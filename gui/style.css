@@ -1,0 +1,687 @@
+/* Karen Desktop — 与 webui/static/app.css 对齐的 GTK 样式。
+ * 颜色由 gui/app.py 里的 @karen_* 调色板提供；尺寸沿用 WebUI 的
+ * 200px 侧栏、56px 顶栏、1100px 内容栏、8px 卡片圆角。 */
+
+window {
+  background-color: @karen_bg;
+  color: @karen_fg;
+  font-family: "Noto Sans CJK SC";
+  font-size: 14px;
+}
+
+/* ================= 侧栏 ================= */
+
+.shell-paned > separator {
+  min-width: 0;
+  background-color: transparent;
+}
+
+.sidebar {
+  background-color: @karen_sidebar_bg;
+  color: @karen_sidebar_fg;
+  border-right: 1px solid @karen_border;
+}
+
+.sidebar-scroll {
+  background-color: transparent;
+}
+
+.sidebar-brand {
+  padding: 0 8px 0 16px;
+  border-bottom: 1px solid @karen_border;
+}
+
+.sidebar.collapsed .sidebar-brand {
+  padding: 0;
+}
+
+.app-name {
+  color: @karen_accent_bg;
+  font-size: 20px;
+  font-weight: 600;
+}
+
+.app-version {
+  color: @karen_text_disabled;
+  font-size: 10px;
+  opacity: 1;
+}
+
+.sidebar-toggle {
+  color: @karen_text_secondary;
+}
+
+.navigation-sidebar {
+  background-color: transparent;
+  padding: 8px;
+}
+
+.nav-row {
+  border-radius: 8px;
+  border-left: 3px solid transparent;
+  margin: 0;
+}
+
+.nav-content {
+  padding: 10px 13px;
+}
+
+.nav-label {
+  color: @karen_fg;
+  font-size: 14px;
+}
+
+.nav-row image {
+  color: @karen_text_secondary;
+}
+
+.nav-row:hover {
+  background-color: @karen_hover;
+}
+
+.nav-row:selected {
+  background-color: @karen_accent_soft;
+  border-left-color: @karen_accent_bg;
+}
+
+.nav-row:selected .nav-label {
+  color: @karen_accent_fg;
+  font-weight: 600;
+}
+
+.nav-row:selected image {
+  color: @karen_accent_fg;
+}
+
+.sidebar.collapsed .nav-content {
+  padding: 10px 0;
+}
+
+.sidebar-foot {
+  padding: 12px 16px;
+  border-top: 1px solid @karen_border;
+}
+
+.sidebar.collapsed .sidebar-foot {
+  padding: 12px 0;
+}
+
+.conn-text {
+  color: @karen_text_secondary;
+  font-size: 12px;
+}
+
+.runtime-pill {
+  border-radius: 4px;
+  padding: 2px 8px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.runtime-running { background-color: @karen_success_bg; color: @karen_success_fg; }
+.runtime-starting { background-color: @karen_warning_bg; color: @karen_warning_fg; }
+.runtime-idle { background-color: @karen_hover; color: @karen_text_secondary; }
+.runtime-error { background-color: @karen_error_bg; color: @karen_error_fg; }
+
+/* ================= 顶栏 ================= */
+
+headerbar.app-topbar {
+  min-height: 56px;
+  padding: 0 12px 0 20px;
+  background-color: @karen_bg;
+  color: @karen_fg;
+  border-bottom: 1px solid @karen_border;
+  box-shadow: none;
+}
+
+headerbar.app-topbar windowcontrols button {
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0 5px;
+  border: 0;
+  background-color: transparent;
+}
+
+.topbar-badge {
+  margin-right: 4px;
+}
+
+.persona-label {
+  color: @karen_text_secondary;
+  font-size: 13px;
+}
+
+/* ================= 页面与内容栏 ================= */
+
+.content-area {
+  background-color: @karen_bg;
+}
+
+.page-title {
+  color: @karen_fg;
+  font-family: "Noto Serif CJK SC";
+  font-size: 20px;
+  font-weight: 500;
+}
+
+.page-title-xl {
+  font-size: 24px;
+}
+
+.page-desc {
+  color: @karen_text_secondary;
+  font-size: 13px;
+}
+
+.section-title {
+  color: @karen_fg;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.card-title {
+  color: @karen_fg;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.card-sub {
+  color: @karen_text_secondary;
+  font-size: 13px;
+}
+
+.card {
+  background-color: @karen_card_bg;
+  color: @karen_card_fg;
+  border: 1px solid @karen_border;
+  border-radius: 8px;
+  padding: 20px;
+}
+
+.card-tight {
+  padding: 10px;
+}
+
+.card-hover:hover {
+  background-color: @karen_hover;
+}
+
+.stat {
+  padding: 0;
+}
+
+.stat-label {
+  color: @karen_text_secondary;
+  font-size: 12px;
+}
+
+.stat-value {
+  color: @karen_fg;
+  font-size: 24px;
+  font-weight: 600;
+}
+
+.stat-value-small {
+  color: @karen_fg;
+  font-size: 16px;
+  font-weight: 500;
+}
+
+.metric-value {
+  color: @karen_fg;
+  font-size: 24px;
+  font-weight: 600;
+}
+
+.metric-label {
+  color: @karen_text_secondary;
+  font-size: 12px;
+}
+
+/* ================= 表格 ================= */
+
+.data-table {
+  border: 0;
+  background-color: transparent;
+}
+
+.table-head {
+  padding: 0 0 8px 0;
+  border-bottom: 1px solid @karen_border;
+}
+
+.table-head-label {
+  color: @karen_text_secondary;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.table-row {
+  padding: 9px 0;
+  border-bottom: 1px solid @karen_border;
+  border-radius: 4px;
+}
+
+.table-row:hover {
+  background-color: @karen_hover;
+}
+
+.table-cell {
+  color: @karen_fg;
+  font-size: 13px;
+}
+
+.table-name {
+  color: @karen_fg;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.page-actions {
+  padding: 0;
+}
+
+/* ================= 徽标 / 文字 ================= */
+
+.badge {
+  background-color: @karen_hover;
+  color: @karen_text_secondary;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  padding: 2px 8px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.badge-ok,
+.badge-green {
+  background-color: @karen_success_bg;
+  color: @karen_success_fg;
+  border-color: transparent;
+}
+
+.badge-warn,
+.badge-orange {
+  background-color: @karen_warning_bg;
+  color: @karen_warning_fg;
+  border-color: transparent;
+}
+
+.badge-bad,
+.badge-red {
+  background-color: @karen_error_bg;
+  color: @karen_error_fg;
+  border-color: transparent;
+}
+
+.badge-idle {
+  background-color: transparent;
+  border-color: @karen_text_secondary;
+  color: @karen_text_secondary;
+}
+
+.muted {
+  color: @karen_text_secondary;
+  font-size: 12px;
+  opacity: 1;
+}
+
+.field-label {
+  color: @karen_text_secondary;
+  font-size: 13px;
+  font-weight: 500;
+  opacity: 1;
+}
+
+.field-help {
+  color: @karen_text_disabled;
+  font-size: 12px;
+  opacity: 1;
+}
+
+.property-name {
+  min-width: 130px;
+  color: @karen_text_secondary;
+  font-size: 13px;
+  opacity: 1;
+}
+
+.property-value {
+  color: @karen_fg;
+  font-size: 13px;
+}
+
+.danger-text { color: @karen_error; }
+.success-text { color: @karen_success; }
+
+.danger-card {
+  border-color: @karen_error;
+  background-color: alpha(@karen_error, 0.08);
+}
+
+.empty-state {
+  padding: 48px 20px;
+  color: @karen_text_disabled;
+}
+
+.monospace {
+  font-family: "DejaVu Sans Mono";
+  font-size: 12px;
+}
+
+.separator {
+  background-color: @karen_border;
+}
+
+/* ================= 按钮 / 输入 ================= */
+
+button {
+  min-height: 36px;
+  padding: 4px 14px;
+  border: 1px solid @karen_border;
+  border-radius: 8px;
+  background-color: @karen_card_bg;
+  color: @karen_fg;
+  font-size: 14px;
+  font-weight: 500;
+  box-shadow: none;
+  text-shadow: none;
+}
+
+button:hover {
+  background-color: @karen_hover;
+}
+
+button:active {
+  background-color: @karen_border;
+}
+
+button:disabled {
+  color: @karen_text_disabled;
+  background-color: @karen_card_bg;
+  border-color: @karen_border;
+}
+
+button.suggested-action {
+  background-color: @karen_accent_bg;
+  border-color: @karen_accent_bg;
+  color: #FFFFFF;
+}
+
+button.suggested-action:hover {
+  background-color: @karen_accent_fg;
+  border-color: @karen_accent_fg;
+}
+
+button.destructive-action {
+  background-color: @karen_error;
+  border-color: @karen_error;
+  color: #FFFFFF;
+}
+
+button.flat {
+  background-color: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+button.flat:hover {
+  background-color: @karen_hover;
+}
+
+button.icon-button {
+  min-width: 32px;
+  min-height: 32px;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background-color: transparent;
+  color: @karen_text_secondary;
+}
+
+button.icon-button:hover {
+  background-color: @karen_hover;
+  color: @karen_fg;
+}
+
+button.compact-button {
+  min-height: 28px;
+  padding: 2px 10px;
+  font-size: 12px;
+}
+
+button.link {
+  min-height: 0;
+  padding: 2px 4px;
+  border: 0;
+  background-color: transparent;
+  color: @karen_accent_fg;
+}
+
+entry,
+passwordentry,
+spinbutton {
+  min-height: 36px;
+  padding: 6px 12px;
+  border: 1px solid @karen_border;
+  border-radius: 4px;
+  background-color: @karen_card_bg;
+  color: @karen_fg;
+  box-shadow: none;
+}
+
+entry:focus,
+spinbutton:focus {
+  border-color: @karen_accent_bg;
+  box-shadow: 0 0 0 2px @karen_accent_soft;
+}
+
+entry:disabled,
+spinbutton:disabled {
+  background-color: @karen_bg;
+  color: @karen_text_disabled;
+}
+
+entry > text,
+textview {
+  background-color: transparent;
+  color: @karen_fg;
+}
+
+dropdown > button,
+combobox > button {
+  min-height: 36px;
+  border: 1px solid @karen_border;
+  border-radius: 4px;
+  background-color: @karen_card_bg;
+  color: @karen_fg;
+}
+
+.text-area {
+  background-color: @karen_card_bg;
+  border: 1px solid @karen_border;
+  border-radius: 4px;
+}
+
+.text-area textview,
+.text-area text {
+  background-color: transparent;
+  color: @karen_fg;
+}
+
+/* ================= 特殊视图 ================= */
+
+.chat-row {
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: 2px 0;
+}
+
+.chat-row:hover {
+  background-color: @karen_hover;
+}
+
+.chat-speaker {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.chat-text {
+  font-size: 14px;
+}
+
+.chat-system .chat-text,
+.chat-reasoning .chat-text {
+  color: @karen_text_secondary;
+  font-size: 12px;
+}
+
+.chat-tool .chat-text {
+  font-family: "DejaVu Sans Mono";
+  font-size: 12px;
+  color: @karen_text_secondary;
+}
+
+.chat-expander {
+  color: @karen_text_secondary;
+}
+
+.chat-expander label {
+  color: @karen_text_secondary;
+}
+
+.tool-results {
+  border-left: 2px solid @karen_border;
+  margin-left: 12px;
+  padding-left: 10px;
+}
+
+.chip {
+  background-color: @karen_hover;
+  border-radius: 999px;
+  padding: 2px 4px 2px 10px;
+}
+
+.chip-label {
+  color: @karen_fg;
+  font-size: 12px;
+}
+
+button.chip-remove {
+  min-width: 20px;
+  min-height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background-color: transparent;
+  color: @karen_text_secondary;
+  font-size: 14px;
+}
+
+button.chip-remove:hover {
+  background-color: @karen_border;
+  color: @karen_error;
+}
+
+.chat-composer {
+  background-color: @karen_card_bg;
+  border: 1px solid @karen_border;
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+
+button.choice-card {
+  min-height: 96px;
+  padding: 14px;
+  border: 1px solid @karen_border;
+  border-radius: 8px;
+  background-color: @karen_card_bg;
+  color: @karen_fg;
+}
+
+button.choice-card:hover {
+  background-color: @karen_hover;
+}
+
+button.choice-card:checked {
+  border-color: @karen_accent_bg;
+  background-color: @karen_accent_soft;
+}
+
+.conversation-row {
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.conversation-row:selected {
+  background-color: @karen_accent_soft;
+}
+
+.conversation-title {
+  font-weight: 500;
+  font-size: 13px;
+}
+
+.conversation-preview {
+  font-size: 12px;
+  color: @karen_text_secondary;
+}
+
+.log-row {
+  font-family: "DejaVu Sans Mono";
+  font-size: 12px;
+  padding: 2px 0;
+}
+
+.log-error { color: @karen_error; }
+.log-warning { color: @karen_warning; }
+.log-debug { color: @karen_text_disabled; }
+
+.toolbar {
+  padding: 2px 0;
+}
+
+.sidebar-search {
+  margin: 4px 10px 8px 10px;
+}
+
+.settings-split > separator {
+  min-width: 1px;
+  background-color: @karen_border;
+}
+
+.settings-nav .nav-row {
+  border-radius: 6px;
+}
+
+.settings-nav .nav-content {
+  padding: 6px 8px;
+}
+
+.settings-nav .nav-row:selected {
+  background-color: @karen_accent_soft;
+  border-left-color: @karen_accent_bg;
+}
+
+/* 细滚动条，尽量贴近浏览器里 10px 的观感。 */
+scrollbar {
+  background-color: transparent;
+  border: 0;
+}
+
+scrollbar slider {
+  min-width: 6px;
+  min-height: 6px;
+  border-radius: 3px;
+  background-color: @karen_text_disabled;
+}
+
+scrollbar slider:hover {
+  background-color: @karen_accent_bg;
+}
+
+/* 卡片里嵌套的列表不重复画底色。 */
+.card row,
+.card list {
+  background-color: transparent;
+}
