@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import posixpath
 import time
+from pathlib import Path
 from typing import Any
 
 import gi
@@ -226,6 +227,10 @@ class WorkspaceBrowser(Gtk.Box):
         )
         state["path"] = target
         state["error"] = ""
+        # 先让所有在途请求失效，再查缓存。否则从目录 A 切到已缓存的目录 B
+        # 时，A 的旧响应仍会通过 token 校验并把界面覆盖回 A。
+        self._seq += 1
+        token = self._seq
         key = self._cache_key(target)
         hit = self._cache.get(key)
         if hit is not None and not force and time.monotonic() - hit[0] < CACHE_TTL_SECONDS:
@@ -235,8 +240,6 @@ class WorkspaceBrowser(Gtk.Box):
             self._render()
             return
 
-        self._seq += 1
-        token = self._seq
         self._loading = True
         state["loaded"] = False
         self._render()
@@ -251,10 +254,14 @@ class WorkspaceBrowser(Gtk.Box):
             if token != self._seq or mode != self.mode:
                 return
             state["data"] = data
-            state["path"] = str(data.get("path") or target)
+            normalized = str(data.get("path") or target)
+            state["path"] = normalized
             state["loaded"] = True
             state["error"] = ""
-            self._cache[key] = (time.monotonic(), data)
+            self._cache[self._cache_key(normalized)] = (
+                time.monotonic(),
+                data,
+            )
             if mode == "container":
                 self._container_running = True
             self._loading = False
@@ -521,10 +528,39 @@ class WorkspaceBrowser(Gtk.Box):
         picture.set_hexpand(True)
         picture.set_vexpand(True)
         body.append(picture)
+        save = widgets.button("保存图片", css="suggested-action")
+        body.append(save)
         window.set_child(body)
         window.present()
         raw_path = MODES[self.mode]["raw"]
         api = self.page.api
+
+        def _save_image() -> None:
+            target = widgets.save_path_picker(
+                window,
+                title_text="保存图片",
+                initial_name=Path(path).name,
+            )
+            if not target:
+                return
+
+            def _download() -> int:
+                payload = api.raw(f"{raw_path}?path={q(path)}", timeout=120)
+                Path(target).write_bytes(payload)
+                return len(payload)
+
+            def _saved(size: int) -> None:
+                self.page.toast(
+                    f"已保存图片（{widgets.format_bytes(size)}）"
+                )
+
+            widgets.run_async(
+                _download,
+                on_success=_saved,
+                on_error=lambda exc: self.page.toast(f"保存失败：{exc}"),
+            )
+
+        save.connect("clicked", lambda _b: _save_image())
 
         def _do() -> bytes:
             return api.raw(f"{raw_path}?path={q(path)}", timeout=120)
@@ -585,6 +621,8 @@ class WorkspaceBrowser(Gtk.Box):
                 area = widgets.text_view(
                     str(data.get("content") or ""), height=540, monospace=True
                 )
+                area.text_view.set_editable(False)
+                area.text_view.set_cursor_visible(False)
                 area.set_vexpand(True)
                 body.append(area)
             if data.get("truncated"):

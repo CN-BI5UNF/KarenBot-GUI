@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import gi
@@ -33,6 +34,8 @@ def _display_value(value: Any) -> str:
         return "—"
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, str) and re.match(r"^\d{4}-\d{2}-\d{2}T", value):
+        return widgets.short_time(value) or value
     return str(value)
 
 
@@ -45,10 +48,12 @@ class MindPage(Page):
 
     def build(self) -> None:
         self._state: dict[str, Any] = {}
+        self._disposed = False
         self._state_busy = False
         self._wake_busy = False
-        self._last_poll = 0.0
+        self._poll_source = 0
         self._tab_loaded: set[str] = set()
+        self._tab_failed: set[str] = set()
         self._tab_busy: set[str] = set()
         self._tab_hosts: dict[str, Gtk.Box] = {}
 
@@ -105,7 +110,6 @@ class MindPage(Page):
 
         self.banner.set_visible(False)
         self._render_disabled("正在读取人格状态…")
-        GLib.timeout_add_seconds(3, self._poll)
 
     # ------------------------------------------------------------------
     # State polling
@@ -116,6 +120,7 @@ class MindPage(Page):
         self._state_busy = True
         if load_tab:
             self._tab_loaded.clear()
+            self._tab_failed.clear()
 
         def _fetch() -> dict[str, Any]:
             return self.api.get("/api/mind/state", timeout=30)
@@ -130,8 +135,32 @@ class MindPage(Page):
 
         widgets.run_async(_fetch, on_success=_done, on_error=_failed)
 
+    def activate(self) -> None:
+        super().activate()
+        self._schedule_poll()
+
+    def _schedule_poll(self) -> None:
+        if self._disposed or self._poll_source:
+            return
+        self._poll_source = GLib.timeout_add_seconds(3, self._poll)
+
+    def dispose(self) -> None:
+        self._disposed = True
+        if self._poll_source:
+            GLib.source_remove(self._poll_source)
+            self._poll_source = 0
+
     def _poll(self) -> bool:
-        if not self.get_mapped() or self._wake_busy:
+        if self._disposed:
+            self._poll_source = 0
+            return False
+        if not self.get_mapped():
+            # Stop the timer while the page is hidden; activate() restarts it.
+            self._poll_source = 0
+            return False
+        if self._wake_busy:
+            # 唤醒请求可能持续数十秒。保持定时器存活，只跳过这一轮请求；
+            # 否则唤醒完成后页面会永久停止自动刷新。
             return True
         self.refresh(load_tab=False)
         return True
@@ -152,6 +181,7 @@ class MindPage(Page):
     def _render_state(self, data: dict[str, Any]) -> None:
         self._state = data
         if not data.get("available"):
+            self._tab_loaded.clear()
             self._render_disabled(
                 str(data.get("reason") or "人格后台未启用。")
             )
@@ -161,9 +191,10 @@ class MindPage(Page):
         state = data.get("state") or {}
         activity = data.get("activity") or {}
         physiology = data.get("physiology") or {}
-        action = str(state.get("current_action") or "awake")
+        action = str(state.get("current_action") or "idle")
         action_labels = {
             "awake": "清醒",
+            "idle": "空闲",
             "sleeping": "睡眠中",
             "eating": "进食中",
             "collapsing": "体力崩溃",
@@ -187,9 +218,11 @@ class MindPage(Page):
             ("当前动作", action_labels.get(action, action)),
             ("年龄", _display_value(age)),
         ]
-        if not physiology or physiology.get("energy_mode") != "off":
+        energy_mode = str(physiology.get("energy_mode") or "")
+        satiety_mode = str(physiology.get("satiety_mode") or "")
+        if energy_mode and energy_mode != "off":
             tiles.append(("能量", self._num(state.get("energy"), 1)))
-        if not physiology or physiology.get("satiety_mode") != "off":
+        if satiety_mode and satiety_mode != "off":
             tiles.append(("饱食度", self._num(state.get("satiety"), 1)))
         tiles.append(
             ("上次心跳", widgets.short_time(state.get("last_tick_at")) or "—")
@@ -222,7 +255,11 @@ class MindPage(Page):
         else:
             self.banner.set_visible(False)
         current = self._current_tab()
-        if current and current not in self._tab_loaded:
+        if (
+            current
+            and current not in self._tab_loaded
+            and current not in self._tab_failed
+        ):
             self._load_tab(current)
 
     @staticmethod
@@ -246,7 +283,8 @@ class MindPage(Page):
 
     def _tab_changed(self, *_args: Any) -> None:
         key = self._current_tab()
-        if key and key not in self._tab_loaded and self._state.get("available"):
+        if key and self._state.get("available"):
+            # 点击标签页时重新拉取；已加载的标签也允许手动刷新。
             self._load_tab(key)
 
     def _load_tab(self, key: str) -> None:
@@ -258,6 +296,7 @@ class MindPage(Page):
         if host is None:
             return
         self._tab_busy.add(key)
+        self._tab_failed.discard(key)
         widgets.clear(host)
         host.append(self.busy("正在读取…"))
 
@@ -266,19 +305,47 @@ class MindPage(Page):
 
         def _done(data: dict[str, Any]) -> None:
             self._tab_busy.discard(key)
+            if not data.get("available", True):
+                self._tab_loaded.discard(key)
+                self._tab_failed.add(key)
+                widgets.clear(host)
+                host.append(
+                    widgets.muted(
+                        "这个标签页暂时不可用："
+                        + str(data.get("reason") or "未知原因")
+                    )
+                )
+                retry = widgets.button("重试")
+                retry.connect("clicked", lambda _b: self._load_tab(key))
+                host.append(retry)
+                return
             self._tab_loaded.add(key)
+            self._tab_failed.discard(key)
             self._render_tab(key, data)
 
         def _failed(exc: BaseException) -> None:
             self._tab_busy.discard(key)
+            self._tab_loaded.discard(key)
+            self._tab_failed.add(key)
             widgets.clear(host)
             host.append(widgets.muted(f"读取失败：{exc}"))
+            retry = widgets.button("重试")
+            retry.connect("clicked", lambda _b: self._load_tab(key))
+            host.append(retry)
 
         widgets.run_async(_fetch, on_success=_done, on_error=_failed)
 
     def _render_tab(self, key: str, data: dict[str, Any]) -> None:
         host = self._tab_hosts[key]
         widgets.clear(host)
+        if not data.get("available", True):
+            host.append(
+                widgets.muted(
+                    "这个标签页暂时不可用："
+                    + str(data.get("reason") or "未知原因")
+                )
+            )
+            return
         items = (
             data.get("items")
             or data.get("entries")
@@ -296,14 +363,12 @@ class MindPage(Page):
             return
         headers: list[str] = []
         for item in items:
-            if isinstance(item, dict):
-                for name in item:
-                    if name not in headers:
-                        headers.append(str(name))
-                    if len(headers) >= 6:
-                        break
-            if len(headers) >= 6:
-                break
+            if not isinstance(item, dict):
+                continue
+            for name in item:
+                if name not in headers:
+                    headers.append(str(name))
+        headers = headers[:6]
         if not headers:
             for item in items[:100]:
                 card = widgets.card(spacing=4)
@@ -321,6 +386,10 @@ class MindPage(Page):
             ]
             for item in items[:60]
         ]
+        title = str(data.get("title") or key)
+        host.append(
+            widgets.muted(f"{title} · 显示 {len(rows)} 条（共 {len(items)} 条）")
+        )
         host.append(
             widgets.table(
                 headers,
@@ -365,9 +434,14 @@ class MindPage(Page):
         def _submit(dialog: Gtk.Window) -> None:
             if self._wake_busy:
                 return
-            message = widgets.text_value(message_view).strip()[:2000]
+            message = widgets.text_value(message_view).strip()
+            if len(message) > 2000:
+                error.set_text(f"叫醒留言最多 2000 字（当前 {len(message)} 字）")
+                return
+            error.set_text("")
             self._wake_busy = True
             self.wake_button.set_sensitive(False)
+            window.submit_button.set_sensitive(False)
 
             def _do() -> dict[str, Any]:
                 return self.api.post(
@@ -381,11 +455,14 @@ class MindPage(Page):
                 dialog.close()
                 self._render_wake_reply(result)
                 self.refresh()
+                self._schedule_poll()
 
             def _failed(exc: BaseException) -> None:
                 self._wake_busy = False
                 self.wake_button.set_sensitive(True)
+                window.submit_button.set_sensitive(True)
                 error.set_text(f"唤醒失败：{exc}")
+                self._schedule_poll()
 
             widgets.run_async(_do, on_success=_done, on_error=_failed)
 

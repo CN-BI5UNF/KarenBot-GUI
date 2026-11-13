@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any
+from urllib.parse import quote
 
 import gi
 
 gi.require_version("Gtk", "4.0")
-from gi.repository import GLib, Gtk  # noqa: E402
+gi.require_version("Gdk", "4.0")
+from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
 from .. import widgets  # noqa: E402
 from .base import Page  # noqa: E402
+
+_EMOJI_LABEL_RE = re.compile(r"\[表情包\s*[:：]\s*([^\]]+?)\s*\]")
 
 
 class ChatsPage(Page):
@@ -26,18 +31,29 @@ class ChatsPage(Page):
         self.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.NEVER)
         self.body.set_vexpand(True)
         self._selected_key = ""
+        self._disposed = False
         self._load_serial = 0
         self._display_limit = 300
         self._last_signature: tuple[Any, ...] | None = None
         self._conversations: list[dict[str, Any]] = []
+        self._conversations_signature: tuple[Any, ...] | None = None
         self._load_busy = False
         self._conversations_busy = False
+        self._pending_display_reload = False
         self._last_conversations_at = 0.0
         self._search_timer = 0
         self._expanded_ids: set[str] = set()
         self._collapsed_ids: set[str] = set()
         self._last_display_data: dict[str, Any] | None = None
         self._building_display = False
+        self._emoji_names: dict[str, str] = {}
+        self._emoji_names_loaded = False
+        self._emoji_names_busy = False
+        self._emoji_textures: dict[str, Gdk.Texture] = {}
+        self._emoji_texture_busy: set[str] = set()
+        self._emoji_texture_waiters: dict[
+            str, list[tuple[Gtk.Picture, Gtk.Label]]
+        ] = {}
         header_row = self.header()
         inject = widgets.button("注入测试消息", icon="list-add-symbolic")
         inject.connect("clicked", lambda _b: self._inject_dialog())
@@ -117,6 +133,7 @@ class ChatsPage(Page):
         left_scroller.set_min_content_height(260)
         left_scroller.set_vexpand(True)
         left_scroller.set_child(self.conversation_list)
+        self.conversation_scroller = left_scroller
         left.append(left_scroller)
         paned.set_start_child(left)
 
@@ -131,7 +148,14 @@ class ChatsPage(Page):
         self.all_button = widgets.button("显示全部")
         self.all_button.set_visible(False)
         self.all_button.connect("clicked", lambda _b: self._show_all())
+        self.reload_display_button = widgets.icon_button(
+            "view-refresh-symbolic", "重新加载当前会话记录"
+        )
+        self.reload_display_button.connect(
+            "clicked", lambda _b: self._manual_reload_display()
+        )
         right_head.append(self.conversation_title)
+        right_head.append(self.reload_display_button)
         right_head.append(self.more_button)
         right_head.append(self.all_button)
         right.append(right_head)
@@ -153,13 +177,24 @@ class ChatsPage(Page):
         self.composer_qq.set_text("10001")
         self.composer_qq.set_tooltip_text("发送者 QQ 号")
         composer.append(self.composer_qq)
-        self.composer_entry = Gtk.Entry()
-        self.composer_entry.set_hexpand(True)
-        self.composer_entry.set_placeholder_text(
-            "输入一条模拟消息，回车发送（不接 NapCat 也能试跑人格）"
+        composer_input = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=2
         )
-        self.composer_entry.connect("activate", lambda _e: self._send_composer())
-        composer.append(self.composer_entry)
+        composer_input.set_hexpand(True)
+        self.composer_entry = widgets.text_view("", height=48)
+        self.composer_entry.set_hexpand(True)
+        composer_view: Gtk.TextView = self.composer_entry.text_view  # type: ignore[attr-defined]
+        composer_view.set_tooltip_text(
+            "输入一条模拟消息：Enter 发送，Shift+Enter 换行"
+        )
+        key_controller = Gtk.EventControllerKey()
+        key_controller.connect("key-pressed", self._composer_key)
+        composer_view.add_controller(key_controller)
+        composer_input.append(self.composer_entry)
+        composer_input.append(
+            widgets.muted("Enter 发送 · Shift+Enter 换行")
+        )
+        composer.append(composer_input)
         send = widgets.button("发送", icon="mail-send-symbolic", css="suggested-action")
         send.connect("clicked", lambda _b: self._send_composer())
         composer.append(send)
@@ -171,8 +206,22 @@ class ChatsPage(Page):
         self.body.append(composer)
         GLib.timeout_add_seconds(5, self._poll)
 
+    def _composer_key(
+        self,
+        _controller: Gtk.EventControllerKey,
+        keyval: int,
+        _keycode: int,
+        state: Gdk.ModifierType,
+    ) -> bool:
+        if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter) and not (
+            state & Gdk.ModifierType.SHIFT_MASK
+        ):
+            self._send_composer()
+            return True
+        return False
+
     def _send_composer(self) -> None:
-        text = self.composer_entry.get_text().strip()
+        text = widgets.text_value(self.composer_entry).strip()
         if not text or self.api is None:
             return
         user_id = self.composer_qq.get_text().strip() or "10001"
@@ -190,16 +239,23 @@ class ChatsPage(Page):
 
         def _done(result: dict[str, Any]) -> None:
             self.composer_send.set_sensitive(True)
-            self.composer_entry.set_text("")
-            key = str(result.get("conversation_id") or f"private:{user_id}")
-            self._selected_key = key
-            self._last_signature = None
-            self._last_display_data = None
-            self._expanded_ids.clear()
-            self._collapsed_ids.clear()
-            self._display_limit = 300
+            self.composer_entry.text_view.get_buffer().set_text("")  # type: ignore[attr-defined]
+            conversation_id = str(result.get("conversation_id") or "")
             self.toast(str(result.get("message") or "消息已注入"))
-            self.refresh()
+            if result.get("blacklisted"):
+                # The backend dropped the message, so there is no conversation
+                # to select; keep the user where they were.
+                self.refresh(load_display=False)
+                return
+            if conversation_id:
+                self._selected_key = conversation_id
+                self._last_signature = None
+                self._last_display_data = None
+                self._expanded_ids.clear()
+                self._collapsed_ids.clear()
+                self._display_limit = 300
+                self._load_selected(scroll="bottom")
+            self.refresh(load_display=False)
 
         def _failed(exc: BaseException) -> None:
             self.composer_send.set_sensitive(True)
@@ -208,8 +264,172 @@ class ChatsPage(Page):
         widgets.run_async(_do, on_success=_done, on_error=_failed)
 
     # ------------------------------------------------------------------
-    def refresh(self) -> None:
-        if self.api is None or self._conversations_busy:
+    def activate(self) -> None:
+        super().activate()
+        # The emoji library can change while this page is not visible. A
+        # small names index is enough; image bytes are fetched only for labels
+        # that actually occur in the visible records.
+        self._load_emoji_names(force=True)
+
+    def _load_emoji_names(self, *, force: bool = False) -> None:
+        if self.api is None or self._emoji_names_busy:
+            return
+        if self._emoji_names_loaded and not force:
+            return
+        self._emoji_names_busy = True
+        api = self.api
+
+        def _fetch() -> dict[str, Any]:
+            return api.get("/api/emoji/names", timeout=20)
+
+        def _done(data: dict[str, Any]) -> None:
+            self._emoji_names_busy = False
+            self._emoji_names_loaded = True
+            names = {
+                str(item.get("name") or "").casefold(): str(
+                    item.get("file") or ""
+                )
+                for item in data.get("items") or []
+                if item.get("name") and item.get("file")
+            }
+            if names != self._emoji_names:
+                self._emoji_names = names
+                if self._last_display_data is not None:
+                    self._rerender_display()
+
+        def _failed(_exc: BaseException) -> None:
+            self._emoji_names_busy = False
+            self._emoji_names_loaded = True
+
+        widgets.run_async(_fetch, on_success=_done, on_error=_failed)
+
+    def _rich_text_widget(self, text: str) -> Gtk.Widget:
+        """Chat bubble body with ``[表情包: name]`` replaced by thumbnails.
+
+        The message text is never used to build a filesystem path: only the
+        server-provided mapping is consulted, exactly like the WebUI.
+        """
+        source = str(text or "")
+        if "[表情包" not in source or not self._emoji_names:
+            return widgets.label(
+                source, css="chat-text", wrap=True, selectable=True
+            )
+        segments: list[tuple[str, Any]] = []
+        cursor = 0
+        has_image = False
+        for match in _EMOJI_LABEL_RE.finditer(source):
+            if match.start() > cursor:
+                segments.append(("text", source[cursor:match.start()]))
+            name = match.group(1).strip()
+            filename = self._emoji_names.get(name.casefold())
+            if filename:
+                segments.append(("emoji", (name, filename)))
+                has_image = True
+            else:
+                segments.append(("text", match.group(0)))
+            cursor = match.end()
+        if cursor < len(source):
+            segments.append(("text", source[cursor:]))
+        if not has_image:
+            return widgets.label(
+                source, css="chat-text", wrap=True, selectable=True
+            )
+        # Merge adjacent text runs so that prose around an emoji stays one
+        # wrapping label instead of one widget per fragment.
+        merged: list[tuple[str, Any]] = []
+        for kind, value in segments:
+            if (
+                kind == "text"
+                and merged
+                and merged[-1][0] == "text"
+            ):
+                merged[-1] = ("text", str(merged[-1][1]) + str(value))
+            else:
+                merged.append((kind, value))
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.add_css_class("chat-rich-text")
+        for kind, value in merged:
+            if kind == "text":
+                if str(value):
+                    box.append(
+                        widgets.label(
+                            str(value),
+                            css="chat-text",
+                            wrap=True,
+                            selectable=True,
+                        )
+                    )
+                continue
+            name, filename = value
+            holder = Gtk.Box(
+                orientation=Gtk.Orientation.HORIZONTAL, spacing=4
+            )
+            placeholder = widgets.muted(f"[表情包: {name}]")
+            picture = Gtk.Picture()
+            picture.set_content_fit(Gtk.ContentFit.CONTAIN)
+            picture.set_size_request(44, 44)
+            picture.set_visible(False)
+            picture.set_tooltip_text(name)
+            holder.append(placeholder)
+            holder.append(picture)
+            box.append(holder)
+            self._attach_emoji_texture(filename, picture, placeholder)
+        return box
+
+    def _attach_emoji_texture(
+        self,
+        filename: str,
+        picture: Gtk.Picture,
+        placeholder: Gtk.Label,
+    ) -> None:
+        cached = self._emoji_textures.get(filename)
+        if cached is not None:
+            picture.set_paintable(cached)
+            picture.set_visible(True)
+            placeholder.set_visible(False)
+            return
+        waiters = self._emoji_texture_waiters.setdefault(filename, [])
+        waiters.append((picture, placeholder))
+        if filename in self._emoji_texture_busy or self.api is None:
+            return
+        self._emoji_texture_busy.add(filename)
+        api = self.api
+        path = f"/api/emoji/file/{quote(filename, safe='')}"
+
+        def _fetch() -> bytes:
+            return api.raw(path, timeout=20)
+
+        def _done(data: bytes) -> None:
+            self._emoji_texture_busy.discard(filename)
+            texture: Gdk.Texture | None
+            try:
+                texture = Gdk.Texture.new_from_bytes(GLib.Bytes.new(data))
+            except Exception:  # noqa: BLE001
+                texture = None
+            if texture is not None:
+                self._emoji_textures[filename] = texture
+            for pic, label in self._emoji_texture_waiters.pop(filename, []):
+                if texture is not None:
+                    pic.set_paintable(texture)
+                    pic.set_visible(True)
+                    label.set_visible(False)
+                else:
+                    label.set_text(label.get_text() + "（预览失败）")
+
+        def _failed(_exc: BaseException) -> None:
+            self._emoji_texture_busy.discard(filename)
+            for _pic, label in self._emoji_texture_waiters.pop(filename, []):
+                label.set_text(label.get_text() + "（加载失败）")
+
+        widgets.run_async(_fetch, on_success=_done, on_error=_failed)
+
+    def refresh(self, *, load_display: bool = True) -> None:
+        if self.api is None:
+            return
+        if self._conversations_busy:
+            self._pending_display_reload = (
+                self._pending_display_reload or load_display
+            )
             return
         self._conversations_busy = True
         self._last_conversations_at = time.monotonic()
@@ -219,7 +439,16 @@ class ChatsPage(Page):
 
         def _done(data: dict[str, Any]) -> None:
             self._conversations_busy = False
+            previous = self._selected_key
             self._render_conversations(data)
+            reload_display = load_display or self._pending_display_reload
+            self._pending_display_reload = False
+            if (
+                reload_display
+                and self._selected_key
+                and self._selected_key == previous
+            ):
+                self._load_selected(scroll="preserve")
 
         def _failed(exc: BaseException) -> None:
             self._conversations_busy = False
@@ -284,13 +513,18 @@ class ChatsPage(Page):
                     self._collapsed_ids.clear()
                     self._display_limit = 300
                 self.toast(str(result.get("message") or "消息已注入"))
-                self.refresh()
+                if conversation_id:
+                    self._load_selected(scroll="bottom")
+                self.refresh(load_display=False)
 
             widgets.run_async(_do, on_success=_done, on_error=lambda exc: error.set_text(str(exc)))
 
         window.present()
 
     def _error(self, exc: BaseException) -> None:
+        # Force the next successful poll to rebuild the list instead of
+        # short-circuiting on the previous unchanged signature.
+        self._conversations_signature = None
         widgets.clear(self.conversation_list)
         row = Gtk.ListBoxRow()
         row.set_activatable(False)
@@ -298,8 +532,27 @@ class ChatsPage(Page):
         self.conversation_list.append(row)
 
     def _render_conversations(self, data: dict[str, Any] | None = None) -> None:
+        adjustment = self.conversation_scroller.get_vadjustment()
+        old_value = adjustment.get_value()
         if data is not None:
-            self._conversations = list(data.get("conversations") or [])
+            conversations = list(data.get("conversations") or [])
+            signature = tuple(
+                (
+                    conv.get("key"),
+                    conv.get("label"),
+                    conv.get("preview"),
+                    conv.get("record_count"),
+                    conv.get("last_timestamp"),
+                )
+                for conv in conversations
+            )
+            if (
+                signature == self._conversations_signature
+                and self._conversations
+            ):
+                return
+            self._conversations = conversations
+            self._conversations_signature = signature
         widgets.clear(self.conversation_list)
         needle = self.conversation_search.get_text().strip().casefold()
         conversations = [
@@ -318,7 +571,13 @@ class ChatsPage(Page):
         if not conversations:
             row = Gtk.ListBoxRow()
             row.set_activatable(False)
-            row.set_child(widgets.muted("没有匹配的对话记录。"))
+            row.set_child(
+                widgets.muted(
+                    "没有匹配的会话。"
+                    if self._conversations
+                    else "暂无对话记录；收到消息后会出现在这里。"
+                )
+            )
             self.conversation_list.append(row)
             return
         selected_row: Gtk.ListBoxRow | None = None
@@ -361,10 +620,12 @@ class ChatsPage(Page):
                 first_normal = row
         if selected_row is not None:
             self.conversation_list.select_row(selected_row)
-        elif first_normal is not None:
+        elif not self._selected_key and first_normal is not None:
             self.conversation_list.select_row(first_normal)
-        elif conversations:
-            self.conversation_list.select_row(self.conversation_list.get_row_at_index(0))
+        if old_value > 0:
+            GLib.idle_add(
+                lambda: (adjustment.set_value(old_value), False)[1]
+            )
 
     def _on_conversation(self, _list: Gtk.ListBox, row: Gtk.ListBoxRow | None) -> None:
         if row is None:
@@ -379,7 +640,17 @@ class ChatsPage(Page):
             self._last_display_data = None
             self._expanded_ids.clear()
             self._collapsed_ids.clear()
+            self.more_button.set_visible(False)
+            self.all_button.set_visible(False)
+            widgets.clear(self.display_box)
+            self.display_box.append(widgets.muted("正在准备这个会话…"))
             self._load_selected(scroll="bottom")
+
+    def _manual_reload_display(self) -> None:
+        if not self._selected_key:
+            return
+        self._last_signature = None
+        self._load_selected(scroll="preserve")
 
     def _schedule_search(self) -> None:
         if self._search_timer:
@@ -464,7 +735,18 @@ class ChatsPage(Page):
 
         widgets.run_async(_fetch, on_success=_done, on_error=_failed)
 
+    def dispose(self) -> None:
+        self._disposed = True
+        self._load_serial += 1
+        if self._search_timer:
+            GLib.source_remove(self._search_timer)
+            self._search_timer = 0
+        self._emoji_texture_waiters.clear()
+        self._emoji_texture_busy.clear()
+
     def _poll(self) -> bool:
+        if self._disposed:
+            return False
         if not self.get_mapped():
             return True
         if self.auto_refresh is None or not self.auto_refresh.get_active():
@@ -472,15 +754,18 @@ class ChatsPage(Page):
         now = time.monotonic()
         if (
             not self._conversations_busy
-            and now - self._last_conversations_at > 30
+            and now - self._last_conversations_at >= 5
         ):
-            self.refresh()
+            self.refresh(load_display=False)
         if self._selected_key and not self._load_busy:
             self._load_selected(silent=True, scroll="preserve")
         return True
 
     def _display_error(self, exc: BaseException) -> None:
         self._last_display_data = None
+        # 下一次轮询即使拿到与上次相同的数据也必须重新渲染，否则错误文本
+        # 会永久留在页面上。
+        self._last_signature = None
         self.conversation_title.set_text("加载失败")
         widgets.clear(self.display_box)
         self.display_box.append(widgets.muted(f"无法读取会话：{exc}"))
@@ -505,20 +790,37 @@ class ChatsPage(Page):
             + (f" / {total} 条记录" if total else "")
         )
         items = data.get("items") or []
-        self.more_button.set_visible(bool(data.get("truncated")) and self._display_limit > 0)
-        self.all_button.set_visible(bool(data.get("truncated")))
+        total_count = int(total or 0)
+        filtered_count = int(filtered or 0)
+        hidden = max(0, filtered_count - len(items))
+        self.more_button.set_visible(hidden > 0 and self._display_limit > 0)
+        self.more_button.set_label(f"加载更早（{min(hidden, 300)}）")
+        self.all_button.set_visible(hidden > 0)
         self._building_display = True
         try:
             if not items:
-                self.display_box.append(widgets.muted("当前筛选没有可显示的内容。"))
+                if total_count > 0 and filtered_count == 0:
+                    self.display_box.append(
+                        widgets.muted(
+                            "当前过滤条件下没有内容。试试勾上「聊天」或「系统」，"
+                            "或清空搜索词。"
+                        )
+                    )
+                else:
+                    self.display_box.append(
+                        widgets.muted("这个会话还没有可显示的记录。")
+                    )
             for item in items:
                 self.display_box.append(self._display_row(item))
-            if data.get("truncated"):
+            if hidden > 0:
                 self.display_box.append(
                     widgets.muted(
-                        "当前只显示最近一部分记录；可点上方「加载更早」或「显示全部」。"
+                        f"还有 {hidden} 条更早的记录未显示；可点上方"
+                        "「加载更早」或「显示全部」。"
                     )
                 )
+            elif data.get("truncated"):
+                self.display_box.append(widgets.muted("已显示全部记录。"))
         finally:
             self._building_display = False
         mode = scroll
@@ -599,20 +901,27 @@ class ChatsPage(Page):
         expander = Gtk.Expander(label=" · ".join(bits))
         expander.add_css_class("chat-expander")
         expander.set_expanded(self._is_expanded(item))
-        text = str(item.get("text") or "")
-        truncated = kind == "tool_result" and len(text) > 4000
-        if truncated:
-            text = text[:4000]
+        full_text = str(item.get("text") or "")
+        truncated = kind == "tool_result" and len(full_text) > 4000
+        text = full_text[:4000] if truncated else full_text
         if text:
             wrapper = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
             wrapper.set_margin_start(16)
-            wrapper.append(
-                widgets.label(text, css="chat-text", wrap=True, selectable=True)
-            )
+            wrapper.append(self._rich_text_widget(text))
             if truncated:
                 wrapper.append(
-                    widgets.muted("工具结果已截断（仅显示前 4000 字符）。")
+                    widgets.muted(
+                        f"工具结果较长（{len(full_text)} 字符），此处仅显示前 4000 字符。"
+                    )
                 )
+                show_full = widgets.button("查看完整结果")
+                show_full.connect(
+                    "clicked",
+                    lambda _b, value=full_text: self._show_full_text(
+                        "工具结果", value
+                    ),
+                )
+                wrapper.append(show_full)
             expander.set_child(wrapper)
         expander.connect(
             "notify::expanded",
@@ -628,6 +937,20 @@ class ChatsPage(Page):
             row.append(expander)
             return row
         return expander
+
+    def _show_full_text(self, title: str, text: str) -> None:
+        window = widgets.FormWindow(
+            self.app.window,
+            title,
+            width=820,
+            height=640,
+            submit_label="关闭",
+            on_submit=lambda: window.close(),
+        )
+        window.cancel_button.set_visible(False)
+        area = widgets.text_view(text, height=520, monospace=True)
+        window.add_row("完整内容（可选中复制）", area)
+        window.present()
 
     def _display_row(self, item: dict[str, Any]) -> Gtk.Widget:
         kind = str(item.get("kind") or "chat")
@@ -686,9 +1009,9 @@ class ChatsPage(Page):
         row.append(head)
         text = str(item.get("text") or "")
         if text:
-            row.append(
-                widgets.label(text, css="chat-text", wrap=True, selectable=True)
-            )
+            row.append(self._rich_text_widget(text))
+        elif kind in {"inbound_message", "outbound_message"}:
+            row.append(widgets.muted("（空）"))
         return row
 
 

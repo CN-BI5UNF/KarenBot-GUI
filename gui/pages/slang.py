@@ -27,6 +27,9 @@ class SlangPage(Page):
     def build(self) -> None:
         self._search_timer = 0
         self._conv_sync = False
+        self._entries: list[dict[str, Any]] = []
+        self._learn_busy = False
+        self._load_seq = 0
         header_row = self.header()
         settings_button = widgets.button("学习设置")
         settings_button.connect(
@@ -67,6 +70,8 @@ class SlangPage(Page):
         self.body.append(toolbar)
         self.stats_label = widgets.muted("")
         self.body.append(self.stats_label)
+        self.learn_status = widgets.muted("")
+        self.body.append(self.learn_status)
         self.list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         self.body.append(self.list_box)
 
@@ -103,11 +108,21 @@ class SlangPage(Page):
         if status:
             params.append(f"status={status}")
         path = "/api/slang" + (("?" + "&".join(params)) if params else "")
+        self._load_seq += 1
+        token = self._load_seq
 
         def _fetch() -> dict[str, Any]:
             return self.api.get(path, timeout=30)
 
-        widgets.run_async(_fetch, on_success=self._render, on_error=self._error)
+        def _ok(data: dict[str, Any]) -> None:
+            if token == self._load_seq:
+                self._render(data)
+
+        def _failed(exc: BaseException) -> None:
+            if token == self._load_seq:
+                self._error(exc)
+
+        widgets.run_async(_fetch, on_success=_ok, on_error=_failed)
 
     def _error(self, exc: BaseException) -> None:
         widgets.clear(self.list_box)
@@ -120,7 +135,7 @@ class SlangPage(Page):
         settings = data.get("settings") or {}
         writable = data.get("writable") is not False
         self.add_button.set_sensitive(writable)
-        self.learn_button.set_sensitive(writable)
+        self.learn_button.set_sensitive(writable and not self._learn_busy)
         conversations = list(data.get("conversations") or [])
         current_conv = self.conversation_entry.get_text().strip()
         if current_conv and current_conv not in conversations:
@@ -160,6 +175,7 @@ class SlangPage(Page):
             bits.append("黑话库只读：上次读取失败")
         self.stats_label.set_text(" · ".join(bits))
         entries = data.get("entries") or []
+        self._entries = list(entries)
         if not entries:
             self.list_box.append(self.empty("当前条件下没有词条。"))
             return
@@ -195,7 +211,17 @@ class SlangPage(Page):
             if entry.get("persona_id"):
                 extra.append("来源人格：" + str(entry["persona_id"]))
             if entry.get("source"):
-                extra.append("来源：" + str(entry["source"]))
+                source_labels = {
+                    "manual": "手动",
+                    "ai": "AI 候选",
+                    "learn": "缓存学习",
+                    "system": "系统",
+                }
+                extra.append(
+                    "来源：" + source_labels.get(
+                        str(entry["source"]), str(entry["source"])
+                    )
+                )
             if entry.get("rejection_reason"):
                 extra.append("自动拒绝：" + str(entry["rejection_reason"]))
             if extra:
@@ -224,6 +250,30 @@ class SlangPage(Page):
             [("candidate", "待确认"), ("confirmed", "已确认"), ("rejected", "已拒绝")],
             str((entry or {}).get("status") or "confirmed"),
         )
+        duplicate_rejected = bool(
+            entry
+            and entry.get("status") == "rejected"
+            and entry.get("rejection_code") == "duplicate_term"
+            and any(
+                item.get("id") != entry.get("id")
+                and item.get("conversation_id") == entry.get("conversation_id")
+                and item.get("content") == entry.get("content")
+                and item.get("status") != "rejected"
+                for item in self._entries
+            )
+        )
+        if entry:
+            subtitle = " · ".join(
+                part
+                for part in (
+                    "群 " + str(entry.get("conversation_id") or "—"),
+                    "来源人格 " + str(entry.get("persona_id") or "—"),
+                    "来源 " + str(entry.get("source") or "—"),
+                    f"出现 {entry.get('count') or 0} 次",
+                )
+                if part
+            )
+            window.body_box.append(widgets.muted(subtitle))
         window.add_row("群聊 ID", conv)
         window.add_row("词条", content)
         window.add_row("含义", meaning)
@@ -239,14 +289,47 @@ class SlangPage(Page):
                     wrap=True,
                 )
             )
+        if duplicate_rejected:
+            window.body_box.append(
+                widgets.label(
+                    "同群已有同名词条；不能把本词条设为待确认或已确认。"
+                    "修改词条内容后才可以设为有效，或继续保留拒绝状态。",
+                    css="danger-text",
+                    wrap=True,
+                )
+            )
         evidence = (entry or {}).get("evidence") or (entry or {}).get("sources") or []
         if evidence:
             window.body_box.append(widgets.label("证据", css="field-label"))
+            if isinstance(evidence, list):
+                lines = []
+                for item in evidence:
+                    if isinstance(item, dict):
+                        pieces = [
+                            str(item.get(key) or "").strip()
+                            for key in ("timestamp", "time", "sender", "speaker")
+                        ]
+                        text = str(
+                            item.get("text")
+                            or item.get("content")
+                            or item.get("message")
+                            or ""
+                        ).strip()
+                        prefix = " ".join(piece for piece in pieces if piece)
+                        lines.append(
+                            (prefix + "：" if prefix else "")
+                            + (text or json.dumps(item, ensure_ascii=False))
+                        )
+                    else:
+                        lines.append(str(item))
+                evidence_text = "\n".join(lines)
+            elif isinstance(evidence, dict):
+                evidence_text = json.dumps(evidence, ensure_ascii=False, indent=2)
+            else:
+                evidence_text = str(evidence)
             window.body_box.append(
                 widgets.label(
-                    json.dumps(evidence, ensure_ascii=False, indent=2)
-                    if isinstance(evidence, (dict, list))
-                    else str(evidence),
+                    evidence_text,
                     css="monospace",
                     wrap=True,
                     selectable=True,
@@ -255,11 +338,33 @@ class SlangPage(Page):
         error = widgets.muted("")
         window.body_box.append(error)
 
+        def _sync_submit(*_args: Any) -> None:
+            same_content = bool(
+                entry
+                and content.get_text().strip() == str(entry.get("content") or "")
+            )
+            selected_status = widgets.dropdown_value(status)
+            blocked = bool(
+                duplicate_rejected
+                and same_content
+                and selected_status != "rejected"
+            )
+            window.submit_button.set_sensitive(not blocked)
+            if blocked:
+                error.set_text(
+                    "同群已有同名词条；请修改词条或保留拒绝状态。"
+                )
+            elif error.get_text().startswith("同群已有同名词条"):
+                error.set_text("")
+
+        content.connect("changed", _sync_submit)
+        status.connect("notify::selected", _sync_submit)
+        _sync_submit()
+
         def _save() -> None:
             if self.api is None:
                 return
             payload = {
-                "conversation_id": conv.get_text().strip(),
                 "content": content.get_text().strip(),
                 "meaning": widgets.text_value(meaning).strip(),
                 "usage": usage.get_text().strip(),
@@ -267,8 +372,13 @@ class SlangPage(Page):
                 "risk": risk.get_text().strip(),
                 "status": widgets.dropdown_value(status),
             }
-            if not payload["content"] or not payload["conversation_id"]:
-                error.set_text("群聊 ID 和词条不能为空。")
+            if entry is None:
+                payload["conversation_id"] = conv.get_text().strip()
+                if not payload["conversation_id"]:
+                    error.set_text("群聊 ID 不能为空。")
+                    return
+            if not payload["content"]:
+                error.set_text("词条不能为空。")
                 return
             if payload["status"] == "confirmed" and not payload["meaning"]:
                 error.set_text("确认词条前必须填写含义。")
@@ -284,8 +394,42 @@ class SlangPage(Page):
                 self.toast("词条已保存")
                 self.refresh()
 
-            widgets.run_async(_do, on_success=_done, on_error=lambda exc: error.set_text(str(exc)))
+            def _failed(exc: BaseException) -> None:
+                window.submit_button.set_sensitive(True)
+                error.set_text(str(exc))
 
+            window.submit_button.set_sensitive(False)
+            widgets.run_async(_do, on_success=_done, on_error=_failed)
+
+        def _set_status(value: str) -> None:
+            values = getattr(status, "_values", [])
+            if value in values:
+                status.set_selected(values.index(value))
+
+        if entry is not None:
+            quick = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            confirm = widgets.button("保存并确认", css="suggested-action")
+            confirm.connect(
+                "clicked",
+                lambda _b: (_set_status("confirmed"), _save()),
+            )
+            reject = widgets.button("拒绝")
+            reject.connect(
+                "clicked",
+                lambda _b: (_set_status("rejected"), _save()),
+            )
+            remove = widgets.button("删除", css="destructive-action")
+            remove.connect(
+                "clicked",
+                lambda _b: (
+                    window.close(),
+                    self._delete(entry),
+                ),
+            )
+            quick.append(confirm)
+            quick.append(reject)
+            quick.append(remove)
+            window.body_box.append(quick)
         window.present()
 
     def _delete(self, entry: dict[str, Any]) -> None:
@@ -313,18 +457,48 @@ class SlangPage(Page):
 
     def _learn(self) -> None:
         conv = self.conversation_entry.get_text().strip()
+        if self._learn_busy:
+            return
         if not conv or self.api is None:
             self.toast("请先填写 group:<群号>")
             return
+        self._learn_busy = True
+        self.learn_button.set_sensitive(False)
+        self.learn_status.set_text("正在从缓存提取候选词条，可能需要十几秒…")
 
-        def _do() -> Any:
-            return self.api.post("/api/slang/learn", {"conversation_id": conv}, timeout=180)
+        def _do() -> dict[str, Any]:
+            return self.api.post(
+                "/api/slang/learn",
+                {"conversation_id": conv},
+                timeout=180,
+            )
 
-        widgets.run_async(
-            _do,
-            on_success=lambda result: (self.toast(str(result.get("message") or "学习完成")), self.refresh()),
-            on_error=lambda exc: self.toast(f"学习失败：{exc}"),
-        )
+        def _done(result: dict[str, Any]) -> None:
+            self._learn_busy = False
+            self.learn_button.set_sensitive(True)
+            if result.get("ok"):
+                message = str(result.get("message") or "学习完成")
+                self.learn_status.set_text(message)
+                self.toast(message)
+                rejected = int(result.get("auto_rejected") or 0)
+                if rejected:
+                    self.toast(
+                        f"有 {rejected} 条重复申请已自动拒绝，仍保留在列表中"
+                    )
+                self.refresh()
+            else:
+                message = f"没有学习：{result.get('error') or '未知原因'}"
+                self.learn_status.set_text(message)
+                self.toast(message)
+
+        def _failed(exc: BaseException) -> None:
+            self._learn_busy = False
+            self.learn_button.set_sensitive(True)
+            message = f"学习失败：{exc}"
+            self.learn_status.set_text(message)
+            self.toast(message)
+
+        widgets.run_async(_do, on_success=_done, on_error=_failed)
 
 
 def _quote(value: Any) -> str:

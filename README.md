@@ -1,10 +1,9 @@
 # KarenBot-GUI
 
-KarenBot 的**原生 GTK4 / libadwaita 桌面控制台**模块。仓库当前为私有开发仓库，
-版本 **v0.0.1-dev**，后续计划公开。
+KarenBot 的**原生 GTK4 / libadwaita 桌面控制台**模块。仓库已公开，当前版本 **v0.1.1-alpha**。
 
 > 这是模块源码仓库，不是完整的独立 KarenBot 应用。运行前需要 KarenBot 宿主和兼容的
-> `KarenBot-backend`（v0.0.1-dev）。
+> `KarenBot-backend`（v0.1.1-alpha）。
 
 ## 这是什么
 
@@ -35,10 +34,10 @@ KarenBot RuntimeHost / core.Runtime
 
 | 项目 | 版本 |
 |---|---|
-| 本模块 release | `v0.0.1-dev`（预发布） |
-| 配套后端 | `KarenBot-backend` `v0.0.1-dev` |
+| 本模块 release | `v0.1.1-alpha`（预发布） |
+| 配套后端 | `KarenBot-backend` `v0.1.1-alpha` |
 | KarenBot 宿主 | `1.0.1-alpha.1` 拆分版本及后续兼容版本 |
-| 配套 WebUI | `KarenBot-WebUI` `v0.0.1-dev` |
+| 配套 WebUI | `KarenBot-WebUI` `v0.1.1-alpha` |
 
 ## 系统要求
 
@@ -106,7 +105,7 @@ GApplication ID，可并存运行；同一个数据目录同一时间只允许�
 ## 版本与发布
 
 - 版本标签格式：`vMAJOR.MINOR.PATCH[-dev]`
-- 当前 `v0.0.1-dev` 为预发布开发版，界面与接口可能调整。
+- 当前 `v0.1.1-alpha` 为预发布开发版，界面与接口可能调整。
 - Release 自动提供源码归档，并附带模块源码 zip。
 - 与后端模块的兼容关系见上表。
 

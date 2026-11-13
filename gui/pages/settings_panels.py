@@ -15,6 +15,49 @@ from .. import widgets  # noqa: E402
 from ..api import q  # noqa: E402
 
 
+def _vision_override_present(
+    provider_id: str,
+    base_url: str,
+    api_key_id: str,
+) -> bool:
+    """True when saving the vision panel would otherwise erase an override."""
+    return bool(
+        str(provider_id or "").strip()
+        and (
+            str(base_url or "").strip()
+            or str(api_key_id or "").strip()
+        )
+    )
+
+
+BACKUP_STAGE_TEXT = {
+    "queued": "排队中",
+    "scanning": "扫描文件",
+    "writing": "写入压缩包",
+    "verifying": "验证压缩包",
+    "hashing": "计算校验值",
+    "cancelling": "收尾中",
+    "cancelled": "已取消",
+    "interrupted": "已中断",
+    "done": "完成",
+    "partial": "部分完成",
+    "failed": "失败",
+}
+
+
+BACKUP_TERMINAL_STATES = frozenset(
+    {
+        "done",
+        "completed",
+        "success",
+        "partial",
+        "failed",
+        "cancelled",
+        "interrupted",
+    }
+)
+
+
 def _spec_map(group: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {
         str(spec.get("path") or ""): spec
@@ -48,14 +91,22 @@ def _labeled_switch(text: str, active: bool) -> tuple[Gtk.Box, Gtk.Switch]:
     return row, switch
 
 
-def _spin(spec: dict[str, Any], low: int, high: int) -> Gtk.SpinButton:
-    control = Gtk.SpinButton.new_with_range(low, high, 1)
+def _spin(
+    spec: dict[str, Any],
+    low: float,
+    high: float,
+    *,
+    step: float = 1.0,
+    digits: int = 0,
+) -> Gtk.SpinButton:
+    control = Gtk.SpinButton.new_with_range(low, high, step)
+    control.set_digits(digits)
     control.set_numeric(True)
     control.set_halign(Gtk.Align.START)
     try:
-        control.set_value(int(_value(spec, low) or low))
+        control.set_value(float(_value(spec, low) or low))
     except (TypeError, ValueError):
-        control.set_value(low)
+        control.set_value(float(low))
     return control
 
 
@@ -69,10 +120,17 @@ def _card(title: str, description: str, *children: Gtk.Widget | None) -> Gtk.Box
 
 
 def _provider_preset(
-    provider: dict[str, Any], presets: list[dict[str, Any]]
+    provider: dict[str, Any],
+    presets: list[dict[str, Any]],
+    model_id: str = "",
 ) -> dict[str, Any] | None:
-    preset_id = str(provider.get("preset") or "").lower()
-    return next((item for item in presets if str(item.get("id")) == preset_id), None)
+    from .models import _resolve_provider_vendor
+
+    vendor = _resolve_provider_vendor(provider, model_id, presets)
+    return next(
+        (item for item in presets if str(item.get("id")) == vendor),
+        None,
+    )
 
 
 def _model_candidates(
@@ -80,23 +138,39 @@ def _model_candidates(
     provider: dict[str, Any] | None,
     capability: str | None = None,
 ) -> list[tuple[str, str]]:
-    preset_id = ""
-    if provider:
-        preset_id = str(provider.get("preset") or "").lower()
     result: list[tuple[str, str]] = []
     seen: set[str] = set()
-    for preset in presets:
-        if preset_id and str(preset.get("id") or "").lower() != preset_id:
-            continue
-        for model in preset.get("models") or []:
+
+    def _append(models: list[dict[str, Any]], keep_capability: bool) -> None:
+        for model in models:
             caps = model.get("capabilities") or []
-            if capability and capability not in caps:
+            if keep_capability and capability and capability not in caps:
                 continue
             model_id = str(model.get("id") or "")
             if not model_id or model_id in seen:
                 continue
             seen.add(model_id)
-            result.append((model_id, str(model.get("display_name") or model_id)))
+            result.append(
+                (model_id, str(model.get("display_name") or model_id))
+            )
+
+    if provider:
+        preset = _provider_preset(provider, presets)
+        if preset is not None:
+            models = list(preset.get("models") or [])
+            filtered = [
+                item
+                for item in models
+                if not capability
+                or capability in (item.get("capabilities") or [])
+            ]
+            # WebUI 在预设没有声明能力时回退到该预设的全部模型，
+            # 避免中转站/新模型无法从建议列表中选择。
+            _append(filtered or models, False)
+            return result
+
+    for preset in presets:
+        _append(list(preset.get("models") or []), True)
     return result
 
 
@@ -146,16 +220,35 @@ def _chat_model_hint(page: Any) -> tuple[str, bool, bool]:
     provider_id = str(chat.get("provider") or "")
     model_id = str(chat.get("model") or "")
     provider = next((item for item in providers if item.get("id") == provider_id), None)
-    preset = _provider_preset(provider, presets) if provider else None
     label = f"{provider_id} / {model_id}" if provider_id or model_id else ""
-    if preset is None:
+    if provider is None:
         return label, False, False
-    model = next(
-        (item for item in (preset.get("models") or []) if item.get("id") == model_id),
-        None,
+    from .models import _resolve_preset_model
+
+    _preset, model, _vendor = _resolve_preset_model(
+        presets, provider, model_id
     )
-    caps = set(model.get("capabilities") or []) if model else set()
+    caps = set((model or {}).get("capabilities") or [])
     return label, "vision" in caps, "video" in caps
+
+
+def _install_dirty_tracking(panel: Gtk.Widget) -> None:
+    """Mark batch-save panels dirty on real user input, not programmatic loads."""
+    panel.dirty = False  # type: ignore[attr-defined]
+
+    def _key(_controller: Any, _keyval: int, _code: int, _state: Any) -> bool:
+        panel.dirty = True  # type: ignore[attr-defined]
+        return False
+
+    def _click(*_args: Any) -> None:
+        panel.dirty = True  # type: ignore[attr-defined]
+
+    key = Gtk.EventControllerKey()
+    key.connect("key-pressed", _key)
+    panel.add_controller(key)
+    click = Gtk.GestureClick()
+    click.connect("pressed", _click)
+    panel.add_controller(click)
 
 
 class VisionSettingsPanel(Gtk.Box):
@@ -164,6 +257,7 @@ class VisionSettingsPanel(Gtk.Box):
         self.page = page
         self.specs = _spec_map(group)
         self._build()
+        _install_dirty_tracking(self)
 
     def _build(self) -> None:
         specs = self.specs
@@ -173,6 +267,7 @@ class VisionSettingsPanel(Gtk.Box):
             self.append(widgets.muted("视觉设置字段不完整，无法渲染专用面板。"))
             return
 
+        _providers, _presets, provider_error = self.page.provider_payload()
         label, supports_vision, supports_video = _chat_model_hint(self.page)
         native_hint = widgets.muted("")
         native_select = widgets.dropdown(_options(native), str(_value(native, "auto")))
@@ -206,15 +301,20 @@ class VisionSettingsPanel(Gtk.Box):
             _card(
                 "主模型原生图片输入",
                 "让聊天模型直接接收用户图片；这条路径不需要独立视觉 provider。",
+                widgets.muted(
+                    f"读取 provider/预设失败，无法判断当前聊天模型：{provider_error}"
+                ) if provider_error else None,
                 _field_block(
                     "图片输入策略",
                     native_select,
                     "auto：仅预设标记 vision 的聊天模型；on：显式开启；off：不向主模型附图。",
                 ),
                 native_hint,
-                self._immediate_spec_control("features.vision.image_token_reserve", 1, 1_000_000),
                 self._immediate_spec_control(
-                    "features.vision.image_limits.max_images_per_request", 1, 100
+                    "features.vision.image_token_reserve", 256, 65536
+                ),
+                self._immediate_spec_control(
+                    "features.vision.image_limits.max_images_per_request", 1, 20
                 ),
                 self._immediate_spec_control("features.vision.gif_mode", options=True),
             )
@@ -259,11 +359,21 @@ class VisionSettingsPanel(Gtk.Box):
                 _card(
                     "主模型原生视频输入",
                     "把完整视频作为 video_url 发给聊天模型；不支持时只保留占位，不抽帧。",
-                    _field_block("视频输入策略", video_select),
+                    widgets.muted(
+                        f"读取 provider/预设失败，无法判断当前聊天模型：{provider_error}"
+                    ) if provider_error else None,
+                    _field_block(
+                        "视频输入策略",
+                        video_select,
+                        "auto：仅预设标记 video 的聊天模型；on：显式开启；"
+                        "off：不发送。视频以受管 data URL 发送完整文件，不抽帧降级。",
+                    ),
                     video_hint,
-                    self._immediate_spec_control("features.vision.video_token_reserve", 1, 1_000_000),
                     self._immediate_spec_control(
-                        "features.vision.video_limits.max_videos_per_request", 1, 20
+                        "features.vision.video_token_reserve", 1024, 524288
+                    ),
+                    self._immediate_spec_control(
+                        "features.vision.video_limits.max_videos_per_request", 1, 2
                     ),
                 )
             )
@@ -336,7 +446,7 @@ class VisionSettingsPanel(Gtk.Box):
         enabled_switch.set_active(bool(_value(enabled_spec, False)))
         details = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
 
-        provider_options = [("", "自定义 OpenAI 兼容端点")]
+        provider_options = [("", "自定义 OpenAI 兼容端点（不引用已有 provider）")]
         for provider in providers:
             preset = _provider_preset(provider, presets)
             label = f"{provider.get('display_name') or provider.get('id')} ({provider.get('id')})"
@@ -364,8 +474,13 @@ class VisionSettingsPanel(Gtk.Box):
         model_row.append(model_entry)
         model_row.append(suggestion)
 
+        has_saved_override = _vision_override_present(
+            current_provider,
+            str(_value(base_spec, "") or ""),
+            key_state["id"],
+        )
         override_row, override_switch = _labeled_switch(
-            "覆盖该 provider 的地址/密钥（高级）", False
+            "覆盖该 provider 的地址/密钥（高级）", has_saved_override
         )
         base_entry = Gtk.Entry()
         base_entry.set_text(str(_value(base_spec, "") or ""))
@@ -398,24 +513,40 @@ class VisionSettingsPanel(Gtk.Box):
 
         def sync_visibility(*_args: Any) -> None:
             details.set_visible(bool(enabled_switch.get_active()))
-            is_custom = not widgets.dropdown_value(provider_select)
+            provider_value = widgets.dropdown_value(provider_select)
+            is_custom = not provider_value
             show_override = is_custom or override_switch.get_active()
             override_row.set_visible(not is_custom)
             base_row.set_visible(show_override)
             key_row.set_visible(show_override)
             if is_custom:
                 custom_note.set_text(
-                    "未选择已有 provider：需要填写 base_url 和 API Key，按 OpenAI 兼容协议连接。"
+                    "未选择已有 provider：需要填写 base_url 和 API Key，"
+                    "按 OpenAI 兼容协议连接。"
                 )
             else:
                 custom_note.set_text(
-                    "复用该 provider 的协议、地址与密钥；只有视觉端点不同时才勾选“覆盖”。"
+                    "复用该 provider 的协议、地址与密钥；"
+                    "只有视觉端点不同时才勾选“覆盖”。"
                 )
-            if not providers:
+            provider_known = any(
+                str(item.get("id")) == provider_value for item in providers
+            )
+            if provider_error:
+                warning.set_text(f"读取 provider/预设失败：{provider_error}")
+                warning.set_visible(True)
+            elif not providers:
                 warning.set_text(
-                    "还没有添加 provider。可以到「模型与提供商」添加，或使用自定义端点。"
+                    "还没有添加 provider。可以到「模型管理」添加，或使用自定义端点。"
                 )
                 warning.set_visible(True)
+            elif not is_custom and not provider_known:
+                warning.set_text(
+                    "当前视觉 provider 不在已添加列表中，请重新选择。"
+                )
+                warning.set_visible(True)
+            else:
+                warning.set_visible(False)
 
         def provider_changed(*_args: Any) -> None:
             override_switch.set_active(False)
@@ -503,6 +634,7 @@ class VisionSettingsPanel(Gtk.Box):
                     save_status.set_text(
                         str(result.get("message") or "视觉设置已保存并立即生效")
                     )
+                self.dirty = False
                 self.page.toast(str(result.get("message") or "视觉设置已保存"))
                 save_button.set_sensitive(True)
 
@@ -514,15 +646,31 @@ class VisionSettingsPanel(Gtk.Box):
 
         details.append(warning)
         details.append(custom_note)
-        details.append(_field_block("视觉 provider", provider_select))
-        details.append(_field_block("视觉模型", model_row))
+        details.append(
+            _field_block(
+                "视觉 provider",
+                provider_select,
+                "引用「模型管理」里已添加的 provider；"
+                "选择已有 provider 后通常不需要再填地址和 Key。",
+            )
+        )
+        details.append(
+            _field_block(
+                "视觉模型",
+                model_row,
+                "独立看图模型 ID，例如 glm-4v / qwen-vl-max；"
+                "可以和聊天模型不同。",
+            )
+        )
         details.append(override_row)
         details.append(base_row)
         details.append(key_row)
         sync_visibility()
         card = _card(
             "独立视觉识别（可选）",
-            "主模型不能看图，或想把看图交给另一个模型时使用；开启后只提供 describe_image 工具。",
+            "主模型不能看图，或想把看图交给另一个模型时使用；开启后只提供 "
+            "describe_image 工具。关闭时保留配置，不会删除密钥；只有开启后"
+            "才会构造独立视觉客户端。",
             enabled_row,
             details,
             action_row,
@@ -536,6 +684,7 @@ class SearchSettingsPanel(Gtk.Box):
         self.page = page
         self.specs = _spec_map(group)
         self._build()
+        _install_dirty_tracking(self)
 
     def _build(self) -> None:
         specs = self.specs
@@ -559,21 +708,35 @@ class SearchSettingsPanel(Gtk.Box):
         engine_select = widgets.dropdown(
             _options(engine_spec), str(_value(engine_spec, "bing_rss"))
         )
+        engine_help = widgets.muted("")
+        engine_block = _field_block(
+            "免费搜索后端",
+            engine_select,
+            str(engine_spec.get("help") or ""),
+        )
+        engine_block.append(engine_help)
         searxng_spec = specs.get("features.web_search.searxng_base_url") or {}
         searxng_entry = Gtk.Entry()
         searxng_entry.set_text(str(_value(searxng_spec, "") or ""))
         searxng_entry.set_placeholder_text("https://searx.example.com")
-        searxng_row = _field_block("SearXNG 地址", searxng_entry)
+        searxng_row = _field_block(
+            "SearXNG 地址",
+            searxng_entry,
+            str(searxng_spec.get("help") or ""),
+        )
         max_spec = specs.get("features.web_search.max_results") or {}
         timeout_spec = specs.get("features.web_search.timeout_seconds") or {}
         max_spin = _spin(max_spec, 1, 20)
-        timeout_spin = _spin(timeout_spec, 1, 60)
+        timeout_spin = _spin(timeout_spec, 1, 60, step=0.5, digits=1)
         official_timeout_spec = specs.get("features.web_search.official.timeout_seconds") or {}
-        official_timeout_spin = _spin(official_timeout_spec, 5, 180)
+        official_timeout_spin = _spin(
+            official_timeout_spec, 5, 180, step=0.5, digits=1
+        )
         probe_status = widgets.muted("")
         probe_button = widgets.button("测速免费搜索")
+        probe_state = {"probing": False}
         free_details = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        free_details.append(_field_block("免费搜索后端", engine_select))
+        free_details.append(engine_block)
         free_details.append(searxng_row)
         free_details.append(_field_block("最多结果数", max_spin, "1–20，建议 5。"))
         free_details.append(
@@ -636,7 +799,11 @@ class SearchSettingsPanel(Gtk.Box):
             )
         )
         official_details.append(
-            _field_block("官方搜索超时（秒）", official_timeout_spin)
+            _field_block(
+                "官方搜索超时（秒）",
+                official_timeout_spin,
+                str(official_timeout_spec.get("help") or ""),
+            )
         )
         if provider_error:
             official_details.append(widgets.muted(f"读取 provider/预设失败：{provider_error}"))
@@ -655,14 +822,25 @@ class SearchSettingsPanel(Gtk.Box):
         save_button = widgets.button("保存搜索设置", css="suggested-action")
         save_button.set_halign(Gtk.Align.END)
 
+        provider_notes = {
+            "bing_rss": "Bing RSS：国内通常可直连、无广告，适合作为默认免费通道。",
+            "baidu": "百度：国内直连；结果可能包含推广内容，建议配合结果过滤。",
+            "searxng": "SearXNG：需要自建实例并开启 JSON 输出；地址只在选择该后端时使用。",
+        }
+
         def sync_visibility(*_args: Any) -> None:
             enabled = bool(master_switch.get_active())
+            provider = widgets.dropdown_value(engine_select)
             free_switch.set_sensitive(enabled)
             official_switch.set_sensitive(enabled)
             free_details.set_visible(enabled and bool(free_switch.get_active()))
             official_details.set_visible(enabled and bool(official_switch.get_active()))
-            searxng_row.set_visible(widgets.dropdown_value(engine_select) == "searxng")
-            probe_button.set_sensitive(bool(free_switch.get_active()) and enabled)
+            searxng_row.set_visible(provider == "searxng")
+            engine_help.set_text(provider_notes.get(provider, ""))
+            engine_help.set_visible(bool(provider_notes.get(provider)))
+            # The probe only exercises the free channel; allow it while the
+            # free channel is disabled so a backend can be tested before use.
+            probe_button.set_sensitive(enabled and not probe_state["probing"])
 
         engine_select.connect("notify::selected", sync_visibility)
         free_switch.connect("notify::active", sync_visibility)
@@ -679,6 +857,7 @@ class SearchSettingsPanel(Gtk.Box):
             if provider == "searxng" and not searxng:
                 probe_status.set_text("请先填写 SearXNG 地址。")
                 return
+            probe_state["probing"] = True
             probe_button.set_sensitive(False)
             probe_status.set_text("测速中…")
 
@@ -703,11 +882,13 @@ class SearchSettingsPanel(Gtk.Box):
                     probe_status.set_text(
                         f"不可用：{error}（{result.get('latency_ms', 0)} ms）"
                     )
-                probe_button.set_sensitive(True)
+                probe_state["probing"] = False
+                sync_visibility()
 
             def _failed(exc: BaseException) -> None:
+                probe_state["probing"] = False
                 probe_status.set_text(f"测速失败：{exc}")
-                probe_button.set_sensitive(True)
+                sync_visibility()
 
             widgets.run_async(_do, on_success=_done, on_error=_failed)
 
@@ -793,6 +974,7 @@ class SearchSettingsPanel(Gtk.Box):
                     save_status.set_text(
                         str(result.get("message") or "搜索设置已保存并立即生效")
                     )
+                self.dirty = False
                 self.page.toast(str(result.get("message") or "搜索设置已保存"))
                 save_button.set_sensitive(True)
 
@@ -841,14 +1023,16 @@ class BackupSettingsPanel(Gtk.Box):
         self.summary_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self.status_card.append(self.summary_box)
         warning = widgets.label(
-            "安全提示：备份 ZIP 可能包含 RSA 私钥与加密密钥库，请保存在可信位置，"
-            "不要上传或公开分享。",
+            "安全提示：备份包含加密 API 密钥库与 RSA 私钥，拿到它就可能解密模型密钥。"
+            "ZIP 本身未加密，0600 只是本机文件权限；请像密码一样保管，"
+            "不要上传公共网盘或通过不安全渠道发送。",
             css="danger-text",
             wrap=True,
         )
         self.status_card.append(warning)
         actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.start_button = widgets.button("创建备份", css="suggested-action")
+        self.start_button.set_sensitive(False)
         self.start_button.connect("clicked", lambda _b: self._start())
         self.cancel_button = widgets.button("取消当前备份", css="destructive-action")
         self.cancel_button.set_visible(False)
@@ -861,6 +1045,10 @@ class BackupSettingsPanel(Gtk.Box):
         self.status_card.append(actions)
         self.status_label = widgets.muted("正在读取备份状态…")
         self.status_card.append(self.status_label)
+        # Manual verification/download results live separately so the 1s job
+        # poll cannot overwrite them while a backup is still running.
+        self.detail_label = widgets.muted("")
+        self.status_card.append(self.detail_label)
         self.append(self.status_card)
 
         self.append(widgets.section_header("备份任务", "最近 10 个任务；运行中的任务可取消"))
@@ -870,6 +1058,23 @@ class BackupSettingsPanel(Gtk.Box):
         self.append(widgets.section_header("备份文件", "可离线校验或下载到本机"))
         self.files_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         self.append(self.files_box)
+
+        guide = widgets.card(spacing=6, padding=14)
+        guide.append(widgets.section_header(
+            "恢复备份（手动）",
+            "GUI 与 WebUI 都不提供在线一键恢复，避免运行中的服务写坏恢复结果。",
+        ))
+        for line in (
+            "1. 先停止 GUI 和 Runtime，并复制当前数据目录作为回滚点。",
+            "2. 解压备份 ZIP 到临时目录，按包内 README_RESTORE.txt 操作。",
+            "3. 恢复时整体替换数据目录，不要只替换单个 SQLite 文件；"
+            "各库分别快照，跨库引用与版本号必须保持一致。",
+            "4. 恢复后启动 Runtime；若提示维护库或数据库版本需要迁移，"
+            "先保留原库副本，再按提示迁移。",
+            "5. 校验结果显示“凭据不可恢复”时，模型 API Key 需要重新填写。",
+        ):
+            guide.append(widgets.muted(line))
+        self.append(guide)
 
     def _on_mapped(self, *_args: Any) -> None:
         if self.get_mapped():
@@ -884,6 +1089,7 @@ class BackupSettingsPanel(Gtk.Box):
             return
         self._bump += 1
         token = self._bump
+        self.start_button.set_sensitive(False)
 
         def _do() -> dict[str, Any]:
             return self.page.api.get("/api/backup/status", timeout=60)
@@ -894,7 +1100,12 @@ class BackupSettingsPanel(Gtk.Box):
             self._render(data)
 
         def _failed(exc: BaseException) -> None:
-            self.status_label.set_text(f"读取备份状态失败：{exc}")
+            if token != self._bump:
+                return
+            self.start_button.set_sensitive(False)
+            self.status_label.set_text(
+                f"读取备份状态失败：{exc}。请点击刷新重试。"
+            )
 
         widgets.run_async(_do, on_success=_done, on_error=_failed)
 
@@ -906,6 +1117,13 @@ class BackupSettingsPanel(Gtk.Box):
             widgets.property_row(
                 "包含入站媒体",
                 "是" if data.get("include_media") else "否",
+            )
+        )
+        self.summary_box.append(
+            widgets.property_row(
+                "一致性",
+                "每个 SQLite 库分别快照；不是跨库全局事务，备份后的新消息不含在内",
+                wrap=True,
             )
         )
         files = data.get("files") or []
@@ -933,9 +1151,33 @@ class BackupSettingsPanel(Gtk.Box):
             if jobs:
                 latest = jobs[0]
                 state = str(latest.get("state") or "")
+                filename = str(latest.get("filename") or "")
+                size = widgets.format_bytes(latest.get("size"))
                 if state in {"done", "completed", "success"}:
                     self.status_label.set_text(
-                        f"最近任务完成：{widgets.format_bytes(latest.get('processed_bytes'))}"
+                        f"最近任务完成：{filename}（{size}）"
+                        if filename
+                        else f"最近任务完成：{size}"
+                    )
+                elif state == "partial":
+                    self.status_label.set_text(
+                        f"最近任务部分完成：{filename}（{size}），请查看任务警告。"
+                    )
+                elif state == "failed":
+                    error = latest.get("error") or {}
+                    message = (
+                        str(error.get("message") or "")
+                        if isinstance(error, dict)
+                        else ""
+                    )
+                    self.status_label.set_text(
+                        f"最近任务失败：{message or '未知错误'}"
+                    )
+                elif state == "cancelled":
+                    self.status_label.set_text("最近任务已取消，没有可下载文件。")
+                elif state == "interrupted":
+                    self.status_label.set_text(
+                        "上次备份被服务重启中断；可以重新发起备份。"
                     )
                 elif state:
                     self.status_label.set_text(f"最近任务：{state}")
@@ -959,12 +1201,12 @@ class BackupSettingsPanel(Gtk.Box):
             head.append(_state_badge(state))
             stage = str(job.get("stage") or "")
             if stage:
-                head.append(widgets.muted(stage))
+                head.append(widgets.muted(BACKUP_STAGE_TEXT.get(stage, stage)))
             head.set_hexpand(True)
             card.append(head)
             total = int(job.get("total_bytes") or 0)
             processed = int(job.get("processed_bytes") or 0)
-            if total > 0 and state not in {"done", "completed", "failed", "cancelled"}:
+            if total > 0 and state not in BACKUP_TERMINAL_STATES:
                 progress = Gtk.ProgressBar()
                 progress.set_fraction(min(1.0, processed / total))
                 progress.set_show_text(False)
@@ -992,7 +1234,7 @@ class BackupSettingsPanel(Gtk.Box):
         if not files:
             self.files_box.append(self.page.empty("备份目录里还没有文件。"))
             return
-        for item in files[:20]:
+        for item in files:
             filename = str(item.get("filename") or "")
             card = widgets.card(spacing=4, padding=10)
             head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -1008,6 +1250,17 @@ class BackupSettingsPanel(Gtk.Box):
                 widgets.format_timestamp(item.get("created_at")),
             ]
             file_count = item.get("file_count")
+            if item.get("include_media") is not None:
+                meta.append("含媒体" if item.get("include_media") else "不含媒体")
+            validation = str(item.get("validation_status") or "")
+            if validation:
+                meta.append("校验：" + validation)
+            if item.get("credential_restorable") is not None:
+                meta.append(
+                    "凭据可恢复"
+                    if item.get("credential_restorable")
+                    else "凭据不可恢复"
+                )
             if file_count:
                 meta.append(f"{file_count} 个文件")
             card.append(widgets.muted(" · ".join(str(x) for x in meta if x)))
@@ -1064,7 +1317,7 @@ class BackupSettingsPanel(Gtk.Box):
     def _verify(self, filename: str) -> None:
         if self.page.api is None:
             return
-        self.status_label.set_text(f"正在校验 {filename}…")
+        self.detail_label.set_text(f"正在校验 {filename}…")
 
         def _do() -> dict[str, Any]:
             return self.page.api.post(
@@ -1075,21 +1328,39 @@ class BackupSettingsPanel(Gtk.Box):
 
         def _done(report: dict[str, Any]) -> None:
             if report.get("ok"):
-                self.status_label.set_text(
-                    f"校验通过：{filename}（{report.get('member_count', 0)} 个成员）"
-                )
+                parts = [
+                    f"校验通过：{filename}（{report.get('member_count', 0)} 个成员）",
+                    "聊天可恢复：" + ("是" if report.get("chat_restorable") else "否"),
+                    "凭据可恢复："
+                    + ("是" if report.get("credential_restorable") else "否"),
+                ]
+                state = str(report.get("validation_status") or "")
+                if state:
+                    parts.append("状态：" + state)
+                warnings = [str(item) for item in report.get("warnings") or []]
+                if warnings:
+                    parts.append("警告：" + "；".join(warnings))
+                if not report.get("credential_restorable"):
+                    parts.append("凭据不可恢复，请勿只依赖这个备份恢复 API Key")
+                self.detail_label.set_text(" · ".join(parts))
             else:
                 errors = [
                     str(item.get("message") or item.get("code") or "")
                     for item in report.get("errors") or []
                 ]
-                self.status_label.set_text(
-                    "校验失败：" + ("；".join(x for x in errors if x) or "未知原因")
+                warnings = [
+                    str(item) for item in report.get("warnings") or []
+                ]
+                message = "校验失败：" + (
+                    "；".join(x for x in errors if x) or "未知原因"
                 )
-            self.page.toast(self.status_label.get_text())
+                if warnings:
+                    message += "；警告：" + "；".join(warnings)
+                self.detail_label.set_text(message)
+            self.page.toast(self.detail_label.get_text())
 
         def _failed(exc: BaseException) -> None:
-            self.status_label.set_text(f"校验失败：{exc}")
+            self.detail_label.set_text(f"校验失败：{exc}")
 
         widgets.run_async(_do, on_success=_done, on_error=_failed)
 
@@ -1101,7 +1372,7 @@ class BackupSettingsPanel(Gtk.Box):
         )
         if not target:
             return
-        self.status_label.set_text(f"正在下载 {filename}…")
+        self.detail_label.set_text(f"正在下载 {filename}…")
 
         def _do() -> int:
             data = self.page.api.raw(f"/api/backup/files/{q(filename)}", timeout=600)
@@ -1110,11 +1381,11 @@ class BackupSettingsPanel(Gtk.Box):
             return len(data)
 
         def _done(size: int) -> None:
-            self.status_label.set_text(f"已下载 {filename}（{widgets.format_bytes(size)}）")
+            self.detail_label.set_text(f"已下载 {filename}（{widgets.format_bytes(size)}）")
             self.page.toast("备份已保存到本机")
 
         def _failed(exc: BaseException) -> None:
-            self.status_label.set_text(f"下载失败：{exc}")
+            self.detail_label.set_text(f"下载失败：{exc}")
 
         widgets.run_async(_do, on_success=_done, on_error=_failed)
 
@@ -1145,7 +1416,7 @@ class BackupSettingsPanel(Gtk.Box):
             total = widgets.format_bytes(job.get("total_bytes"))
             current = str(job.get("current") or job.get("stage") or "")
             self.status_label.set_text(f"备份中：{processed} / {total}" + (f" · {current}" if current else ""))
-            if state in {"done", "completed", "success", "failed", "cancelled", "interrupted"}:
+            if state in BACKUP_TERMINAL_STATES:
                 self.refresh()
             else:
                 self._schedule_poll()
@@ -1164,6 +1435,7 @@ class UpdateSettingsPanel(Gtk.Box):
         self.page = page
         self.specs = _spec_map(group)
         self._presets: list[dict[str, str]] = []
+        self._preset_values: set[str] = set()
         self._build()
         self.connect("notify::mapped", self._on_mapped)
 
@@ -1176,12 +1448,21 @@ class UpdateSettingsPanel(Gtk.Box):
         open_versions.connect(
             "clicked", lambda _b: self.page.app.show_page("updates")
         )
+        restart_backend = widgets.button("重启后端")
+        restart_backend.set_tooltip_text(
+            "重新启动 GUI 的本地控制后端并加载磁盘上的 Python 代码"
+        )
+        restart_backend.connect(
+            "clicked", lambda _b: self._confirm_restart_backend()
+        )
         self.info_card = _card(
             "更新状态",
-            "只读版本信息；完整的版本列表与更新日志在「版本与更新」页面。",
+            "版本信息与后端重启；完整的版本列表、兼容检查与更新日志在"
+            "「版本与更新」页面。",
             self.info_box,
             self.status_label,
             open_versions,
+            restart_backend,
         )
         self.append(self.info_card)
 
@@ -1193,24 +1474,31 @@ class UpdateSettingsPanel(Gtk.Box):
         self.mirror_value.set_hexpand(True)
         self.mirror_select = widgets.dropdown([("", "GitHub 官方（直连）")], "")
         self.mirror_select.connect("notify::selected", self._mirror_selected)
+        self.mirror_note = widgets.muted("")
         self.probe_status = widgets.muted("")
+        self.probe_results = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=4
+        )
         save = widgets.button("保存镜像设置", css="suggested-action")
         save.connect("clicked", lambda _b: self._save_mirror())
-        probe = widgets.button("测速镜像")
-        probe.connect("clicked", lambda _b: self._probe())
+        self.probe_button = widgets.button("测速镜像")
+        self.probe_button.connect("clicked", lambda _b: self._probe())
         actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         actions.append(save)
-        actions.append(probe)
+        actions.append(self.probe_button)
         mirror_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         mirror_row.append(self.mirror_select)
         mirror_row.append(self.mirror_value)
         self.append(
             _card(
                 "GitHub 镜像 / 加速源",
-                "修改只影响更新检查与拉取，不会自动更新 GUI 源码。",
+                "修改只影响更新检查与拉取，不会自动更新 GUI 源码。"
+                "第三方源会看到代码请求；只使用你信任的 https 源。",
                 _field_block("预设", mirror_row),
+                self.mirror_note,
                 actions,
                 self.probe_status,
+                self.probe_results,
             )
         )
 
@@ -1232,6 +1520,9 @@ class UpdateSettingsPanel(Gtk.Box):
 
         def _done(data: dict[str, Any]) -> None:
             self._presets = list(data.get("mirror_presets") or [])
+            self._preset_values = {
+                str(item.get("value") or "") for item in self._presets
+            }
             options = [
                 (str(item.get("value") or ""), str(item.get("label") or item.get("value") or "官方"))
                 for item in self._presets
@@ -1244,6 +1535,10 @@ class UpdateSettingsPanel(Gtk.Box):
             index = next((i for i, (value, _label) in enumerate(options) if value == current), 0)
             self.mirror_select.set_selected(index)
             self.mirror_value.set_text(current)
+            self.mirror_value.set_sensitive(
+                not current or current not in self._preset_values
+            )
+            self._sync_mirror_note()
             widgets.clear(self.info_box)
             self.info_box.append(
                 widgets.property_row("版本", str(data.get("version_label") or "—"))
@@ -1259,9 +1554,38 @@ class UpdateSettingsPanel(Gtk.Box):
             self.info_box.append(
                 widgets.property_row(
                     "工作树",
-                    "有未提交改动" if data.get("worktree_dirty") else "干净",
+                    (
+                        f"有未提交改动（{data.get('dirty_file_count', 0)} 个文件）"
+                        if data.get("worktree_dirty")
+                        else "干净"
+                    ),
                 )
             )
+            for name, value in (
+                ("仓库", data.get("repo")),
+                ("更新目标", data.get("target_ref")),
+                ("跟踪分支", data.get("target_branch")),
+                ("检查间隔", f"{data.get('check_interval_days', 0)} 天"),
+                ("数据目录", data.get("data_dir")),
+            ):
+                if value:
+                    self.info_box.append(
+                        widgets.property_row(name, str(value), wrap=True)
+                    )
+            notification = data.get("notification") or {}
+            if notification:
+                checked = widgets.short_time(notification.get("last_check_at"))
+                nxt = widgets.short_time(notification.get("next_check_at"))
+                if checked:
+                    self.info_box.append(widgets.property_row("上次检查", checked))
+                if nxt:
+                    self.info_box.append(widgets.property_row("下次检查", nxt))
+                if notification.get("last_error"):
+                    self.info_box.append(
+                        widgets.muted(
+                            "上次检查失败：" + str(notification["last_error"])
+                        )
+                    )
             effective = str(data.get("effective_remote") or "")
             if effective:
                 self.info_box.append(widgets.property_row("远端", effective, wrap=True))
@@ -1276,7 +1600,42 @@ class UpdateSettingsPanel(Gtk.Box):
 
     def _mirror_selected(self, *_args: Any) -> None:
         value = widgets.dropdown_value(self.mirror_select)
+        # A custom value is appended as an option so it remains selectable, but
+        # it must stay editable. Only fixed presets lock the text entry.
+        self.mirror_value.set_sensitive(
+            not value or value not in self._preset_values
+        )
         self.mirror_value.set_text(value)
+        self._sync_mirror_note()
+
+    def _sync_mirror_note(self) -> None:
+        value = widgets.dropdown_value(self.mirror_select)
+        note = ""
+        for item in self._presets:
+            if str(item.get("value") or "") == value:
+                note = str(item.get("note") or "")
+                break
+        if not value:
+            note = note or "不经过第三方；私有仓库需要本机已配置 git 凭据。"
+        elif not note and value not in self._preset_values:
+            note = "当前为自定义镜像；请输入可信的 https git 地址。"
+        self.mirror_note.set_text(note)
+        self.mirror_note.set_visible(bool(note))
+
+    def _confirm_restart_backend(self) -> None:
+        restart = getattr(self.page.app, "restart_backend", None)
+        if not callable(restart):
+            self.page.toast("当前窗口不支持重启后端")
+            return
+        widgets.ConfirmDialog(
+            self.page.app.window,
+            heading="重启 GUI 本地后端？",
+            body="当前正在进行的请求会被中断，界面会短暂显示加载页。"
+            "这会重新加载磁盘上的 Python 代码；当前进程中已导入的 GUI 界面"
+            "代码不会被热替换。",
+            confirm_label="重启后端",
+            on_confirm=restart,
+        )
 
     def _save_mirror(self) -> None:
         if not self.mirror_spec:
@@ -1292,29 +1651,69 @@ class UpdateSettingsPanel(Gtk.Box):
         if self.page.api is None:
             return
         self.probe_status.set_text("正在测速（GitHub 官方与预设镜像）…")
-        self.mirror_value.set_text(self.mirror_value.get_text().strip())
+        self.probe_button.set_sensitive(False)
+        widgets.clear(self.probe_results)
 
         def _do() -> dict[str, Any]:
             return self.page.api.post("/api/update/probe", {}, timeout=120)
 
         def _done(data: dict[str, Any]) -> None:
+            self.probe_button.set_sensitive(True)
             results = data.get("results") or []
             if not results:
                 self.probe_status.set_text("没有可测速的镜像。")
                 return
-            lines = []
+            current = self.mirror_value.get_text().strip()
+            rows: list[list[Any]] = []
             for item in results:
-                name = str(item.get("label") or item.get("mirror") or "官方")
-                if item.get("ok"):
-                    lines.append(f"{name}：{item.get('latency_ms', 0)} ms")
+                mirror = str(item.get("mirror") or "")
+                name = str(item.get("label") or mirror or "GitHub 官方")
+                status = (
+                    "可用"
+                    if item.get("ok")
+                    else str(item.get("error") or item.get("error_code") or "失败")
+                )
+                if not item.get("ok"):
+                    use: Any = ""
+                elif mirror == current:
+                    use = widgets.badge("当前", css="badge badge-green")
                 else:
-                    lines.append(f"{name}：失败（{item.get('error') or item.get('error_code') or '未知'}）")
-            self.probe_status.set_text("\n".join(lines))
+                    use = widgets.button("使用", css="compact-button")
+                    use.connect(
+                        "clicked",
+                        lambda _b, value=mirror: self._use_mirror(value),
+                    )
+                rows.append(
+                    [
+                        name,
+                        f"{item.get('latency_ms', 0)} ms",
+                        status,
+                        use,
+                    ]
+                )
+            self.probe_results.append(
+                widgets.table(
+                    ["源", "延迟", "状态", "操作"],
+                    rows,
+                    weights=[2.2, 1.0, 2.4, 0.8],
+                )
+            )
+            self.probe_status.set_text(
+                "测速完成；只执行 git ls-remote，不下载代码、不更新。"
+            )
 
         def _failed(exc: BaseException) -> None:
+            self.probe_button.set_sensitive(True)
             self.probe_status.set_text(f"测速失败：{exc}")
 
         widgets.run_async(_do, on_success=_done, on_error=_failed)
+
+    def _use_mirror(self, value: str) -> None:
+        self.mirror_value.set_text(value)
+        values = getattr(self.mirror_select, "_values", [])
+        if value in values:
+            self.mirror_select.set_selected(values.index(value))
+        self._save_mirror()
 
 
 class TokenBudgetSettingsPanel(Gtk.Box):
@@ -1323,14 +1722,18 @@ class TokenBudgetSettingsPanel(Gtk.Box):
         self.page = page
         self.snapshot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self.status = widgets.muted("")
-        compact = widgets.button("立即压缩活跃历史")
-        compact.connect("clicked", lambda _b: self._compact())
+        self.manual_status = widgets.muted("")
+        self.compact_button = widgets.button("立即压缩活跃历史")
+        self.compact_button.set_sensitive(False)
+        self.compact_button.connect("clicked", lambda _b: self._compact())
         self.card = _card(
             "当前预算快照",
-            "有效窗口 = min(工作窗口, 模型限制)；净输入预算 = 窗口 - 输出预留 - 安全余量。",
+            "有效窗口 = min(工作窗口, 模型限制)；净输入预算 = 窗口 - 输出预留 - 安全余量。"
+            "该预算已用于发送前硬 guard；估算值不是供应商账单。",
             self.snapshot,
-            compact,
+            self.compact_button,
             self.status,
+            self.manual_status,
         )
         self.append(self.card)
         self.connect("notify::mapped", self._on_mapped)
@@ -1346,6 +1749,7 @@ class TokenBudgetSettingsPanel(Gtk.Box):
     def refresh(self) -> None:
         if self.page.api is None:
             return
+        self.compact_button.set_sensitive(False)
         self.status.set_text("正在读取预算…")
 
         def _do() -> dict[str, Any]:
@@ -1353,6 +1757,7 @@ class TokenBudgetSettingsPanel(Gtk.Box):
 
         def _done(data: dict[str, Any]) -> None:
             widgets.clear(self.snapshot)
+            self.compact_button.set_sensitive(True)
             budget = data.get("budget") or {}
             compaction = data.get("compaction") or {}
             rows = [
@@ -1407,7 +1812,10 @@ class TokenBudgetSettingsPanel(Gtk.Box):
                 self.status.set_text("")
 
         def _failed(exc: BaseException) -> None:
-            self.status.set_text(f"读取预算失败：{exc}")
+            self.compact_button.set_sensitive(False)
+            self.status.set_text(
+                f"读取预算失败：{exc}。请刷新面板后重试。"
+            )
 
         widgets.run_async(_do, on_success=_done, on_error=_failed)
 
@@ -1419,10 +1827,12 @@ class TokenBudgetSettingsPanel(Gtk.Box):
             def _request() -> dict[str, Any]:
                 return self.page.api.post("/api/context/compact", {}, timeout=300)
 
+            self.compact_button.set_sensitive(False)
+            self.manual_status.set_text("正在调用摘要模型，请稍候…")
             widgets.run_async(
                 _request,
                 on_success=self._compacted,
-                on_error=lambda exc: self.status.set_text(f"压缩失败：{exc}"),
+                on_error=self._compact_failed,
             )
 
         widgets.ConfirmDialog(
@@ -1434,17 +1844,22 @@ class TokenBudgetSettingsPanel(Gtk.Box):
         )
 
     def _compacted(self, payload: dict[str, Any]) -> None:
+        self.compact_button.set_sensitive(True)
         result = payload.get("result") or {}
         if payload.get("ok"):
-            self.status.set_text(
+            self.manual_status.set_text(
                 f"压缩完成：归档 {result.get('archived_count', 0)} 条，"
                 f"活跃 {result.get('active_records', 0)} 条。"
             )
         else:
-            self.status.set_text(
+            self.manual_status.set_text(
                 f"未压缩：{result.get('reason') or result.get('status') or '无可用结果'}"
             )
         self.refresh()
+
+    def _compact_failed(self, exc: BaseException) -> None:
+        self.compact_button.set_sensitive(True)
+        self.manual_status.set_text(f"压缩失败：{exc}")
 
 
 def _set_native_hint(hint: Gtk.Label, mode: str, label: str, supports: bool) -> None:
@@ -1480,6 +1895,8 @@ def _state_badge(state: str) -> Gtk.Label:
         "done": ("完成", "badge badge-green"),
         "completed": ("完成", "badge badge-green"),
         "success": ("完成", "badge badge-green"),
+        "partial": ("部分完成", "badge badge-orange"),
+        "cancelling": ("取消中", "badge badge-orange"),
         "failed": ("失败", "badge badge-red"),
         "cancelled": ("已取消", "badge badge-orange"),
         "interrupted": ("已中断", "badge badge-red"),

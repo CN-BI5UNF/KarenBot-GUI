@@ -26,6 +26,9 @@ class KnowledgePage(Page):
     def build(self) -> None:
         self._persona_id = ""
         self._search_timer = 0
+        self._research_busy = False
+        self._shared_switch_guard = False
+        self._share_busy: set[str] = set()
         header_row = self.header()
         settings_button = widgets.button("考究设置")
         settings_button.connect(
@@ -157,12 +160,13 @@ class KnowledgePage(Page):
             head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
             kind = str(entry.get("kind") or "note")
             head.append(widgets.badge(dict(KINDS).get(kind, kind)))
-            foreign_shared = bool(
-                entry.get("shared")
-                and entry.get("persona_id")
-                and self._persona_id
-                and str(entry.get("persona_id")) != self._persona_id
+            # 归属未知的共享条目也必须按只读处理；服务端会在写入时拒绝，
+            # 界面不能先把它显示成可编辑。
+            owned = (
+                not self._persona_id
+                or str(entry.get("persona_id") or "") == self._persona_id
             )
+            foreign_shared = bool(entry.get("shared") and not owned)
             if entry.get("shared"):
                 head.append(widgets.badge("共享"))
             if foreign_shared:
@@ -176,6 +180,18 @@ class KnowledgePage(Page):
             head.append(title_label)
             editable = writable and not foreign_shared
             if editable:
+                shared_row = Gtk.Box(
+                    orientation=Gtk.Orientation.HORIZONTAL, spacing=4
+                )
+                shared_switch = widgets.switch(bool(entry.get("shared")))
+                shared_switch.set_tooltip_text("立即共享/取消共享给其他人格")
+                shared_switch.connect(
+                    "notify::active",
+                    lambda sw, _pspec, e=entry: self._set_shared(e, sw),
+                )
+                shared_row.append(shared_switch)
+                shared_row.append(widgets.muted("共享"))
+                head.append(shared_row)
                 edit = widgets.button("编辑")
                 edit.connect("clicked", lambda _b, e=entry: self._editor(e))
                 head.append(edit)
@@ -191,6 +207,13 @@ class KnowledgePage(Page):
                 meta.append("标签：" + "、".join(str(x) for x in tags))
             if entry.get("usage"):
                 meta.append("语境：" + str(entry.get("usage")))
+            source_channel = {
+                "manual": "手动",
+                "ai": "AI 候选",
+                "system": "系统",
+            }.get(str(entry.get("source") or ""), str(entry.get("source") or ""))
+            if source_channel:
+                meta.append("来源渠道：" + source_channel)
             sources = entry.get("sources") or []
             if sources:
                 meta.append("来源：" + "、".join(str(x) for x in sources[:3]))
@@ -230,8 +253,11 @@ class KnowledgePage(Page):
         shared = widgets.switch(bool((entry or {}).get("shared")))
         confidence = Gtk.SpinButton.new_with_range(0, 1, 0.05)
         confidence.set_digits(2)
+        raw_confidence = (entry or {}).get("confidence")
+        if raw_confidence is None:
+            raw_confidence = 1.0
         try:
-            confidence.set_value(float((entry or {}).get("confidence") or 1.0))
+            confidence.set_value(float(raw_confidence))
         except (TypeError, ValueError):
             confidence.set_value(1.0)
         window.add_row("类型", kind)
@@ -250,7 +276,13 @@ class KnowledgePage(Page):
         window.body_box.append(error)
 
         def _split(value: str) -> list[str]:
-            return [part.strip() for part in value.replace("，", ",").split(",") if part.strip()]
+            import re
+
+            return [
+                part.strip()
+                for part in re.split(r"[\n,，]", value)
+                if part.strip()
+            ]
 
         def _save() -> None:
             if self.api is None:
@@ -300,9 +332,14 @@ class KnowledgePage(Page):
                             _finish()
 
                         def _patch_failed(exc: BaseException) -> None:
-                            error.set_text(
+                            # The create already succeeded.  Close the editor so
+                            # a second submit cannot create a duplicate; the
+                            # refreshed list shows the new note.
+                            window.close()
+                            self.toast(
                                 f"笔记已创建，但写入置信度失败：{exc}"
                             )
+                            self.refresh()
 
                         widgets.run_async(
                             _patch,
@@ -342,19 +379,63 @@ class KnowledgePage(Page):
             on_confirm=_delete_now,
         )
 
+    def _set_shared(self, entry: dict[str, Any], switch: Gtk.Switch) -> None:
+        if self._shared_switch_guard:
+            return
+        if self.api is None or not entry.get("id"):
+            return
+        entry_id = str(entry.get("id"))
+        if entry_id in self._share_busy:
+            return
+        target = bool(switch.get_active())
+        previous = bool(entry.get("shared"))
+        entry["shared"] = target
+        self._share_busy.add(entry_id)
+        switch.set_sensitive(False)
+
+        def _do() -> Any:
+            return self.api.patch(
+                f"/api/knowledge/{_quote(entry_id)}",
+                {"shared": target},
+                timeout=30,
+            )
+
+        def _done(_result: Any) -> None:
+            self._share_busy.discard(entry_id)
+            self.toast("已共享" if target else "已取消共享")
+            self.refresh()
+
+        def _failed(exc: BaseException) -> None:
+            self._share_busy.discard(entry_id)
+            entry["shared"] = previous
+            self._shared_switch_guard = True
+            try:
+                switch.set_active(previous)
+                switch.set_sensitive(True)
+            finally:
+                self._shared_switch_guard = False
+            self.toast(f"共享设置失败：{exc}")
+
+        widgets.run_async(_do, on_success=_done, on_error=_failed)
+
+    def _set_research_busy(self, busy: bool) -> None:
+        self._research_busy = busy
+        self.research_button.set_sensitive(not busy)
+        self.trend_button.set_sensitive(not busy)
+
     def _trends(self) -> None:
-        if self.api is None:
+        if self.api is None or self._research_busy:
             return
 
         def _do() -> None:
-            self.trend_button.set_sensitive(False)
+            self._set_research_busy(True)
             self.toast("正在刷新当前热梗，可能需要一段时间…")
 
             def _request() -> dict[str, Any]:
                 return self.api.post("/api/knowledge/trends", {}, timeout=300)
 
             def _done(result: dict[str, Any]) -> None:
-                self.trend_button.set_sensitive(True)
+                self._set_research_busy(False)
                 if result.get("skipped"):
                     self.toast(str(result.get("reason") or "热梗考究已跳过"))
                 else:
@@ -369,7 +450,7 @@ class KnowledgePage(Page):
                 self.refresh()
 
             def _failed(exc: BaseException) -> None:
-                self.trend_button.set_sensitive(True)
+                self._set_research_busy(False)
                 self.toast(f"热梗考究失败：{exc}")
 
             widgets.run_async(_request, on_success=_done, on_error=_failed)
@@ -384,6 +465,8 @@ class KnowledgePage(Page):
 
     def _research(self) -> None:
         query = self.research_entry.get_text().strip()
+        if self._research_busy:
+            return
         if not query or self.api is None:
             self.toast("请先填写考究主题")
             return
@@ -393,16 +476,27 @@ class KnowledgePage(Page):
             "max_notes": 8,
             "save": True,
         }
+        self._set_research_busy(True)
         self.toast("正在联网考究，可能需要一段时间…")
 
         def _do() -> Any:
             return self.api.post("/api/knowledge/research", payload, timeout=180)
 
-        widgets.run_async(
-            _do,
-            on_success=lambda _r: (self.toast("考究完成"), self.refresh()),
-            on_error=lambda exc: self.toast(f"考究失败：{exc}"),
-        )
+        def _done(result: dict[str, Any]) -> None:
+            self._set_research_busy(False)
+            saved = int(result.get("saved") or 0)
+            duplicates = int(result.get("duplicates") or 0)
+            self.toast(
+                f"考究完成：新增 {saved} 条"
+                + (f"，跳过 {duplicates} 条重复" if duplicates else "")
+            )
+            self.refresh()
+
+        def _failed(exc: BaseException) -> None:
+            self._set_research_busy(False)
+            self.toast(f"考究失败：{exc}")
+
+        widgets.run_async(_do, on_success=_done, on_error=_failed)
 
 
 def _quote(value: Any) -> str:

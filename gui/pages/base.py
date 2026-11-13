@@ -46,15 +46,42 @@ class Page(Gtk.ScrolledWindow):
     def build(self) -> None:
         pass
 
+    def dispose(self) -> None:
+        """Stop page-owned timers before the app recreates its backend."""
+        pass
+
     def activate(self) -> None:
         if not self.loaded:
             self.loaded = True
             self.refresh()
-        elif self.refresh_on_activate:
+        elif self.refresh_on_activate and not self._has_unsaved():
             self.refresh()
+
+    def _has_unsaved(self) -> bool:
+        check = getattr(self, "has_unsaved_changes", None)
+        try:
+            return bool(check()) if callable(check) else False
+        except Exception:  # noqa: BLE001
+            return False
 
     def refresh(self) -> None:
         pass
+
+    def refresh_requested(self) -> None:
+        """Header refresh button hook; pages may override for a full reload."""
+        if self._has_unsaved():
+            discard = getattr(self, "discard_unsaved_changes", None)
+            if callable(discard):
+                confirm = getattr(self.app, "_confirm_unsaved", None)
+                if callable(confirm):
+                    confirm(
+                        heading="未保存的更改",
+                        body=f"「{self.page_title}」有尚未保存的修改，"
+                        "刷新会丢失这些修改。",
+                        on_discard=self.refresh,
+                    )
+                    return
+        self.refresh()
 
     # ------------------------------------------------------------------
     # Helpers
@@ -80,7 +107,7 @@ class Page(Gtk.ScrolledWindow):
             reload_button = widgets.icon_button(
                 "view-refresh-symbolic", "刷新", css="flat"
             )
-            reload_button.connect("clicked", lambda _b: self.refresh())
+            reload_button.connect("clicked", lambda _b: self.refresh_requested())
             row.append(reload_button)
         return row
 

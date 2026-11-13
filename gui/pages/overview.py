@@ -65,6 +65,11 @@ def _number(value: Any) -> str:
     return f"{number:g}"
 
 
+def _optional_number(value: Any) -> str:
+    """Usage accounting uses ``None`` for "not reported", not zero."""
+    return "—" if value is None else _number(value)
+
+
 def _duration(seconds: Any) -> str:
     try:
         total = max(0, int(float(seconds or 0)))
@@ -99,6 +104,7 @@ class OverviewPage(Page):
     page_icon = "speedometer-symbolic"
 
     def build(self) -> None:
+        self._disposed = False
         self._refresh_inflight = False
         self._update_inflight = False
         self._overview_error = False
@@ -161,18 +167,29 @@ class OverviewPage(Page):
             self._update_timer_id = GLib.timeout_add_seconds(
                 UPDATE_REFRESH_SECONDS, self._update_tick
             )
-        if time.monotonic() - self._last_update_check >= UPDATE_REFRESH_SECONDS:
-            self._fetch_update()
+        # Re-read the cached badge on every activation. Otherwise toggling
+        # "不再提示" on the update page leaves a stale badge on this page for
+        # up to a minute.
+        self._fetch_update()
+
+    def dispose(self) -> None:
+        self._disposed = True
+        if self._timer_id:
+            GLib.source_remove(self._timer_id)
+            self._timer_id = 0
+        if self._update_timer_id:
+            GLib.source_remove(self._update_timer_id)
+            self._update_timer_id = 0
 
     def _auto_tick(self) -> bool:
-        if not self.get_mapped():
+        if self._disposed or not self.get_mapped():
             self._timer_id = 0
             return False
         self.refresh()
         return True
 
     def _update_tick(self) -> bool:
-        if not self.get_mapped():
+        if self._disposed or not self.get_mapped():
             self._update_timer_id = 0
             return False
         self._fetch_update()
@@ -187,7 +204,11 @@ class OverviewPage(Page):
         def _fetch() -> dict[str, Any]:
             return self.api.get(f"/api/overview?range={range_name}", timeout=20)
 
-        widgets.run_async(_fetch, on_success=self._render, on_error=self._error)
+        widgets.run_async(
+            _fetch,
+            on_success=lambda data: self._render(data, range_name),
+            on_error=lambda exc: self._error(exc, range_name),
+        )
 
     def _fetch_update(self) -> None:
         if self._update_inflight or self.api is None:
@@ -204,8 +225,12 @@ class OverviewPage(Page):
             on_error=self._update_error,
         )
 
-    def _error(self, exc: BaseException) -> None:
+    def _error(self, exc: BaseException, range_name: str) -> None:
         self._refresh_inflight = False
+        if range_name != self._range:
+            # The user picked another range while this request was running.
+            self.refresh()
+            return
         self._overview_error = True
         widgets.clear(self.activity_card)
         self.activity_card.append(widgets.label("主模型状态", css="stat-label"))
@@ -227,8 +252,12 @@ class OverviewPage(Page):
         ):
             self.refresh()
 
-    def _render(self, data: dict[str, Any]) -> None:
+    def _render(self, data: dict[str, Any], range_name: str) -> None:
         self._refresh_inflight = False
+        if range_name != self._range:
+            # Discard the old range's response and fetch the selected one.
+            self.refresh()
+            return
         self._overview_error = False
         usage = data.get("usage") or {}
         self._has_usage = bool(usage.get("available"))
@@ -468,7 +497,7 @@ class OverviewPage(Page):
             ratio = usage.get("cache_hit_rate")
         hit_text = _percent(ratio) if current_available else "—"
         current_value = (
-            (lambda value: _number(value))
+            (lambda value: _optional_number(value))
             if current_available
             else (lambda _value: "—")
         )
@@ -485,10 +514,12 @@ class OverviewPage(Page):
         )
 
         values = {
-            "request_count": _number(usage.get("request_count")),
-            "total_tokens": _number(usage.get("total_tokens")),
+            "request_count": _optional_number(usage.get("request_count")),
+            "total_tokens": _optional_number(usage.get("total_tokens")),
             "cache_hit": hit_text,
-            "completion_tokens": _number(usage.get("completion_tokens")),
+            "completion_tokens": _optional_number(
+                usage.get("completion_tokens")
+            ),
             "current_prompt_tokens": current_value(
                 usage.get("current_prompt_tokens")
             ),
@@ -501,10 +532,14 @@ class OverviewPage(Page):
             "current_cache_creation_tokens": current_value(
                 usage.get("current_cache_creation_tokens")
             ),
-            "reasoning_tokens": _number(usage.get("reasoning_tokens")),
+            "reasoning_tokens": _optional_number(
+                usage.get("reasoning_tokens")
+            ),
             "estimate_error": estimate_text,
             "estimate_samples": (
-                current_value(estimate_samples) if current_available else "—"
+                _optional_number(usage.get("current_estimate_samples"))
+                if current_available
+                else "—"
             ),
             "current_estimated_prompt_tokens": current_value(
                 usage.get("current_estimated_prompt_tokens")
@@ -561,9 +596,9 @@ class OverviewPage(Page):
                                 operation, operation or "unknown"
                             )
                         ),
-                        _number(row.get("request_count")),
-                        _number(row.get("current_prompt_tokens")),
-                        _number(row.get("current_total_tokens")),
+                        _optional_number(row.get("request_count")),
+                        _optional_number(row.get("current_prompt_tokens")),
+                        _optional_number(row.get("current_total_tokens")),
                     ]
                 )
             self.usage_ops_host.append(
@@ -592,4 +627,7 @@ class OverviewPage(Page):
 
     def _update_error(self, _exc: BaseException) -> None:
         self._update_inflight = False
+        # Let the next activation retry immediately instead of staying stale
+        # for the full minute after a transient failure.
+        self._last_update_check = 0.0
         self.update_button.set_visible(False)

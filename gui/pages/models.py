@@ -27,6 +27,123 @@ REASONING_EFFORT_STYLES = [
     ("openai", "openai — 发送 reasoning_effort（OpenAI / Gemini 反代）"),
     ("deepseek", "deepseek — 发送 reasoning_effort（DeepSeek 风格）"),
 ]
+FALLBACK_EFFORT_OPTIONS = ["low", "medium", "high"]
+EFFORT_LABELS = {
+    "minimal": "最小",
+    "low": "低",
+    "medium": "中",
+    "high": "高",
+    "xhigh": "极高",
+    "max": "最大",
+}
+VENDOR_LABELS = {
+    "gemini": "Google Gemini",
+    "anthropic": "Anthropic Claude",
+    "openai": "OpenAI",
+    "deepseek": "DeepSeek",
+    "qwen": "通义千问 Qwen",
+    "glm": "智谱 GLM",
+    "moonshot": "月之暗面 Kimi",
+    "xai": "xAI Grok",
+    "volcengine": "火山引擎豆包",
+    "mimo": "小米 MiMo",
+}
+_VENDOR_PREFIXES = (
+    (("gemini", "gemma"), "gemini"),
+    (("claude",), "anthropic"),
+    (("gpt", "chatgpt", "o1", "o3", "o4"), "openai"),
+    (("deepseek",), "deepseek"),
+    (("qwen", "qwq"), "qwen"),
+    (("glm", "chatglm"), "glm"),
+    (("kimi", "moonshot"), "moonshot"),
+    (("grok",), "xai"),
+    (("doubao", "skylark"), "volcengine"),
+    (("mimo",), "mimo"),
+)
+
+
+def _normalize_vendor(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    return text if text else ""
+
+
+def _detect_model_vendor(model_id: Any) -> str:
+    text = str(model_id or "").strip().lower().rsplit("/", 1)[-1]
+    text = text.split(":", 1)[0]
+    for prefixes, vendor in _VENDOR_PREFIXES:
+        if any(text.startswith(prefix) for prefix in prefixes):
+            return vendor
+    return ""
+
+
+def _vendor_label(vendor_id: str) -> str:
+    return VENDOR_LABELS.get(vendor_id, vendor_id or "未识别")
+
+
+def _resolve_provider_vendor(
+    provider: dict[str, Any] | None,
+    model_id: str,
+    presets: list[dict[str, Any]],
+) -> str:
+    """Match backend resolution order: explicit vendor, preset, model ID."""
+    preset_ids = {str(item.get("id") or "") for item in presets}
+    explicit = _normalize_vendor((provider or {}).get("model_vendor"))
+    preset = _normalize_vendor((provider or {}).get("preset"))
+    if explicit and explicit in preset_ids:
+        return explicit
+    if preset and preset in preset_ids:
+        return preset
+    detected = _detect_model_vendor(model_id)
+    if detected and detected in preset_ids:
+        return detected
+    return ""
+
+
+def _resolve_preset_model(
+    presets: list[dict[str, Any]],
+    provider: dict[str, Any] | None,
+    model_id: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str]:
+    vendor = _resolve_provider_vendor(provider, model_id, presets)
+    if not vendor:
+        return None, None, ""
+    preset = next(
+        (item for item in presets if str(item.get("id") or "") == vendor),
+        None,
+    )
+    if preset is None:
+        return None, None, vendor
+    full = str(model_id or "").strip()
+    tail = full.rsplit("/", 1)[-1]
+    model = next(
+        (item for item in preset.get("models") or [] if str(item.get("id") or "") == full),
+        None,
+    )
+    if model is None and tail:
+        model = next(
+            (
+                item
+                for item in preset.get("models") or []
+                if str(item.get("id") or "").rsplit("/", 1)[-1] == tail
+            ),
+            None,
+        )
+    return preset, model, vendor
+
+
+
+def _effort_options(
+    presets: list[dict[str, Any]],
+    provider: dict[str, Any] | None,
+    model_id: str,
+) -> list[str]:
+    """Resolve effort levels from model, then preset, then generic fallback."""
+    preset, model, _vendor = _resolve_preset_model(presets, provider, model_id)
+    options = list((model or {}).get("reasoning_effort_options") or [])
+    if not options:
+        options = list((preset or {}).get("reasoning_effort_options") or [])
+    return [str(item) for item in options] or list(FALLBACK_EFFORT_OPTIONS)
+
 
 class _SuggestMenu(Gtk.MenuButton):
     def __init__(self, entry: Gtk.Entry) -> None:
@@ -81,9 +198,9 @@ class ModelsPage(Page):
 
     def build(self) -> None:
         header_row = self.header()
-        scan = widgets.button("重新扫描本地模型")
-        scan.connect("clicked", lambda _b: self._load_models(rescan=True))
-        header_row.append(scan)
+        self.scan_button = widgets.button("重新扫描本地模型")
+        self.scan_button.connect("clicked", lambda _b: self._load_models(rescan=True))
+        header_row.append(self.scan_button)
         self.body.append(header_row)
         self.restart_hint = widgets.card()
         self.restart_hint.set_visible(False)
@@ -103,6 +220,8 @@ class ModelsPage(Page):
         self.body.append(widgets.section_header("Agent 模型绑定", "主聊天、主动思考、摘要与人格生成"))
         self.body.append(self.agents_box)
         self.body.append(widgets.section_header("本地模型插件", "语音合成与向量模型"))
+        self.models_status = widgets.muted("")
+        self.body.append(self.models_status)
         self.models_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         self.body.append(self.models_box)
         self._providers: list[dict[str, Any]] = []
@@ -110,6 +229,7 @@ class ModelsPage(Page):
         self._presets: list[dict[str, Any]] = []
         self._vendors: list[dict[str, Any]] = []
         self._models: list[dict[str, Any]] = []
+        self._models_busy = False
 
     def refresh(self) -> None:
         if self.api is None:
@@ -119,35 +239,76 @@ class ModelsPage(Page):
             from concurrent.futures import ThreadPoolExecutor
 
             api = self.api
+            errors: dict[str, str] = {}
+
+            def _get(key: str, path: str, timeout: float) -> dict[str, Any]:
+                try:
+                    payload = api.get(path, timeout=timeout)
+                except Exception as exc:  # noqa: BLE001 - report per section
+                    errors[key] = str(exc) or type(exc).__name__
+                    return {}
+                return payload if isinstance(payload, dict) else {}
+
             with ThreadPoolExecutor(max_workers=3) as pool:
-                providers = pool.submit(api.get, "/api/providers", timeout=30)
+                providers = pool.submit(_get, "providers", "/api/providers", 30)
                 presets = pool.submit(
-                    api.get, "/api/providers/presets", timeout=30
+                    _get, "presets", "/api/providers/presets", 30
                 )
-                models = pool.submit(api.get, "/api/models", timeout=60)
+                models = pool.submit(_get, "models", "/api/models", 60)
                 return {
                     "providers": providers.result(),
                     "presets": presets.result(),
                     "models": models.result(),
+                    "errors": errors,
                 }
 
         widgets.run_async(_fetch, on_success=self._render, on_error=self._error)
 
     def _error(self, exc: BaseException) -> None:
-        widgets.clear(self.providers_box)
-        self.providers_box.append(widgets.muted(f"读取模型配置失败：{exc}"))
+        for box, name in (
+            (self.providers_box, "模型提供商"),
+            (self.agents_box, "Agent 绑定"),
+            (self.models_box, "本地模型"),
+        ):
+            widgets.clear(box)
+            box.append(widgets.muted(f"读取{name}失败：{exc}"))
 
     def _render(self, data: dict[str, Any]) -> None:
+        errors = dict(data.get("errors") or {})
+        provider_error = errors.get("providers", "")
+        preset_error = errors.get("presets", "")
+        models_error = errors.get("models", "")
         provider_data = data.get("providers") or {}
-        self._providers = list(provider_data.get("providers") or [])
-        self._agents = dict(provider_data.get("agents") or {})
+        if not provider_error:
+            self._providers = list(provider_data.get("providers") or [])
+            self._agents = dict(provider_data.get("agents") or {})
         presets_payload = data.get("presets") or {}
-        self._presets = list(presets_payload.get("presets") or [])
-        self._vendors = list(presets_payload.get("vendors") or [])
-        self._models = list((data.get("models") or {}).get("models") or [])
-        self._render_providers()
-        self._render_agents()
-        self._render_models()
+        if not preset_error:
+            self._presets = list(presets_payload.get("presets") or [])
+            self._vendors = list(presets_payload.get("vendors") or [])
+        if not models_error:
+            self._models = list((data.get("models") or {}).get("models") or [])
+
+        if provider_error:
+            widgets.clear(self.providers_box)
+            self.providers_box.append(
+                widgets.muted(f"读取模型提供商失败：{provider_error}")
+            )
+            widgets.clear(self.agents_box)
+            self.agents_box.append(
+                widgets.muted(f"读取 Agent 绑定失败：{provider_error}")
+            )
+        else:
+            self._render_providers()
+            if preset_error:
+                self.providers_box.append(
+                    widgets.muted(
+                        f"读取模型预设失败：{preset_error}"
+                        "。已有提供商仍可编辑，但预设联动和模型建议不可用。"
+                    )
+                )
+            self._render_agents()
+        self._render_models(error=models_error)
 
     def _render_providers(self) -> None:
         widgets.clear(self.providers_box)
@@ -157,19 +318,44 @@ class ModelsPage(Page):
         for provider in self._providers:
             card = widgets.card(spacing=5)
             head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-            head.append(widgets.label(str(provider.get("id") or ""), css="section-title"))
-            head.append(widgets.label(str(provider.get("display_name") or "")))
+            head.append(
+                widgets.label(str(provider.get("id") or ""), css="section-title")
+            )
+            display_name = str(provider.get("display_name") or "")
+            if display_name and display_name != str(provider.get("id") or ""):
+                head.append(widgets.muted("·"))
+                head.append(widgets.label(display_name))
             if provider.get("has_key"):
                 head.append(widgets.badge("密钥已配置", css="badge badge-green"))
             elif provider.get("api_key_id"):
                 head.append(widgets.badge("缺密钥", css="badge badge-orange"))
+            else:
+                head.append(widgets.badge("无密钥", css="badge badge-idle"))
             health = provider.get("health") or {}
             status = str(health.get("status") or "")
             if status:
-                head.append(widgets.badge(health.get("message") or status))
+                health_css = {
+                    "healthy": "badge badge-green",
+                    "degraded": "badge badge-orange",
+                    "error": "badge badge-red",
+                }.get(status, "badge badge-idle")
+                health_text = {
+                    "healthy": "已就位",
+                    "degraded": "有异常",
+                    "error": "出错了",
+                }.get(status, str(health.get("message") or status))
+                health_badge = widgets.badge(health_text, css=health_css)
+                if health.get("message"):
+                    health_badge.set_tooltip_text(str(health["message"]))
+                head.append(health_badge)
+            else:
+                head.append(widgets.badge("未检测", css="badge badge-idle"))
             head.set_hexpand(True)
             test = widgets.button("测试")
-            test.connect("clicked", lambda _b, p=provider: self._test_provider(p))
+            test.connect(
+                "clicked",
+                lambda b, p=provider: self._test_provider(p, b),
+            )
             edit = widgets.button("编辑")
             edit.connect("clicked", lambda _b, p=provider: self._provider_dialog(p))
             delete = widgets.button("删除", css="destructive-action")
@@ -185,12 +371,17 @@ class ModelsPage(Page):
             if provider.get("protocol"):
                 details.append("协议：" + str(provider["protocol"]))
             if provider.get("model_vendor"):
-                details.append("厂商：" + str(provider["model_vendor"]))
+                details.append(
+                    "厂商：" + _vendor_label(str(provider["model_vendor"]))
+                )
             if provider.get("timeout_seconds") is not None:
                 details.append(f"超时：{provider.get('timeout_seconds')}s")
             if used:
                 details.append("用于：" + "、".join(str(x) for x in used))
             card.append(widgets.muted(" · ".join(details)))
+            health_message = str(health.get("message") or "")
+            if health_message:
+                card.append(widgets.muted("健康检查：" + health_message))
             self.providers_box.append(card)
 
     def _render_agents(self) -> None:
@@ -199,11 +390,21 @@ class ModelsPage(Page):
             self.agents_box.append(widgets.muted("没有 Agent 配置。"))
             return
         for name, agent in self._agents.items():
+            title = AGENT_LABEL.get(name, name)
             if not isinstance(agent, dict):
+                card = widgets.card(spacing=5)
+                head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+                head.append(widgets.label(title, css="section-title"))
+                head.append(widgets.badge("未启用", css="badge badge-idle"))
+                card.append(head)
+                card.append(
+                    widgets.muted("这个 Agent 当前关闭，不需要配置模型。")
+                )
+                self.agents_box.append(card)
                 continue
             card = widgets.card(spacing=5)
             head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-            head.append(widgets.label(AGENT_LABEL.get(name, name), css="section-title"))
+            head.append(widgets.label(title, css="section-title"))
             head.append(
                 widgets.muted(
                     f"{agent.get('provider') or '—'} / {agent.get('model') or '—'}"
@@ -228,10 +429,15 @@ class ModelsPage(Page):
                 card.append(widgets.muted(" · ".join(extras)))
             self.agents_box.append(card)
 
-    def _render_models(self) -> None:
+    def _render_models(self, *, error: str = "") -> None:
         widgets.clear(self.models_box)
         if not self._models:
-            self.models_box.append(self.empty("没有发现本地模型插件。"))
+            if error:
+                self.models_box.append(
+                    widgets.muted(f"读取本地模型失败：{error}")
+                )
+            else:
+                self.models_box.append(self.empty("没有发现本地模型插件。"))
             return
         status_css = {
             "ENABLED": "badge badge-green",
@@ -242,48 +448,121 @@ class ModelsPage(Page):
         for model in self._models:
             card = widgets.card(spacing=5)
             head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-            head.append(widgets.label(str(model.get("display_name") or model.get("name")), css="section-title"))
-            head.append(widgets.badge(str(model.get("status_text") or model.get("status")), css=status_css.get(str(model.get("status")), "badge")))
-            missing = model.get("missing_deps") or []
+            head.append(
+                widgets.label(
+                    str(model.get("display_name") or model.get("name")),
+                    css="section-title",
+                )
+            )
+            head.append(
+                widgets.badge(
+                    str(model.get("status_text") or model.get("status") or "未知"),
+                    css=status_css.get(str(model.get("status")), "badge"),
+                )
+            )
+            missing = [str(item) for item in model.get("missing_deps") or []]
             if missing:
-                head.append(widgets.badge(f"缺 {len(missing)} 个依赖", css="badge badge-orange"))
+                head.append(
+                    widgets.badge(
+                        f"缺 {len(missing)} 个依赖",
+                        css="badge badge-orange",
+                    )
+                )
             head.set_hexpand(True)
             guide = widgets.button("安装指引")
             guide.connect("clicked", lambda _b, m=model: self._show_guide(m))
             head.append(guide)
             if missing:
                 install = widgets.button("安装依赖")
-                install.connect("clicked", lambda _b, m=model: self._install_deps(m))
+                install.set_tooltip_text("缺失：" + "、".join(missing))
+                install.connect(
+                    "clicked",
+                    lambda b, m=model: self._install_deps(m, b),
+                )
                 head.append(install)
             upload = widgets.button("上传 zip")
-            upload.connect("clicked", lambda _b, m=model: self._upload_model(m))
+            upload.connect(
+                "clicked", lambda b, m=model: self._upload_model(m, b)
+            )
             head.append(upload)
             card.append(head)
+
             description = str(model.get("description") or "")
             if description:
                 card.append(widgets.muted(description))
-            card.append(widgets.muted(str(model.get("model_dir") or "")))
+            details = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            details.append(
+                widgets.property_row(
+                    "类型", str(model.get("kind") or "—"), wrap=False
+                )
+            )
+            details.append(
+                widgets.property_row(
+                    "目标目录", str(model.get("model_dir") or "—")
+                )
+            )
+            card.append(details)
+            if missing:
+                card.append(
+                    widgets.muted("缺失依赖：" + "、".join(missing))
+                )
+            download_url = str(model.get("download_url") or "")
+            if download_url:
+                link = Gtk.LinkButton.new_with_label(download_url, "打开下载页")
+                link.set_halign(Gtk.Align.START)
+                link.set_tooltip_text(download_url)
+                card.append(link)
+            model_error = str(model.get("error") or "")
+            if model_error:
+                card.append(
+                    widgets.label(
+                        "错误：" + model_error,
+                        css="danger-text",
+                        wrap=True,
+                        selectable=True,
+                    )
+                )
             self.models_box.append(card)
+        if error:
+            self.models_box.append(
+                widgets.muted(
+                    f"本地模型列表刷新失败：{error}（显示的是上一次结果）"
+                )
+            )
 
     # ------------------------------------------------------------------
     # Provider actions
     # ------------------------------------------------------------------
-    def _test_provider(self, provider: dict[str, Any]) -> None:
+    def _test_provider(
+        self,
+        provider: dict[str, Any],
+        button: Gtk.Button | None = None,
+    ) -> None:
         if self.api is None:
             return
+        if button is not None:
+            button.set_sensitive(False)
 
         def _do() -> Any:
-            return self.api.post(f"/api/providers/{_quote(provider.get('id'))}/test", {}, timeout=90)
+            return self.api.post(
+                f"/api/providers/{_quote(provider.get('id'))}/test",
+                {},
+                timeout=90,
+            )
 
         def _done(result: dict[str, Any]) -> None:
-            self.toast(str(result.get("message") or "测试完成"))
+            message = str(result.get("message") or "测试完成")
+            self.toast(
+                message if result.get("ok") else f"测试未通过：{message}"
+            )
             self.refresh()
 
-        widgets.run_async(
-            _do,
-            on_success=_done,
-            on_error=lambda exc: self.toast(f"测试失败：{exc}"),
-        )
+        def _failed(exc: BaseException) -> None:
+            if button is not None:
+                button.set_sensitive(True)
+            self.toast(f"测试失败：{exc}")
+
+        widgets.run_async(_do, on_success=_done, on_error=_failed)
 
     def _delete_provider(self, provider: dict[str, Any]) -> None:
         def _do_delete() -> None:
@@ -311,10 +590,17 @@ class ModelsPage(Page):
                 on_error=lambda exc: self.toast(str(exc)),
             )
 
+        used_by = [str(item) for item in provider.get("used_by") or []]
+        body = "已保存的密钥会保留。"
+        if used_by:
+            body += (
+                "\n\n它仍被 " + "、".join(used_by) + " 使用，"
+                "需要先把这些引用改到别的提供商，否则删除会被拒绝。"
+            )
         widgets.ConfirmDialog(
             self.app.window,
             heading=f"删除提供商「{provider.get('id')}」？",
-            body="已保存的密钥会保留；仍被 Agent 使用时会被拒绝。",
+            body=body,
             confirm_label="删除",
             destructive=True,
             on_confirm=_do_delete,
@@ -331,16 +617,38 @@ class ModelsPage(Page):
             submit_label="保存",
             on_submit=lambda: _save(),
         )
-        preset_options = [("", "自定义 / 中转站")] + [
-            (str(item.get("id")), str(item.get("display_name") or item.get("id")))
-            for item in self._presets
-        ]
         initial_preset = str(current.get("preset") or "")
         if not editing and not initial_preset:
             initial_preset = "deepseek" if any(
                 str(item.get("id")) == "deepseek" for item in self._presets
             ) else ""
+        preset_options = [("", "自定义 / 中转站")] + [
+            (str(item.get("id")), str(item.get("display_name") or item.get("id")))
+            for item in self._presets
+        ]
+        if (
+            editing
+            and initial_preset
+            and not any(value == initial_preset for value, _ in preset_options)
+        ):
+            preset_options.append(
+                (initial_preset, f"{initial_preset}（预设信息未加载）")
+            )
         preset = widgets.dropdown(preset_options, initial_preset)
+        if not self._presets:
+            reload_row = Gtk.Box(
+                orientation=Gtk.Orientation.HORIZONTAL, spacing=8
+            )
+            reload_row.append(
+                widgets.muted("预设列表没有加载成功；可以重新读取后再打开本对话框。")
+            )
+            reload_presets = widgets.button("重新加载预设")
+            reload_presets.connect(
+                "clicked",
+                lambda _b: (window.close(), self.refresh()),
+            )
+            reload_row.append(reload_presets)
+            window.body_box.append(reload_row)
         provider_id = Gtk.Entry()
         provider_id.set_text(str(current.get("id") or ""))
         provider_id.set_sensitive(not editing)
@@ -376,7 +684,11 @@ class ModelsPage(Page):
         )
         timeout = Gtk.SpinButton.new_with_range(1, 3600, 1)
         timeout.set_numeric(True)
-        timeout.set_value(float(current.get("timeout_seconds") or 120))
+        timeout.set_value(
+            120.0
+            if current.get("timeout_seconds") is None
+            else float(current["timeout_seconds"])
+        )
         model_entry = Gtk.Entry()
         model_entry.set_placeholder_text("模型 ID，例如 deepseek-chat")
         suggestions = _SuggestMenu(model_entry)
@@ -437,6 +749,50 @@ class ModelsPage(Page):
             if value in values:
                 dropdown.set_selected(values.index(value))
 
+        def _refresh_vendor_hint(*_args: Any) -> None:
+            explicit = widgets.dropdown_value(vendor)
+            if explicit:
+                vendor_hint.set_text(
+                    f"能力识别使用 {_vendor_label(explicit)} 的模型表；"
+                    "不会改变协议或地址。"
+                )
+                return
+            preset_id = widgets.dropdown_value(preset)
+            if preset_id:
+                detected = _detect_model_vendor(model_entry.get_text())
+                extra = ""
+                if detected and detected != preset_id:
+                    extra = (
+                        f"模型 ID 看起来像 {_vendor_label(detected)}，"
+                        "但当前预设的识别优先级更高。"
+                    )
+                vendor_hint.set_text(
+                    f"能力默认跟随所选预设（{_vendor_label(preset_id)}）；"
+                    "中转站混合模型时建议手动选择上游厂商。" + extra
+                )
+                return
+            detected = _detect_model_vendor(model_entry.get_text())
+            if detected:
+                vendor_hint.set_text(
+                    f"自动识别为 {_vendor_label(detected)}；"
+                    "如果识别不对，可在上面手动选择。"
+                )
+                return
+            vendor_hint.set_text(
+                "识别失败时不会猜能力；可手动选择厂商，"
+                "或把视觉/视频策略改成“开启”。"
+            )
+
+        def _preset_models(found: dict[str, Any]) -> list[tuple[str, str]]:
+            candidates: list[tuple[str, str]] = []
+            for item in found.get("models") or []:
+                model_id = str(item.get("id") or "")
+                if model_id:
+                    candidates.append(
+                        (model_id, str(item.get("display_name") or model_id))
+                    )
+            return candidates
+
         def _preset_changed(*_args: Any) -> None:
             chosen = widgets.dropdown_value(preset)
             if last_preset["value"] == "":
@@ -459,19 +815,31 @@ class ModelsPage(Page):
                     effort_style, custom_values["reasoning_effort_style"]
                 )
                 protocol.set_sensitive(True)
-                vendor_hint.set_text(
-                    "自定义端点：请填写 Base URL 与协议；模型 ID 可手动输入或从上游拉取。"
-                )
+                suggestions.set_candidates([])
+                _refresh_vendor_hint()
                 return
             found = next(
                 (item for item in self._presets if str(item.get("id")) == chosen),
                 None,
             )
             if not found:
+                # Preset metadata failed to load (or a user preset was removed).
+                # Keep the existing preset id instead of silently downgrading
+                # the provider to a custom openai_compat endpoint.
+                protocol.set_sensitive(False)
+                suggestions.set_candidates([])
+                vendor_hint.set_text(
+                    f"预设「{chosen}」的信息没有加载；保存时会保留原预设，"
+                    "协议、地址和思考方式按当前值保存。"
+                )
                 return
-            display.set_text(str(found.get("display_name") or chosen))
+            display.set_text(
+                str(found.get("display_name") or chosen)
+            )
             base_url.set_text(str(found.get("base_url") or ""))
-            _select_value(protocol, str(found.get("protocol") or "openai_compat"))
+            _select_value(
+                protocol, str(found.get("protocol") or "openai_compat")
+            )
             _select_value(
                 reasoning_style, str(found.get("reasoning_style") or "")
             )
@@ -480,46 +848,16 @@ class ModelsPage(Page):
                 str(found.get("reasoning_effort_style") or ""),
             )
             protocol.set_sensitive(False)
-            models = found.get("models") or []
-            if not model_entry.get_text().strip() and models:
-                model_entry.set_text(str(models[0].get("id") or ""))
-            vendor_hint.set_text(
-                "已选择预设：协议、地址和思考方式跟随预设；中转站混合模型时建议手动选上游厂商。"
-            )
+            candidates = _preset_models(found)
+            suggestions.set_candidates(candidates)
+            if not model_entry.get_text().strip() and candidates:
+                model_entry.set_text(candidates[0][0])
+            _refresh_vendor_hint()
 
         preset.connect("notify::selected", _preset_changed)
-        if editing:
-            models = []
-            found = next(
-                (item for item in self._presets if str(item.get("id")) == initial_preset),
-                None,
-            )
-            if found:
-                models = found.get("models") or []
-            if not model_entry.get_text().strip() and models:
-                model_entry.set_text(str(models[0].get("id") or ""))
-        else:
-            _preset_changed()
-        if initial_preset:
-            protocol.set_sensitive(False)
-
-        def _model_candidates() -> list[tuple[str, str]]:
-            chosen = widgets.dropdown_value(preset)
-            found = next(
-                (item for item in self._presets if str(item.get("id")) == chosen),
-                None,
-            )
-            result = []
-            if found:
-                for item in found.get("models") or []:
-                    model_id = str(item.get("id") or "")
-                    if model_id:
-                        result.append(
-                            (model_id, str(item.get("display_name") or model_id))
-                        )
-            return result
-
-        suggestions.set_candidates(_model_candidates())
+        model_entry.connect("changed", _refresh_vendor_hint)
+        vendor.connect("notify::selected", _refresh_vendor_hint)
+        _preset_changed()
 
         def _payload(for_probe: bool = False) -> dict[str, Any]:
             payload: dict[str, Any] = {
@@ -550,17 +888,24 @@ class ModelsPage(Page):
             import re
 
             if not re.match(r"^[a-z][a-z0-9_-]{0,63}$", pid):
-                return "Provider ID 只能用小写字母开头，后跟小写字母、数字、下划线或短横线。"
+                return (
+                    "Provider ID 只能用小写字母开头，"
+                    "后跟小写字母、数字、下划线或短横线。"
+                )
             if not widgets.dropdown_value(preset):
                 if not base_url.get_text().strip():
                     return "自定义端点要填 Base URL。"
                 if not widgets.dropdown_value(protocol):
                     return "自定义端点要选协议。"
-            if not editing and not key_entry.get_text().strip():
-                return "新增提供商需要填写 API Key。"
-            if not model_entry.get_text().strip():
+            imported_key = editing and bool(current.get("api_key_id"))
+            if not key_entry.get_text().strip() and not imported_key:
+                return (
+                    "还没填 API Key。"
+                    if not editing
+                    else "这个提供商没有已保存的密钥，请先填写 API Key。"
+                )
+            if not for_probe and not model_entry.get_text().strip():
                 return "还没填模型 ID。"
-            _ = for_probe
             return ""
 
         def _test() -> None:
@@ -570,9 +915,11 @@ class ModelsPage(Page):
             if error:
                 status.set_text(error)
                 return
+            typed_key = bool(key_entry.get_text().strip())
+            saved_test = editing and not typed_key
             test_button.set_sensitive(False)
             status.set_text("正在测试…")
-            if editing and not key_entry.get_text().strip():
+            if saved_test:
                 def _do() -> dict[str, Any]:
                     return self.api.post(
                         f"/api/providers/{_quote(current.get('id'))}/test",
@@ -615,29 +962,51 @@ class ModelsPage(Page):
 
             def _done(result: dict[str, Any]) -> None:
                 models = result.get("models") or []
-                candidates = [
-                    (str(item.get("id")), str(item.get("display_name") or item.get("id")))
-                    for item in models
-                    if item.get("id")
-                ]
+                candidates: list[tuple[str, str]] = []
+                detected_vendors: set[str] = set()
+                for item in models:
+                    model_id = str(item.get("id") or "")
+                    if not model_id:
+                        continue
+                    label = str(item.get("display_name") or model_id)
+                    vendor_id = str(
+                        item.get("vendor") or _detect_model_vendor(model_id)
+                    ).lower()
+                    if vendor_id:
+                        detected_vendors.add(vendor_id)
+                    caps = [str(cap) for cap in item.get("capabilities") or []]
+                    details = [
+                        part
+                        for part in (
+                            _vendor_label(vendor_id) if vendor_id else "",
+                            "/".join(caps),
+                        )
+                        if part
+                    ]
+                    if details:
+                        label += " · " + " · ".join(details)
+                    candidates.append((model_id, label))
                 suggestions.set_candidates(candidates)
                 if not model_entry.get_text().strip() and candidates:
                     model_entry.set_text(candidates[0][0])
-                vendors = {
-                    str(item.get("vendor") or "")
-                    for item in models
-                    if item.get("vendor")
-                }
-                if not widgets.dropdown_value(vendor) and len(vendors) == 1:
-                    vendor_id = next(iter(vendors))
+                if (
+                    not widgets.dropdown_value(vendor)
+                    and len(detected_vendors) == 1
+                ):
+                    vendor_id = next(iter(detected_vendors))
                     values = getattr(vendor, "_values", [])
                     if vendor_id in values:
                         vendor.set_selected(values.index(vendor_id))
-                status.set_text(f"拿到 {len(models)} 个模型，可在模型输入框中选择或手填。")
+                _refresh_vendor_hint()
+                status.set_text(
+                    f"拿到 {len(models)} 个模型，可在模型输入框中选择或手填。"
+                )
                 fetch_button.set_sensitive(True)
 
             def _failed(exc: BaseException) -> None:
-                status.set_text(f"获取模型失败：{exc}（可以直接手填模型 ID）")
+                status.set_text(
+                    f"获取模型失败：{exc}（可以直接手填模型 ID）"
+                )
                 fetch_button.set_sensitive(True)
 
             widgets.run_async(_do, on_success=_done, on_error=_failed)
@@ -662,6 +1031,11 @@ class ModelsPage(Page):
             def _do() -> Any:
                 return getattr(self.api, method)(path, payload, timeout=60)
 
+            def _set_saving(busy: bool) -> None:
+                window.submit_button.set_sensitive(not busy)
+                test_button.set_sensitive(not busy)
+                fetch_button.set_sensitive(not busy)
+
             def _done(result: Any) -> None:
                 window.close()
                 payload_result = result if isinstance(result, dict) else {}
@@ -676,8 +1050,11 @@ class ModelsPage(Page):
                 self.refresh()
 
             def _failed(exc: BaseException) -> None:
+                _set_saving(False)
                 status.set_text(f"保存失败：{exc}")
 
+            _set_saving(True)
+            status.set_text("正在保存…")
             widgets.run_async(_do, on_success=_done, on_error=_failed)
 
         test_button.connect("clicked", lambda _b: _test())
@@ -715,39 +1092,81 @@ class ModelsPage(Page):
             height=760,
             on_submit=lambda: _save(),
         )
-        provider_options = [
-            (str(item.get("id")), str(item.get("id"))) for item in self._providers
-        ] or [("", "没有提供商")]
-        provider = widgets.dropdown(provider_options, str(agent.get("provider") or ""))
+        provider_ids = {
+            str(item.get("id"))
+            for item in self._providers
+            if item.get("id")
+        }
+        provider_options: list[tuple[str, str]] = [
+            (
+                str(item.get("id")),
+                f"{item.get('display_name') or item.get('id')}（{item.get('id')}）",
+            )
+            for item in self._providers
+            if item.get("id")
+        ]
+        current_provider_id = str(agent.get("provider") or "")
+        if current_provider_id and current_provider_id not in provider_ids:
+            provider_options.append(
+                (current_provider_id, f"{current_provider_id}（已不存在）")
+            )
+        if not provider_options:
+            provider_options = [("", "没有提供商")]
+        provider = widgets.dropdown(provider_options, current_provider_id)
         model = Gtk.Entry()
         model.set_text(str(agent.get("model") or ""))
         suggestions = _SuggestMenu(model)
         model_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         model_row.append(model)
         model_row.append(suggestions)
+
+        def _effort_options_for(provider_id: str, model_id: str) -> list[str]:
+            found_provider = next(
+                (item for item in self._providers if item.get("id") == provider_id),
+                None,
+            )
+            return _effort_options(
+                self._presets, found_provider, model_id
+            )
+
+        agent_budget = str(agent.get("reasoning_budget") or "")
+        initial_options = list(
+            agent.get("reasoning_effort_options")
+            or _effort_options_for(current_provider_id, str(agent.get("model") or ""))
+        )
+        initial_budget = agent_budget if agent_budget in initial_options else ""
+        budget_options = [("", "自动（供应商默认）")] + [
+            (str(item), EFFORT_LABELS.get(str(item), str(item)))
+            for item in initial_options
+        ]
+        budget = widgets.dropdown(budget_options, initial_budget)
+
+        temperature_value = agent.get("temperature")
         temperature = Gtk.SpinButton.new_with_range(0, 2, 0.05)
         temperature.set_digits(2)
-        temperature.set_value(float(agent.get("temperature") or 0))
+        temperature.set_value(
+            0.0 if temperature_value is None else float(temperature_value)
+        )
+        top_p_value = agent.get("top_p")
         top_p = Gtk.SpinButton.new_with_range(0, 1, 0.05)
         top_p.set_digits(2)
-        top_p.set_value(float(agent.get("top_p") or 1.0))
+        top_p.set_value(1.0 if top_p_value is None else float(top_p_value))
+        max_tokens_value = agent.get("max_tokens")
         max_tokens = Gtk.SpinButton.new_with_range(1, 1_000_000, 256)
-        max_tokens.set_value(float(agent.get("max_tokens") or 4096))
+        max_tokens.set_value(
+            4096.0 if max_tokens_value is None else float(max_tokens_value)
+        )
         reasoning_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         reasoning_switch = widgets.switch(bool(agent.get("reasoning")))
         reasoning_row.append(reasoning_switch)
         reasoning_row.append(widgets.label("启用思考 / reasoning"))
-        options = list(agent.get("reasoning_effort_options") or ["low", "medium", "high"])
-        budget_options = [("", "自动（供应商默认）")] + [
-            (str(item), str(item)) for item in options
-        ]
-        budget = widgets.dropdown(budget_options, str(agent.get("reasoning_budget") or ""))
-        budget_hint = widgets.muted(
-            "自动档位不发送 reasoning 强度；选择具体档位后会按 provider 的传递风格发送。"
-        )
+        budget_hint = widgets.muted("")
+        timeout_value = agent.get("first_token_timeout_seconds")
         timeout = Gtk.SpinButton.new_with_range(1, 1800, 1)
         timeout.set_numeric(True)
-        timeout.set_value(float(agent.get("first_token_timeout_seconds") or 120))
+        timeout.set_value(
+            120.0 if timeout_value is None else float(timeout_value)
+        )
         window.add_row("Provider", provider)
         window.add_row("模型", model_row)
         window.add_row("温度", temperature)
@@ -760,33 +1179,91 @@ class ModelsPage(Page):
         error = widgets.muted("")
         window.body_box.append(error)
 
+        def _update_effort_hint(provider_id: str) -> None:
+            found_provider = next(
+                (item for item in self._providers if item.get("id") == provider_id),
+                None,
+            )
+            style = str(
+                (found_provider or {}).get("reasoning_effort_style") or ""
+            )
+            if style in ("openai", "deepseek"):
+                budget_hint.set_text(
+                    "当前提供商会把档位映射为 reasoning_effort；"
+                    "档位越高越慢、越贵。自动表示不发送强度字段。"
+                )
+            else:
+                budget_hint.set_text(
+                    "当前提供商没有声明 reasoning_effort 支持；"
+                    "档位会保存，但不会向端点发送该字段。自动表示不发送。"
+                )
+            budget_hint.set_opacity(
+                1.0 if reasoning_switch.get_active() else 0.55
+            )
+
+        def _refresh_budget_options() -> None:
+            provider_id = widgets.dropdown_value(provider)
+            model_id = model.get_text().strip()
+            options = _effort_options_for(provider_id, model_id)
+            current = widgets.dropdown_value(budget)
+            # 保留已保存的档位；只有它确实不在当前模型支持的档位里时才
+            # 选一个有效档位。绝不能因为重算选项而静默改成“自动”。
+            desired = current if current in options else ""
+            if not desired and agent_budget in options:
+                desired = agent_budget
+            if not desired and not current and options:
+                desired = str(options[0])
+            widgets.set_dropdown_options(
+                budget,
+                [("", "自动（供应商默认）")]
+                + [
+                    (str(item), EFFORT_LABELS.get(str(item), str(item)))
+                    for item in options
+                ],
+                desired,
+            )
+            budget.set_sensitive(bool(reasoning_switch.get_active()))
+            _update_effort_hint(provider_id)
+
         def _sync_model_candidates(*_args: Any) -> None:
             provider_id = widgets.dropdown_value(provider)
             found_provider = next(
                 (item for item in self._providers if item.get("id") == provider_id),
                 None,
             )
-            preset_id = str((found_provider or {}).get("preset") or "")
+            vendor = _resolve_provider_vendor(
+                found_provider, model.get_text().strip(), self._presets
+            )
             found_preset = next(
-                (item for item in self._presets if item.get("id") == preset_id),
+                (
+                    item
+                    for item in self._presets
+                    if str(item.get("id") or "") == vendor
+                ),
                 None,
             )
             candidates = []
-            if found_preset:
-                for item in found_preset.get("models") or []:
-                    model_id = str(item.get("id") or "")
-                    if model_id:
-                        candidates.append(
-                            (model_id, str(item.get("display_name") or model_id))
-                        )
+            for item in (found_preset or {}).get("models") or []:
+                model_id = str(item.get("id") or "")
+                if model_id:
+                    candidates.append(
+                        (model_id, str(item.get("display_name") or model_id))
+                    )
             suggestions.set_candidates(candidates)
+            _refresh_budget_options()
+
+        def _on_model_changed(*_args: Any) -> None:
+            # Do not rebuild the suggestion popover on every keystroke: doing
+            # so reopens the popover while the user is trying to type.
+            _refresh_budget_options()
 
         def _sync_reasoning(*_args: Any) -> None:
             enabled = bool(reasoning_switch.get_active())
             budget.set_sensitive(enabled)
-            budget_hint.set_opacity(1.0 if enabled else 0.55)
+            _update_effort_hint(widgets.dropdown_value(provider))
 
         provider.connect("notify::selected", _sync_model_candidates)
+        model.connect("changed", _on_model_changed)
         reasoning_switch.connect("notify::active", _sync_reasoning)
         _sync_model_candidates()
         _sync_reasoning()
@@ -796,8 +1273,16 @@ class ModelsPage(Page):
                 return
             provider_id = widgets.dropdown_value(provider)
             model_id = model.get_text().strip()
-            if not provider_id or not model_id:
-                error.set_text("Provider 和模型不能为空。")
+            if not provider_id:
+                error.set_text("没有可用的提供商，请先在模型管理中添加。")
+                return
+            if provider_id not in provider_ids:
+                error.set_text(
+                    f"提供商 {provider_id} 已不存在，请改选一个有效提供商。"
+                )
+                return
+            if not model_id:
+                error.set_text("模型不能为空。")
                 return
             payload: dict[str, Any] = {
                 "provider": provider_id,
@@ -836,8 +1321,10 @@ class ModelsPage(Page):
                 self.refresh()
 
             def _failed(exc: BaseException) -> None:
+                window.submit_button.set_sensitive(True)
                 error.set_text(str(exc))
 
+            window.submit_button.set_sensitive(False)
             widgets.run_async(_do, on_success=_done, on_error=_failed)
 
         window.present()
@@ -846,18 +1333,31 @@ class ModelsPage(Page):
     # Local models
     # ------------------------------------------------------------------
     def _load_models(self, *, rescan: bool = False) -> None:
-        if self.api is None:
+        if self.api is None or self._models_busy:
             return
+        self._models_busy = True
+        self.scan_button.set_sensitive(False)
+        self.models_status.set_text("正在重新扫描本地模型…" if rescan else "正在读取本地模型…")
         path = "/api/models" + ("?rescan=true" if rescan else "")
 
         def _fetch() -> dict[str, Any]:
             return self.api.get(path, timeout=90)
 
         def _done(data: dict[str, Any]) -> None:
+            self._models_busy = False
+            self.scan_button.set_sensitive(True)
+            self.models_status.set_text("")
             self._models = list(data.get("models") or [])
             self._render_models()
 
-        widgets.run_async(_fetch, on_success=_done, on_error=lambda exc: self.toast(str(exc)))
+        def _failed(exc: BaseException) -> None:
+            self._models_busy = False
+            self.scan_button.set_sensitive(True)
+            self.models_status.set_text(f"扫描失败：{exc}")
+            self._render_models(error=str(exc))
+            self.toast(f"扫描本地模型失败：{exc}")
+
+        widgets.run_async(_fetch, on_success=_done, on_error=_failed)
 
     def _show_guide(self, model: dict[str, Any]) -> None:
         if self.api is None:
@@ -880,9 +1380,15 @@ class ModelsPage(Page):
 
         widgets.run_async(_do, on_success=_show, on_error=lambda exc: self.toast(str(exc)))
 
-    def _install_deps(self, model: dict[str, Any]) -> None:
+    def _install_deps(
+        self,
+        model: dict[str, Any],
+        button: Gtk.Button | None = None,
+    ) -> None:
         if self.api is None:
             return
+        if button is not None:
+            button.set_sensitive(False)
 
         def _do() -> Any:
             return self.api.post(
@@ -891,17 +1397,30 @@ class ModelsPage(Page):
                 timeout=60,
             )
 
-        widgets.run_async(
-            _do,
-            on_success=lambda result: self.toast(str(result.get("message") or "已开始安装")),
-            on_error=lambda exc: self.toast(str(exc)),
-        )
+        def _done(result: Any) -> None:
+            if button is not None:
+                button.set_sensitive(True)
+            payload = result if isinstance(result, dict) else {}
+            self.toast(str(payload.get("message") or "已开始安装"))
 
-    def _upload_model(self, model: dict[str, Any]) -> None:
+        def _failed(exc: BaseException) -> None:
+            if button is not None:
+                button.set_sensitive(True)
+            self.toast(f"安装依赖失败：{exc}")
+
+        widgets.run_async(_do, on_success=_done, on_error=_failed)
+
+    def _upload_model(
+        self,
+        model: dict[str, Any],
+        button: Gtk.Button | None = None,
+    ) -> None:
         path = widgets.path_picker(self.app.window, title_text="选择模型 zip")
         if not path or self.api is None:
             return
         source = Path(path)
+        if button is not None:
+            button.set_sensitive(False)
 
         def _do() -> Any:
             return self.api.upload_file(
@@ -910,11 +1429,19 @@ class ModelsPage(Page):
                 timeout=600,
             )
 
-        widgets.run_async(
-            _do,
-            on_success=lambda result: (self.toast(str(result.get("message") or "上传完成")), self._load_models(rescan=True)),
-            on_error=lambda exc: self.toast(f"上传失败：{exc}"),
-        )
+        def _done(result: Any) -> None:
+            if button is not None:
+                button.set_sensitive(True)
+            payload = result if isinstance(result, dict) else {}
+            self.toast(str(payload.get("message") or "上传完成"))
+            self._load_models(rescan=True)
+
+        def _failed(exc: BaseException) -> None:
+            if button is not None:
+                button.set_sensitive(True)
+            self.toast(f"上传失败：{exc}")
+
+        widgets.run_async(_do, on_success=_done, on_error=_failed)
 
 
 def _quote(value: Any) -> str:

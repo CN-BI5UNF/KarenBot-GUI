@@ -31,6 +31,8 @@ class StoragePage(Page):
         self.warning_box = widgets.card()
         self.warning_box.set_visible(False)
         self.body.append(self.warning_box)
+        self.maintenance_label = widgets.muted("")
+        self.body.append(self.maintenance_label)
         self.body.append(widgets.section_header("占用分类", "原始聊天、用户文件与备份受保护"))
         self.categories_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.body.append(self.categories_box)
@@ -55,10 +57,14 @@ class StoragePage(Page):
         self.body.append(self.admin_box)
         self._categories: list[dict[str, Any]] = []
         self._checks: dict[str, Gtk.CheckButton] = {}
+        self._selected_categories: set[str] = set()
+        self._seen_categories: set[str] = set()
         self._preview: dict[str, Any] | None = None
+        self._preview_busy = False
         self._jobs: list[dict[str, Any]] = []
         self._job_poll_source = 0
         self._job_poll_id = ""
+        self._job_poll_attempts = 0
         self.status_label = widgets.muted("")
         self.body.append(self.status_label)
 
@@ -223,10 +229,31 @@ class StoragePage(Page):
     def _render_summary(self, usage: dict[str, Any]) -> None:
         widgets.clear(self.summary_box)
         disk = usage.get("disk") or {}
+        history = usage.get("history") or {}
+        maintenance = usage.get("maintenance") or {}
         metrics = [
-            ("磁盘可用", _bytes(disk.get("free")), f"已用 {disk.get('percent', 0)}%"),
-            ("可回收缓存", _bytes(usage.get("reclaimable_bytes")), "内存缓存 + 过期临时文件"),
-            ("受保护数据", _bytes(usage.get("protected_bytes")), "聊天 / 用户文件 / 日志 / 备份"),
+            (
+                "磁盘可用",
+                _bytes(disk.get("free")),
+                f"已用 {disk.get('percent', 0)}% · 共 {_bytes(disk.get('total'))}",
+            ),
+            (
+                "可回收缓存",
+                _bytes(usage.get("reclaimable_bytes")),
+                "内存缓存 + 过期临时文件 + 到期入站媒体",
+            ),
+            (
+                "受保护数据",
+                _bytes(usage.get("protected_bytes")),
+                "聊天 / 用户文件 / 日志 / 备份",
+            ),
+            (
+                "历史分页缓存",
+                f"{int(history.get('page_cache_entries') or 0)} 页",
+                f"{_bytes(history.get('page_cache_bytes'))} / "
+                f"{_bytes(history.get('page_cache_max_bytes'))} · "
+                f"记录 {int(history.get('record_count') or 0)} 条",
+            ),
         ]
         for name, value, hint in metrics:
             card = widgets.card(spacing=2)
@@ -234,6 +261,12 @@ class StoragePage(Page):
             card.append(widgets.label(name, css="metric-label"))
             card.append(widgets.muted(hint))
             self.summary_box.append(card)
+        self.maintenance_label.set_text(
+            f"维护模式：{maintenance.get('mode') or 'inventory_only'} · "
+            f"临时文件保留 {maintenance.get('temp_hours') or 0} 小时 · "
+            f"自动清理："
+            f"{'开启' if maintenance.get('automatic_cleanup') else '未启用'}"
+        )
         low = usage.get("low_disk") or {}
         widgets.clear(self.warning_box)
         if low.get("warning"):
@@ -259,11 +292,25 @@ class StoragePage(Page):
         for category in self._categories:
             card = widgets.card(spacing=4)
             head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            key = str(category.get("key") or "")
             reclaimable = bool(category.get("reclaimable"))
+            has_bytes = int(category.get("bytes") or 0) > 0
+            if key and key not in self._seen_categories:
+                self._seen_categories.add(key)
+                if reclaimable and has_bytes:
+                    self._selected_categories.add(key)
             check = Gtk.CheckButton()
-            check.set_active(reclaimable and int(category.get("bytes") or 0) > 0)
-            check.set_sensitive(reclaimable)
-            self._checks[str(category.get("key"))] = check
+            check.set_active(
+                reclaimable and has_bytes and key in self._selected_categories
+            )
+            check.set_sensitive(reclaimable and has_bytes)
+            check.connect(
+                "toggled",
+                lambda button, category_key=key: self._toggle_category(
+                    category_key, button.get_active()
+                ),
+            )
+            self._checks[key] = check
             head.append(check)
             head.append(widgets.label(str(category.get("label") or category.get("key")), css="section-title"))
             head.append(
@@ -272,25 +319,108 @@ class StoragePage(Page):
                     css="badge" if category.get("protected") else "badge badge-green",
                 )
             )
+            head.append(
+                widgets.badge(
+                    "内存" if category.get("kind") == "memory" else "磁盘",
+                    css="badge badge-idle",
+                )
+            )
             head.append(widgets.label(_bytes(category.get("bytes")), css="metric-label"))
+            head.append(
+                widgets.muted(f"{int(category.get('items') or 0)} 项")
+            )
             card.append(head)
             card.append(widgets.muted(str(category.get("description") or "")))
             self.categories_box.append(card)
 
+    def _toggle_category(self, key: str, selected: bool) -> None:
+        if selected:
+            self._selected_categories.add(key)
+        else:
+            self._selected_categories.discard(key)
+
     def _render_context(self, data: dict[str, Any]) -> None:
         widgets.clear(self.context_box)
         if data.get("error"):
-            self.context_box.append(widgets.muted(f"读取上下文状态失败：{data['error']}"))
+            self.context_box.append(
+                widgets.muted(f"读取上下文状态失败：{data['error']}")
+            )
             return
         if not data:
             self.context_box.append(widgets.muted("暂无上下文状态。"))
             return
-        for key, value in data.items():
-            if isinstance(value, (dict, list)):
-                value = str(value)
-            self.context_box.append(widgets.property_row(str(key), str(value)))
+        budget = data.get("budget") or {}
+        history = data.get("history") or {}
+        errors = [str(item) for item in budget.get("errors") or []]
+        self.context_box.append(
+            widgets.label(
+                "有效窗口 = min(工作窗口, 模型限制)；净输入预算 = 窗口 - 输出预留 - 安全余量。"
+                "估算值不是供应商账单。",
+                css="muted",
+                wrap=True,
+            )
+        )
+        summary = (
+            f"有效窗口 {int(budget.get('window_effective') or 0)} · "
+            f"输出预留 {int(budget.get('output_reserve') or 0)} · "
+            f"安全余量 {int(budget.get('safety_margin') or 0)} · "
+            f"净输入预算 {int(budget.get('input_budget') or 0)}"
+        )
+        self.context_box.append(widgets.label(summary, css="section-title", wrap=True))
+        rows = [
+            (
+                "Provider / 模型",
+                f"{data.get('provider') or '?'} / {data.get('model') or '?'}",
+            ),
+            (
+                "工作窗口 / 模型限制",
+                f"{int(budget.get('window_requested') or 0)} / "
+                + (
+                    str(budget.get("window_model"))
+                    if budget.get("window_model")
+                    else "未核实"
+                ),
+            ),
+            (
+                "阈值基准",
+                f"{budget.get('threshold_basis') or ''}"
+                f"（策略 {budget.get('policy_version') or '—'}）",
+            ),
+            (
+                "soft / target / retry / urgent",
+                f"{int(budget.get('soft_trigger') or 0)} / "
+                f"{int(budget.get('target_after') or 0)} / "
+                f"{int(budget.get('retry_target') or 0)} / "
+                f"{int(budget.get('urgent_trigger') or 0)}",
+            ),
+            (
+                "固定开销估算",
+                str(int(data.get("fixed_overhead_tokens") or 0)),
+            ),
+            (
+                "历史条数 / 活跃起点",
+                f"{int(history.get('record_count') or 0)} / "
+                f"{int(history.get('active_start_index') or 0)}",
+            ),
+        ]
+        for name, value in rows:
+            self.context_box.append(widgets.property_row(name, value))
+        if errors:
+            self.context_box.append(
+                widgets.label(
+                    "预算校验：" + "、".join(errors),
+                    css="danger-text",
+                    wrap=True,
+                )
+            )
+        else:
+            self.context_box.append(
+                widgets.muted("预算校验通过；估算值不等于供应商账单。")
+            )
         compact = widgets.button("立即压缩上下文")
-        compact.connect("clicked", lambda _b: self._compact())
+        compact.connect(
+            "clicked", lambda button: self._confirm_compact(button)
+        )
         self.context_box.append(compact)
 
     def _render_jobs(self, data: dict[str, Any]) -> None:
@@ -343,10 +473,18 @@ class StoragePage(Page):
 
     # ------------------------------------------------------------------
     def _preview(self) -> None:
+        if self._preview_busy:
+            return
         categories = [key for key, check in self._checks.items() if check.get_active()]
         if not categories or self.api is None:
             self.toast("请先勾选要清理的类别")
             return
+        self._preview_busy = True
+        self.preview_button.set_sensitive(False)
+
+        def _reset() -> None:
+            self._preview_busy = False
+            self.preview_button.set_sensitive(True)
 
         def _do() -> dict[str, Any]:
             return self.api.post(
@@ -360,20 +498,37 @@ class StoragePage(Page):
                 f"{key}: {_bytes(value.get('bytes'))} / {value.get('items', 0)} 项"
                 for key, value in counts.items()
             ]
-            body = "\n".join(lines) + f"\n预计回收 {_bytes(preview.get('expected_bytes'))}"
+            body = "\n".join(lines)
+            body += (
+                f"\n\n预计回收 {_bytes(preview.get('expected_bytes'))}，"
+                f"候选 {int(preview.get('expected_items') or 0)} 项。"
+            )
+            for warning in preview.get("warnings") or []:
+                body += f"\n警告：{warning}"
+            expires = widgets.short_time(preview.get("expires_at"))
+            if expires:
+                body += f"\n\n预览过期时间：{expires}；过期后必须重新预览。"
+            body += "\n原始聊天、用户文件与备份不会出现在候选中。"
             widgets.ConfirmDialog(
                 self.app.window,
                 heading="确认清理这些缓存？",
                 body=body,
                 confirm_label="执行清理",
                 destructive=True,
-                on_confirm=self._execute_preview,
+                on_confirm=lambda selected=preview: (
+                    _reset(),
+                    self._execute_preview(selected),
+                ),
+                on_cancel=_reset,
             )
 
-        widgets.run_async(_do, on_success=_done, on_error=lambda exc: self.toast(f"预览失败：{exc}"))
+        def _failed(exc: BaseException) -> None:
+            _reset()
+            self.toast(f"预览失败：{exc}")
 
-    def _execute_preview(self) -> None:
-        preview = self._preview
+        widgets.run_async(_do, on_success=_done, on_error=_failed)
+
+    def _execute_preview(self, preview: dict[str, Any]) -> None:
         if not preview or self.api is None:
             return
         payload = {
@@ -396,6 +551,7 @@ class StoragePage(Page):
 
     def _start_job_poll(self, job_id: str) -> None:
         self._job_poll_id = job_id
+        self._job_poll_attempts = 0
         if self._job_poll_source:
             GLib.source_remove(self._job_poll_source)
         self._job_poll_source = GLib.timeout_add_seconds(1, self._poll_job)
@@ -403,8 +559,6 @@ class StoragePage(Page):
     def _poll_job(self) -> bool:
         self._job_poll_source = 0
         if self.api is None or not self._job_poll_id:
-            return False
-        if not self.get_mapped():
             return False
         job_id = self._job_poll_id
 
@@ -426,14 +580,37 @@ class StoragePage(Page):
                 "cancelling",
                 "scheduled",
             }:
+                self._job_poll_attempts = 0
                 self._job_poll_source = GLib.timeout_add_seconds(1, self._poll_job)
             else:
                 self._job_poll_id = ""
+                self._job_poll_attempts = 0
+                result = job.get("result") or {}
+                freed = _bytes(result.get("bytes_freed"))
+                skipped = result.get("skipped")
+                state = str(job.get("state") or "")
+                label = {
+                    "completed": "已完成",
+                    "partial": "部分完成",
+                    "failed": "失败",
+                    "cancelled": "已取消",
+                }.get(state, state or "结束")
+                self.toast(
+                    f"清理任务{label}：释放 {freed}"
+                    + (f"，跳过 {skipped}" if skipped else "")
+                )
                 self.refresh()
 
         def _failed(exc: BaseException) -> None:
-            self.status_label.set_text(f"读取清理任务失败：{exc}")
-            self._job_poll_id = ""
+            self._job_poll_attempts += 1
+            self.status_label.set_text(
+                f"读取清理任务失败：{exc}；正在重试（第 {self._job_poll_attempts} 次）"
+            )
+            if self._job_poll_id:
+                delay = min(10, 1 + self._job_poll_attempts)
+                self._job_poll_source = GLib.timeout_add_seconds(
+                    delay, self._poll_job
+                )
 
         widgets.run_async(_do, on_success=_done, on_error=_failed)
         return False
@@ -451,19 +628,48 @@ class StoragePage(Page):
             on_error=lambda exc: self.toast(str(exc)),
         )
 
-    def _compact(self) -> None:
+    def _confirm_compact(self, button: Gtk.Button) -> None:
+        widgets.ConfirmDialog(
+            self.app.window,
+            heading="立即压缩当前活跃历史？",
+            body="原文会归档，活跃窗口起点前移。压缩需要调用摘要模型，"
+            "可能耗时十几秒。",
+            confirm_label="立即压缩",
+            on_confirm=lambda: self._compact(button),
+        )
+
+    def _compact(self, button: Gtk.Button | None = None) -> None:
         if self.api is None:
             return
+        if button is not None:
+            button.set_sensitive(False)
         self.toast("正在压缩上下文…")
 
         def _do() -> Any:
             return self.api.post("/api/context/compact", {}, timeout=180)
 
-        widgets.run_async(
-            _do,
-            on_success=lambda _r: (self.toast("压缩完成"), self.refresh()),
-            on_error=lambda exc: self.toast(f"压缩失败：{exc}"),
-        )
+        def _done(result: Any) -> None:
+            payload = result if isinstance(result, dict) else {}
+            body = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+            if payload.get("ok") is False:
+                reason = body.get("reason") or body.get("status") or "无可用结果"
+                self.toast(f"未压缩：{reason}")
+            else:
+                self.toast(
+                    "压缩完成：归档 "
+                    f"{int(body.get('archived_count') or 0)} 条，活跃 "
+                    f"{int(body.get('active_records') or 0)} 条"
+                )
+            self.refresh()
+            if button is not None:
+                button.set_sensitive(True)
+
+        def _failed(exc: BaseException) -> None:
+            if button is not None:
+                button.set_sensitive(True)
+            self.toast(f"压缩失败：{exc}")
+
+        widgets.run_async(_do, on_success=_done, on_error=_failed)
 
 
 def _admin_state_label(state: str) -> str:

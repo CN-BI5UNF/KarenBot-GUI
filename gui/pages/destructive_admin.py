@@ -255,6 +255,7 @@ def _show_preview(
                 title=f"正在清理「{persona}」",
                 subtitle="服务端任务已提交；关闭进度窗口不会中止已开始的删除。",
                 job=job,
+                audit_path=str(preview.get("audit_path") or ""),
                 on_done=on_done,
             )
 
@@ -411,6 +412,7 @@ def _show_uninstall_preview(
                     "请保存审计路径以便之后确认结果。"
                 ),
                 job=job,
+                audit_path=str(preview.get("audit_path") or ""),
                 on_done=on_done,
                 allow_disconnect=True,
             )
@@ -439,9 +441,13 @@ def _show_job_progress(
     job: dict[str, Any],
     on_done: Callable[[], None] | None,
     allow_disconnect: bool = False,
+    audit_path: str = "",
 ) -> None:
     job_id = str(job.get("job_id") or "")
-    audit_path = str(job.get("audit_path") or "")
+    # execute 返回的 public job 顶层没有 audit_path；它通常来自 preview，
+    # 任务完成后才出现在 result.audit_path。先把 preview 提供的路径显示出来，
+    # 终态时再用 result 补充。
+    audit_path = str(job.get("audit_path") or audit_path or "")
     window = Gtk.Window()
     window.set_title(title)
     window.set_default_size(620, 400)
@@ -465,8 +471,8 @@ def _show_job_progress(
     box.append(detail)
     box.append(result)
     box.append(widgets.muted(f"任务：{job_id or '—'}"))
-    if audit_path:
-        box.append(widgets.muted(f"审计：{audit_path}"))
+    audit_label = widgets.muted(f"审计：{audit_path}" if audit_path else "审计：任务结束后显示")
+    box.append(audit_label)
     box.append(close)
     scroller = Gtk.ScrolledWindow()
     scroller.set_vexpand(True)
@@ -520,7 +526,7 @@ def _show_job_progress(
                 return
             if job_state in TERMINAL_STATES:
                 payload = data.get("result") or {}
-                result.set_text(
+                summary = (
                     f"已释放 {widgets.format_bytes(payload.get('bytes_freed'))}；"
                     f"Runtime："
                     + (
@@ -529,6 +535,21 @@ def _show_job_progress(
                         else "未运行/恢复失败"
                     )
                 )
+                backup = payload.get("backup") or {}
+                backup_path = str(
+                    backup.get("path") if isinstance(backup, dict) else backup or ""
+                )
+                if backup_path:
+                    summary += f"\n备份：{backup_path}"
+                result.set_text(summary)
+                terminal_audit = str(
+                    data.get("audit_path")
+                    or payload.get("audit_path")
+                    or audit_path
+                    or ""
+                )
+                if terminal_audit:
+                    audit_label.set_text(f"审计：{terminal_audit}")
                 if job_state == "completed":
                     page.toast("清理完成")
                 elif job_state == "cancelled":

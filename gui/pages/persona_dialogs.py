@@ -15,6 +15,36 @@ from gi.repository import Adw, Gtk  # noqa: E402
 from .. import widgets  # noqa: E402
 from ..api import q  # noqa: E402
 
+_PERSONA_NAME_RE = re.compile(r"^[\w一-龥㐀-䶿＀-￯-]{1,64}$")
+_RESERVED_PERSONA_NAMES = frozenset(
+    {
+        "__pycache__",
+        "backups",
+        "con",
+        "prn",
+        "aux",
+        "nul",
+        *(f"com{i}" for i in range(1, 10)),
+        *(f"lpt{i}" for i in range(1, 10)),
+    }
+)
+
+
+def _persona_name_error(name: str) -> str:
+    if not name:
+        return "人格目录名不能为空。"
+    if not _PERSONA_NAME_RE.match(name):
+        return (
+            "人格名只能含中文、字母、数字、下划线或短横线，最长 64 个字符"
+            "（它会同时作为目录名，不能包含空格、斜杠或点）。"
+        )
+    if name.startswith((".", "_", "-")):
+        return "人格名不能以点、下划线或短横线开头。"
+    if name.casefold() in _RESERVED_PERSONA_NAMES:
+        return f"{name} 是系统保留名，换一个。"
+    return ""
+
+
 BRIEF_FIELDS = [
     (
         "personality",
@@ -93,6 +123,56 @@ def _shell(
     return window, body, footer, scroller
 
 
+
+_PREVIEW_TAGS = (
+    "identity",
+    "past",
+    "personality",
+    "voice",
+    "boundaries",
+    "relation_with_user",
+    "consistency_anchors",
+)
+
+
+def _persona_preview_sections(xml: str) -> list[tuple[str, str]]:
+    sections: list[tuple[str, str]] = []
+    for tag in _PREVIEW_TAGS:
+        match = re.search(
+            rf"<{tag}[^>]*>([\s\S]*?)</{tag}>", xml
+        )
+        if match:
+            body = match.group(1).strip()
+            if body:
+                sections.append((tag, body))
+    return sections
+
+
+def _render_persona_preview(
+    xml: str, host: Gtk.Box, raw_view: Gtk.Widget
+) -> None:
+    """Render known top-level persona tags as readable sections.
+
+    Models do not always follow the XML contract.  If no known section is
+    found, keep the raw XML visible instead of pretending the parse succeeded.
+    """
+    widgets.clear(host)
+    sections = _persona_preview_sections(xml)
+    if not sections:
+        host.set_visible(False)
+        raw_view.set_visible(True)
+        return
+    for tag, body in sections:
+        section = widgets.card(spacing=3, padding=10)
+        section.append(widgets.label(tag, css="stat-label"))
+        section.append(
+            widgets.label(body, css="chat-text", wrap=True, selectable=True)
+        )
+        host.append(section)
+    host.set_visible(True)
+    raw_view.set_visible(False)
+
+
 def _field(label_text: str, control: Gtk.Widget, help_text: str = "") -> Gtk.Box:
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
     box.append(widgets.label(label_text, css="field-label"))
@@ -152,6 +232,15 @@ def _show_creator(page: Any, on_done: Any, stashed: dict[str, Any] | None) -> No
             "满意了再采用；生成过程不会写盘。"
         )
     )
+    direct = widgets.button("不用 AI，直接写提示词", css="flat")
+    direct.connect(
+        "clicked",
+        lambda _b: (
+            window.close(),
+            open_direct_editor(page, None, on_done),
+        ),
+    )
+    body.append(direct)
 
     brief_views: dict[str, Gtk.ScrolledWindow] = {}
     for key, label_text, help_text in BRIEF_FIELDS:
@@ -163,7 +252,10 @@ def _show_creator(page: Any, on_done: Any, stashed: dict[str, Any] | None) -> No
     preview_title.set_visible(False)
     preview = _text_area(height=300, monospace=True)
     preview.set_visible(False)
+    preview_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    preview_box.set_visible(False)
     body.append(preview_title)
+    body.append(preview_box)
     body.append(preview)
 
     if stashed:
@@ -201,11 +293,9 @@ def _show_creator(page: Any, on_done: Any, stashed: dict[str, Any] | None) -> No
         if state["busy"]:
             return
         name = name_entry.get_text().strip()
-        if not name:
-            status.set_text("先给人格起个目录名。")
-            return
-        if not re.match(r"^[A-Za-z0-9一-鿿][A-Za-z0-9_.\-一-鿿]{0,63}$", name):
-            status.set_text("目录名只能包含字母、数字、中文、下划线、点和短横线。")
+        name_error = _persona_name_error(name)
+        if name_error:
+            status.set_text(name_error)
             return
         set_busy(True)
         status.set_text("正在生成，大概要十几秒…")
@@ -217,8 +307,8 @@ def _show_creator(page: Any, on_done: Any, stashed: dict[str, Any] | None) -> No
             state["xml"] = str(result.get("xml") or "")
             buffer = preview.text_view.get_buffer()  # type: ignore[attr-defined]
             buffer.set_text(state["xml"])
+            _render_persona_preview(state["xml"], preview_box, preview)
             preview_title.set_visible(True)
-            preview.set_visible(True)
             adopt.set_visible(True)
             status.set_text("已生成。不满意就改改描述再点一次，满意后采用。")
             set_busy(False)
@@ -259,7 +349,7 @@ def _show_creator(page: Any, on_done: Any, stashed: dict[str, Any] | None) -> No
             if not overwrite and "已存在" in str(exc):
                 set_busy(False)
                 widgets.ConfirmDialog(
-                    page.app.window,
+                    window,
                     heading="同名人格已存在",
                     body=f"{exc}\n\n覆盖前会自动备份。",
                     confirm_label="覆盖",
@@ -320,6 +410,9 @@ def open_direct_editor(page: Any, name: str | None, on_done: Any) -> None:
     admins.append(_field("管理员 QQ", admin_qq))
     admins.append(_field("管理员称呼", admin_name))
     body.append(admins)
+    admins_note = widgets.muted("")
+    admins_note.set_visible(False)
+    body.append(admins_note)
     body.append(
         _field(
             "人格提示词",
@@ -331,6 +424,7 @@ def open_direct_editor(page: Any, name: str | None, on_done: Any) -> None:
 
     view: Gtk.TextView = prompt.text_view  # type: ignore[attr-defined]
     buffer = view.get_buffer()
+    original_admins: list[dict[str, Any]] = []
 
     def update_counter(*_args: Any) -> None:
         length = len(widgets.text_value(prompt))
@@ -354,8 +448,9 @@ def open_direct_editor(page: Any, name: str | None, on_done: Any) -> None:
             return
         target = name_entry.get_text().strip()
         content = widgets.text_value(prompt)
-        if not target:
-            status.set_text("先填人格目录名。")
+        name_error = _persona_name_error(target)
+        if name_error:
+            status.set_text(name_error)
             return
         if not content.strip():
             status.set_text("提示词不能为空。")
@@ -363,15 +458,44 @@ def open_direct_editor(page: Any, name: str | None, on_done: Any) -> None:
         if len(content) > 20000:
             status.set_text("提示词超过 20000 字符。")
             return
-        admin_entries = []
-        if admin_qq.get_text().strip():
+        admin_entries: list[dict[str, Any]] = []
+        admin_value = admin_qq.get_text().strip()
+        if admin_value:
+            first_original = (
+                original_admins[0] if original_admins else {}
+            )
+            same_admin = (
+                str(first_original.get("qq") or "") == admin_value
+            )
             admin_entries.append(
                 {
-                    "qq": admin_qq.get_text().strip(),
+                    "qq": admin_value,
                     "name": admin_name.get_text().strip(),
-                    "role": "owner",
+                    "role": (
+                        str(first_original.get("role") or "owner")
+                        if same_admin
+                        else "owner"
+                    ),
                 }
             )
+        # The direct editor exposes one administrator. Keep every additional
+        # administrator loaded from the existing persona so saving a prompt
+        # does not silently drop co-owners.
+        if original_admins:
+            admin_entries.extend(
+                dict(item) for item in original_admins[1:]
+            )
+        age_text = age.get_text().strip()
+        age_value: int | None = None
+        if age_text:
+            try:
+                age_value = int(age_text)
+            except ValueError:
+                status.set_text("年龄必须是 0–1000 的整数，或留空。")
+                return
+            if not 0 <= age_value <= 1000:
+                status.set_text("年龄必须是 0–1000 的整数，或留空。")
+                return
         payload = {
             "name": target,
             "xml": content,
@@ -379,7 +503,7 @@ def open_direct_editor(page: Any, name: str | None, on_done: Any) -> None:
             "overwrite": overwrite,
             "display_name": display_name.get_text().strip(),
             "gender": gender.get_text().strip(),
-            "age": age.get_text().strip() or None,
+            "age": age_value,
             "admins": admin_entries,
         }
         save_button.set_sensitive(False)
@@ -399,7 +523,7 @@ def open_direct_editor(page: Any, name: str | None, on_done: Any) -> None:
             if not overwrite and "已存在" in str(exc):
                 save_button.set_sensitive(True)
                 widgets.ConfirmDialog(
-                    page.app.window,
+                    window,
                     heading="同名人格已存在",
                     body=f"{exc}\n\n覆盖前会自动备份。",
                     confirm_label="覆盖",
@@ -429,10 +553,22 @@ def open_direct_editor(page: Any, name: str | None, on_done: Any) -> None:
             gender.set_text(str(values.get("gender") or ""))
             value_age = values.get("age")
             age.set_text("" if value_age in (None, "") else str(value_age))
-            admin = (values.get("admins") or [None])[0]
+            loaded_admins = values.get("admins") or []
+            original_admins.clear()
+            original_admins.extend(
+                dict(item) for item in loaded_admins if isinstance(item, dict)
+            )
+            admin = original_admins[0] if original_admins else None
             if isinstance(admin, dict):
                 admin_qq.set_text(str(admin.get("qq") or ""))
                 admin_name.set_text(str(admin.get("name") or ""))
+            if len(original_admins) > 1:
+                admins_note.set_text(
+                    f"这个人格共有 {len(original_admins)} 个管理员；"
+                    "这里编辑第一个，另外 "
+                    f"{len(original_admins) - 1} 个会在保存时原样保留。"
+                )
+                admins_note.set_visible(True)
             status.set_text("已读取当前提示词；保存覆盖前会自动备份。")
 
         widgets.run_async(_load, on_success=_loaded, on_error=lambda exc: status.set_text(str(exc)))
@@ -448,6 +584,8 @@ def open_refiner(page: Any, name: str, on_done: Any) -> None:
     preview_title.set_visible(False)
     preview = _text_area(height=340, monospace=True)
     preview.set_visible(False)
+    preview_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    preview_box.set_visible(False)
     body.append(
         widgets.muted(
             "贴一句想改的地方，AI 会出一版修改稿。确认前不会动现有文件；"
@@ -456,6 +594,7 @@ def open_refiner(page: Any, name: str, on_done: Any) -> None:
     )
     body.append(_field("想改哪里", feedback, "比如「再冷淡一点」「少说反问句」"))
     body.append(preview_title)
+    body.append(preview_box)
     body.append(preview)
 
     cancel = widgets.button("取消")
@@ -503,9 +642,9 @@ def open_refiner(page: Any, name: str, on_done: Any) -> None:
             state["history"].append({"role": "assistant", "content": state["xml"]})
             buffer = preview.text_view.get_buffer()  # type: ignore[attr-defined]
             buffer.set_text(state["xml"])
+            _render_persona_preview(state["xml"], preview_box, preview)
             preview_title.set_text(f"修改版（第 {state['refined']} 版）")
             preview_title.set_visible(True)
-            preview.set_visible(True)
             adopt.set_visible(True)
             feedback_buffer = feedback.text_view.get_buffer()  # type: ignore[attr-defined]
             feedback_buffer.set_text("")
@@ -551,7 +690,7 @@ def open_refiner(page: Any, name: str, on_done: Any) -> None:
             widgets.run_async(_do, on_success=_done, on_error=_failed)
 
         widgets.ConfirmDialog(
-            page.app.window,
+            window,
             heading=f"覆盖 {name} 的人设？",
             body="覆盖前会自动备份到 personas/<name>/.backups/。",
             confirm_label="采用并覆盖",

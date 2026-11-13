@@ -16,7 +16,7 @@ gi.require_version("Adw", "1")
 gi.require_version("Gdk", "4.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
-from . import __version__, widgets  # noqa: E402
+from . import widgets  # noqa: E402
 from .api import ApiClient  # noqa: E402
 from .identity import application_id  # noqa: E402
 from .local_server import LocalControlServer  # noqa: E402
@@ -237,10 +237,22 @@ class MainWindow(Adw.ApplicationWindow):
         self.current_page_id = ""
         self.status: dict[str, Any] = {}
         self._status_poll_busy = False
+        self._status_timer_id = 0
+        self._backend_restart_busy = False
+        self._backend_generation = 0
         self._last_setup_hint = False
+        self._setup_completed = False
+        self._status_failures = 0
+        self._status_error_active = False
+        self._status_error_before = ""
+        self._last_status_notice: tuple[Any, ...] | None = None
+        self._version_ready = False
+        self._version_tooltip = ""
+        self._data_dir = ""
         self._last_runtime_state = ""
         self._nav_guard = False
         self._unsaved_dialog: Adw.MessageDialog | None = None
+        self._runtime_restart_busy = False
         self._force_close = False
         widgets.install_callback_pump()
         self._build_shell()
@@ -295,6 +307,8 @@ class MainWindow(Adw.ApplicationWindow):
 
         self.nav_list = Gtk.ListBox()
         self.nav_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        # 首次配置门禁完成前不允许进入任何业务页。
+        self.nav_list.set_sensitive(False)
         self.nav_list.add_css_class("navigation-sidebar")
         self.nav_list.connect("row-selected", self._on_nav_selected)
         self._build_nav()
@@ -314,10 +328,8 @@ class MainWindow(Adw.ApplicationWindow):
         self.runtime_box.append(self.runtime_dot)
         self.runtime_box.append(self.runtime_label)
         self.sidebar_foot.append(self.runtime_box)
-        self.version_label = widgets.label(
-            f"Karen Desktop {__version__}", css="app-version"
-        )
-        self.version_label.set_tooltip_text("原生 GTK4 桌面控制台（独立数据目录）")
+        self.version_label = widgets.label("开发版", css="app-version")
+        self.version_label.set_tooltip_text("正在读取版本…")
         self.sidebar_foot.append(self.version_label)
         self.sidebar.append(self.sidebar_foot)
         self._apply_sidebar_state(self._sidebar_collapsed, persist=False)
@@ -341,6 +353,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.restart_button = widgets.icon_button(
             "system-reboot-symbolic", "重启 Runtime（不重新加载代码）"
         )
+        self.restart_button.set_sensitive(False)
         self.restart_button.connect("clicked", lambda _b: self._restart_runtime())
         header.pack_end(self.restart_button)
         self.theme_button = self._theme_button()
@@ -455,20 +468,29 @@ class MainWindow(Adw.ApplicationWindow):
         if self.api is None:
             self.toast("Runtime 尚未就绪")
             return
+        if self._runtime_restart_busy:
+            self.toast("Runtime 正在重启，请稍候…")
+            return
 
         def _do() -> Any:
             return self.api.post("/api/system/restart", {}, timeout=180)
 
         def _confirm() -> None:
-            widgets.run_async(
-                _do,
-                on_success=lambda _r: (
-                    self.toast("Runtime 已重启"),
-                    self._poll_status(),
-                    self.refresh_current(),
-                ),
-                on_error=lambda exc: self.toast(f"重启失败：{exc}"),
-            )
+            if self._runtime_restart_busy:
+                return
+            self._runtime_restart_busy = True
+
+            def _done(_result: Any) -> None:
+                self._runtime_restart_busy = False
+                self.toast("Runtime 已重启")
+                self._poll_status()
+                self.refresh_current()
+
+            def _failed(exc: BaseException) -> None:
+                self._runtime_restart_busy = False
+                self.toast(f"重启失败：{exc}")
+
+            widgets.run_async(_do, on_success=_done, on_error=_failed)
 
         widgets.ConfirmDialog(
             self,
@@ -566,10 +588,12 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_backend_ready(self, base_url: str) -> None:
         logger.info("GUI 已连接控制服务 %s", base_url)
+        self._backend_restart_busy = False
         self.api = ApiClient(base_url, token=getattr(self.backend, "auth_token", ""))
         GLib.timeout_add(250, self._first_status_poll)
 
     def _on_backend_error(self, exc: BaseException) -> None:
+        self._backend_restart_busy = False
         self.runtime_label.set_text("后端启动失败")
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         page.set_valign(Gtk.Align.CENTER)
@@ -585,6 +609,10 @@ class MainWindow(Adw.ApplicationWindow):
         self.toast(f"本地控制服务启动失败：{exc}")
 
     def _retry_backend(self) -> None:
+        self._backend_generation += 1
+        self._status_failures = 0
+        self._status_error_active = False
+        self._version_ready = False
         if self.backend is not None:
             self.backend.stop()
         self.backend = None
@@ -592,9 +620,70 @@ class MainWindow(Adw.ApplicationWindow):
         self._show_loading("正在重试本地控制服务…")
         self._start_backend()
 
+    def restart_backend(self) -> None:
+        """Restart the GUI-owned backend so changed Python code is reloaded.
+
+        This is intentionally different from ``POST /api/system/restart``:
+        that only rebuilds Runtime objects in the old interpreter.  The GUI
+        runs its control server in-process, so a full backend restart must
+        stop the LocalControlServer thread and start a fresh one.
+        """
+        if self._backend_restart_busy:
+            return
+        self._backend_restart_busy = True
+        self._backend_generation += 1
+        old_backend = self.backend
+        self.api = None
+        self.nav_list.set_sensitive(False)
+        self._show_loading("正在重启本地后端并重新加载代码…")
+
+        def _stop() -> bool:
+            if old_backend is not None:
+                old_backend.stop()
+            return True
+
+        def _stopped(_result: bool) -> None:
+            self.backend = None
+            self._reset_pages_after_backend_restart()
+            self._start_backend()
+
+        def _failed(exc: BaseException) -> None:
+            self._backend_restart_busy = False
+            self._on_backend_error(exc)
+
+        widgets.run_async(_stop, on_success=_stopped, on_error=_failed)
+
+    def _reset_pages_after_backend_restart(self) -> None:
+        for page in list(self.pages.values()):
+            dispose = getattr(page, "dispose", None)
+            if callable(dispose):
+                try:
+                    dispose()
+                except Exception:  # noqa: BLE001
+                    logger.debug("页面 dispose 失败", exc_info=True)
+            try:
+                parent = page.get_parent()
+                if parent is self.stack:
+                    self.stack.remove(page)
+            except Exception:  # noqa: BLE001
+                pass
+        self.pages.clear()
+        self.current_page_id = ""
+        self._last_setup_hint = False
+        self._setup_completed = False
+        self._status_failures = 0
+        self._status_error_active = False
+        self._version_ready = False
+        self._last_runtime_state = ""
+        self._status_poll_busy = False
+        self._last_status_state = ""
+
     def _first_status_poll(self) -> bool:
         self._poll_status()
-        GLib.timeout_add_seconds(2, self._status_timer)
+        if not self._status_timer_id:
+            self._status_timer_id = GLib.timeout_add_seconds(
+                2, self._status_timer
+            )
         return False
 
     def _status_timer(self) -> bool:
@@ -609,14 +698,15 @@ class MainWindow(Adw.ApplicationWindow):
             return
         self._status_poll_busy = True
         api = self.api
+        generation = self._backend_generation
 
         def _fetch() -> dict[str, Any]:
             return api.get("/api/status", timeout=10)
 
         widgets.run_async(
             _fetch,
-            on_success=self._on_status,
-            on_error=self._on_status_error,
+            on_success=lambda status: self._on_status(status, generation),
+            on_error=lambda exc: self._on_status_error(exc, generation),
         )
 
     def _set_badge(self, label: Gtk.Label, text: str, tone: str) -> None:
@@ -625,13 +715,34 @@ class MainWindow(Adw.ApplicationWindow):
             label.remove_css_class(css)
         label.add_css_class(tone)
 
-    def _on_status(self, status: dict[str, Any]) -> None:
+    def _on_status(
+        self, status: dict[str, Any], generation: int
+    ) -> None:
+        if generation != self._backend_generation:
+            return
         self._status_poll_busy = False
+        self._status_failures = 0
         self.status = status if isinstance(status, dict) else {}
         state = str(self.status.get("state") or "unknown")
         previous_state = self._last_runtime_state
         self._last_runtime_state = state
         setup_required = bool(self.status.get("setup_required"))
+        if self._status_error_active:
+            self._status_error_active = False
+            self.show_page(self._status_error_before or "overview")
+        # 启动错误/警告只弹一次；状态轮询每 2 秒重复返回同一段文本。
+        notice = (
+            str(self.status.get("last_error") or ""),
+            tuple(str(item) for item in self.status.get("warnings") or []),
+        )
+        if any(notice) and notice != self._last_status_notice:
+            self._last_status_notice = notice
+            if notice[0]:
+                self.toast(f"Runtime 启动失败：{notice[0]}")
+            for warning in notice[1]:
+                self.toast(f"警告：{warning}")
+        if state == "running" and not self._version_ready:
+            self._load_version_info()
         persona = str(self.status.get("persona") or self.status.get("persona_id") or "—")
         connected = bool(self.status.get("adapter_connected"))
         adapter = self.status.get("adapter") or {}
@@ -668,19 +779,26 @@ class MainWindow(Adw.ApplicationWindow):
         else:
             self.runtime_label.set_text("Runtime 未运行")
             self._set_runtime_dot(None)
-        data_dir = str(self.status.get("data_dir") or "")
-        if data_dir:
-            self.version_label.set_tooltip_text(f"数据目录：{data_dir}")
+        self._data_dir = str(self.status.get("data_dir") or "")
+        self._refresh_version_tooltip()
         if setup_required:
-            self.nav_list.set_sensitive(False)
-            if not self._last_setup_hint:
+            self.restart_button.set_sensitive(False)
+            if not self._setup_completed:
+                self.nav_list.set_sensitive(False)
                 self._last_setup_hint = True
-                self.show_page("setup")
-            return
-        self.nav_list.set_sensitive(True)
-        if self._last_setup_hint:
-            self._last_setup_hint = False
-            self.show_page("overview")
+                if self.current_page_id != "setup":
+                    self.show_page("setup")
+                return
+            # 向导刚写完配置、状态尚未刷新为 setup_required=false 时，
+            # 不能让导航继续停留在禁用态。
+            self.nav_list.set_sensitive(True)
+        else:
+            self._setup_completed = False
+            self.nav_list.set_sensitive(True)
+            self.restart_button.set_sensitive(True)
+            if self._last_setup_hint:
+                self._last_setup_hint = False
+                self.show_page("overview")
         if state == "running" and previous_state != "running":
             page = self.pages.get(self.current_page_id)
             if page is not None and page.loaded:
@@ -692,12 +810,92 @@ class MainWindow(Adw.ApplicationWindow):
             if page is not None and page.loaded:
                 page.apply_status(self.status)
 
-    def _on_status_error(self, exc: BaseException) -> None:
+    def _on_status_error(
+        self, exc: BaseException, generation: int
+    ) -> None:
+        if generation != self._backend_generation:
+            return
         self._status_poll_busy = False
+        self._status_failures += 1
+        # 保留最后一帧渠道徽标和人格：控制面连接失败并不等于 NapCat 掉线。
         self._set_runtime_dot(False)
-        self.runtime_label.set_text("连接中…")
-        self._set_badge(self.adapter_badge, "渠道未连接", "badge-idle")
-        self.persona_label.set_text("当前人格：—")
+        self.runtime_label.set_text("控制台连接断开，重连中…")
+        if self._status_failures >= 2:
+            self._show_status_error(exc)
+
+    def _show_status_error(self, exc: BaseException) -> None:
+        if self._status_error_active:
+            return
+        self._status_error_active = True
+        self._status_error_before = self.current_page_id or "overview"
+        page = getattr(self, "_status_error_page", None)
+        if page is None:
+            page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+            page.set_valign(Gtk.Align.CENTER)
+            page.set_halign(Gtk.Align.CENTER)
+            page.set_vexpand(True)
+            page.append(widgets.title("控制台连接中断", level=1))
+            page.append(
+                widgets.muted(
+                    "本地控制服务不再响应；后台会继续自动重连。"
+                    "如果长时间无法恢复，请查看日志或重启后端。"
+                )
+            )
+            error_label = widgets.muted("")
+            error_label.set_wrap(True)
+            error_label.set_max_width_chars(80)
+            page.append(error_label)
+            retry = widgets.button("立即重试", css="suggested-action")
+            retry.connect("clicked", lambda _b: self._poll_status())
+            page.append(retry)
+            self._status_error_page = page
+            self._status_error_label = error_label
+            self.stack.add_named(page, "status-error")
+        self._status_error_label.set_text(str(exc))
+        self.current_page_id = ""
+        self.stack.set_visible_child_name("status-error")
+        self.nav_list.set_sensitive(False)
+
+    def _refresh_version_tooltip(self) -> None:
+        parts = []
+        if self._version_tooltip:
+            parts.append(self._version_tooltip)
+        if self._data_dir:
+            parts.append(f"数据目录：{self._data_dir}")
+        self.version_label.set_tooltip_text(
+            "\n".join(parts) or "原生 GTK4 桌面控制台"
+        )
+
+    def _load_version_info(self) -> None:
+        if self.api is None or self._version_ready:
+            return
+        self._version_ready = True
+        api = self.api
+        generation = self._backend_generation
+
+        def _do() -> dict[str, Any]:
+            return api.get("/api/update/version", timeout=30)
+
+        def _done(info: dict[str, Any]) -> None:
+            if generation != self._backend_generation:
+                return
+            data = info if isinstance(info, dict) else {}
+            label = str(data.get("version_label") or "开发版")
+            self.version_label.set_text(label)
+            commit = str(data.get("commit_short") or "")
+            self._version_tooltip = (
+                f"开发版 · 源码 {commit}" if commit else "开发版"
+            )
+            self._refresh_version_tooltip()
+
+        def _failed(_exc: BaseException) -> None:
+            if generation != self._backend_generation:
+                return
+            self.version_label.set_text("开发版")
+            self._version_tooltip = "开发版（版本接口不可用）"
+            self._refresh_version_tooltip()
+
+        widgets.run_async(_do, on_success=_done, on_error=_failed)
 
     def _set_runtime_dot(self, ok: bool | None) -> None:
         parent = self.runtime_dot.get_parent()
@@ -781,6 +979,14 @@ class MainWindow(Adw.ApplicationWindow):
         return _discard
 
     def show_page(self, page_id: str, *, section: str = "") -> None:
+        if (
+            bool(self.status.get("setup_required"))
+            and not self._setup_completed
+            and page_id != "setup"
+        ):
+            # Ctrl+数字、侧栏、深链都走这里；首次配置完成前不能绕过向导。
+            page_id = "setup"
+            section = ""
         if page_id == self.current_page_id and not section:
             return
         if (
@@ -860,14 +1066,16 @@ class MainWindow(Adw.ApplicationWindow):
 
     def on_setup_finished(self) -> None:
         self._last_setup_hint = False
+        self._setup_completed = True
         self.nav_list.set_sensitive(True)
+        self.restart_button.set_sensitive(True)
         if "overview" in self.pages:
             self.pages["overview"].loaded = False
         self.show_page("overview")
         self._poll_status()
 
-    def toast(self, message: str) -> None:
-        widgets.toast(self, message)
+    def toast(self, message: str, kind: str = "") -> None:
+        widgets.toast(self, message, kind=kind)
 
     def confirm_close(self) -> bool:
         """Return True when the window may close; otherwise show a guard."""
@@ -969,7 +1177,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--data-dir",
         default="",
-        help="使用指定的数据目录；默认使用本 GUI 目录下的 data/（完全隔离）",
+        help="使用指定的数据目录；开发检出默认使用本目录下的 data/，"
+        "打包安装默认使用用户数据目录",
     )
     parser.add_argument(
         "--version",

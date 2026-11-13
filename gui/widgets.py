@@ -366,10 +366,18 @@ def escape_markup(text: Any) -> str:
     return html.escape(str(text or ""), quote=False)
 
 
-def toast(window: Any, message: str) -> None:
+def toast(window: Any, message: str, kind: str = "") -> None:
+    text = str(message)
+    if kind == "error":
+        text = "✕ " + text
+    elif kind == "warn":
+        text = "⚠ " + text
+    toast = Adw.Toast.new(text)
+    if kind == "error":
+        toast.set_priority(Adw.ToastPriority.HIGH)
     overlay = getattr(window, "toast_overlay", None)
     if overlay is not None:
-        overlay.add_toast(Adw.Toast.new(str(message)))
+        overlay.add_toast(toast)
         return
     print(message)
 
@@ -386,6 +394,7 @@ class ConfirmDialog:
         confirm_label: str = "确认",
         destructive: bool = False,
         on_confirm: Callable[[], None],
+        on_cancel: Callable[[], None] | None = None,
     ) -> None:
         dialog = Adw.MessageDialog(
             transient_for=window,
@@ -407,6 +416,8 @@ class ConfirmDialog:
         def _response(_dialog: Adw.MessageDialog, response: str) -> None:
             if response == "ok":
                 on_confirm()
+            elif on_cancel is not None:
+                on_cancel()
 
         dialog.connect("response", _response)
         dialog.present()
@@ -513,6 +524,26 @@ def dropdown_value(widget: Gtk.DropDown) -> str:
     if 0 <= index < len(values):
         return values[index]
     return ""
+
+
+def set_dropdown_options(
+    widget: Gtk.DropDown,
+    options: list[tuple[str, str]],
+    selected: str = "",
+) -> None:
+    """Replace a dropdown's model in place, keeping the widget identity.
+
+    Rows in ``FormWindow`` hold the original widget, so rebuilding and
+    re-adding a dropdown is not an option for live option refreshes.
+    """
+    values = [value for value, _name in options]
+    widget.set_model(Gtk.StringList.new([name for _value, name in options]))
+    widget._values = values  # type: ignore[attr-defined]
+    try:
+        index = values.index(selected)
+    except ValueError:
+        index = 0
+    widget.set_selected(index)
 
 
 def switch(active: bool = False) -> Gtk.Switch:

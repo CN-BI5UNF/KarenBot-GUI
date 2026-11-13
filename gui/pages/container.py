@@ -34,7 +34,12 @@ class ContainerPage(Page):
         self._agent_status: dict[str, Any] = {}
         self._refreshing = False
         self._agent_busy = False
+        self._reset_busy = False
+        self._host_saving = False
+        self._agent_action_buttons: list[Gtk.Button] = []
         self._agents_seq = 0
+        self._last_error: dict[str, Any] | None = None
+        self._pending_storage_prompt = False
         self.body.append(self.header(refresh=False))
         self._build_actions()
         self.summary_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
@@ -205,6 +210,19 @@ class ContainerPage(Page):
         widgets.clear(self.summary_row)
         widgets.clear(self.problem_box)
         self.problem_box.append(widgets.muted(f"读取容器状态失败：{exc}"))
+        # 状态读取失败时，Agent/诊断/存储区块的旧数据已经不可信，不能继续
+        # 显示成可操作状态。
+        for host in (
+            getattr(self, "agent_table_host", None),
+            getattr(self, "diagnostics_card", None),
+            getattr(self, "storage_card", None),
+        ):
+            if host is None:
+                continue
+            widgets.clear(host)
+            host.append(widgets.muted("容器状态不可用；恢复后重新读取。"))
+        if hasattr(self, "file_browser"):
+            self.file_browser.set_container_running(False)
 
     def _render_core(self, data: dict[str, Any]) -> None:
         status_payload = data.get("status") or {}
@@ -226,6 +244,7 @@ class ContainerPage(Page):
         self._render_problems(info, docker, storage)
         self._render_diagnostics(info, docker, storage)
         self._render_storage(storage)
+        self._maybe_open_requested_storage_setup(storage)
         self.file_browser.set_container_running(box.get("state") == "running")
 
     # ------------------------------------------------------------------
@@ -289,7 +308,24 @@ class ContainerPage(Page):
             if storage.get("code") == "container_storage_not_mounted"
             else "初始化 C 存储"
         )
-        if not info.get("enabled"):
+        if mismatch:
+            size = int(storage.get("marker_size_mb") or 0)
+            message = str(
+                storage.get("error")
+                or f"存储镜像实际为 {size} MiB，与当前配置不一致。"
+            )
+            adopt = widgets.button(
+                f"采用 {size} MiB", css="suggested-action"
+            )
+            adopt.connect("clicked", lambda _b, value=size: self._adopt_size(value))
+            buttons.append(adopt)
+            buttons.append(self._settings_button("修改存储设置"))
+            restart = widgets.button("重启 Runtime")
+            restart.connect(
+                "clicked", lambda b: self._restart_runtime(b)
+            )
+            buttons.append(restart)
+        elif not info.get("enabled"):
             message = "容器功能未启用。请到设置 → 容器启用并重启 Runtime。"
             buttons.append(self._settings_button("打开容器设置"))
         elif not docker.get("available"):
@@ -304,21 +340,6 @@ class ContainerPage(Page):
                 "「Docker 镜像加速前缀」。"
             )
             buttons.append(self._settings_button("配置镜像加速"))
-        elif mismatch:
-            size = int(storage.get("marker_size_mb") or 0)
-            message = str(
-                storage.get("error")
-                or f"存储镜像实际为 {size} MiB，与当前配置不一致。"
-            )
-            adopt = widgets.button(
-                f"采用 {size} MiB", css="suggested-action"
-            )
-            adopt.connect("clicked", lambda _b, value=size: self._adopt_size(value))
-            buttons.append(adopt)
-            buttons.append(self._settings_button("修改存储设置"))
-            restart = widgets.button("重启 Runtime")
-            restart.connect("clicked", lambda _b: self._restart_runtime())
-            buttons.append(restart)
         elif storage.get("mode") == "image_fixed" and not storage.get("ready"):
             message = str(storage.get("error") or "C 固定大小存储尚未初始化。")
             setup = self._storage_payload.get("setup") or {}
@@ -339,6 +360,13 @@ class ContainerPage(Page):
                 )
             elif setup.get("command"):
                 message += "\n请以管理员身份手动运行安装命令（见下方存储信息）。"
+        elif self._last_error:
+            message = str(self._last_error.get("message") or "容器准备失败")
+            tail = str(self._last_error.get("tail") or "")
+            if tail:
+                message += "\n\n" + tail
+            if not info.get("image_present"):
+                buttons.append(self._settings_button("配置镜像加速"))
         elif info.get("config_warning"):
             title = "配置提示"
             description = "当前容器可以继续使用；设置只影响显式重建。"
@@ -388,6 +416,7 @@ class ContainerPage(Page):
             widgets.clear(self.host_controls)
             return
         modes = data.get("agents") or []
+        self._agent_action_buttons = []
         rows: list[list[Any]] = []
         for agent in modes:
             mode = str(agent.get("id") or "")
@@ -430,6 +459,7 @@ class ContainerPage(Page):
                 "clicked", lambda _b, m=mode: self._agent_action("install", m)
             )
             actions.append(install)
+            self._agent_action_buttons.append(install)
             activate = widgets.button(
                 "当前使用" if active else "激活",
                 css="compact-button" + (" suggested-action" if not active else ""),
@@ -441,12 +471,14 @@ class ContainerPage(Page):
                 "clicked", lambda _b, m=mode: self._agent_action("activate", m)
             )
             actions.append(activate)
+            self._agent_action_buttons.append(activate)
             deactivate = widgets.button("停用", css="compact-button")
             deactivate.set_sensitive(not self._agent_busy and active)
             deactivate.connect(
                 "clicked", lambda _b: self._agent_action("deactivate", "")
             )
             actions.append(deactivate)
+            self._agent_action_buttons.append(deactivate)
             uninstall = widgets.button(
                 "卸载", css="compact-button destructive-action"
             )
@@ -457,6 +489,7 @@ class ContainerPage(Page):
                 "clicked", lambda _b, m=mode: self._confirm_uninstall(m)
             )
             actions.append(uninstall)
+            self._agent_action_buttons.append(uninstall)
             rows.append(
                 [
                     head,
@@ -474,7 +507,17 @@ class ContainerPage(Page):
                 empty_text="正在读取 Agent 模式…" if not modes else "暂无 Agent 模式",
             )
         )
-        self._render_host(data.get("host") or {})
+        # ``host`` 是执行策略，``host_runtime`` 是 rg/bubblewrap 探测结果；
+        # 后者才包含 rg_available/rg_path。
+        host_view = {
+            **(data.get("host_runtime") or {}),
+            **(data.get("host") or {}),
+        }
+        self._render_host(host_view)
+
+    def _set_agent_buttons(self, enabled: bool) -> None:
+        for button in self._agent_action_buttons:
+            button.set_sensitive(enabled and not self._agent_busy)
 
     def _render_host(self, host: dict[str, Any]) -> None:
         widgets.clear(self.host_controls)
@@ -506,6 +549,7 @@ class ContainerPage(Page):
         self.host_controls.append(spacer)
         save = widgets.button("保存本机设置")
         save.connect("clicked", lambda _b: self._save_host())
+        self.host_save_button = save
         self.host_controls.append(save)
         if host:
             self.host_note.set_text(
@@ -535,6 +579,9 @@ class ContainerPage(Page):
             method = "post"
             label = "已停用"
         self._agent_busy = True
+        # Buttons were rendered while idle. Disable all of them now so a
+        # second click does not look like a silent no-op.
+        self._set_agent_buttons(False)
 
         def _do() -> Any:
             if method == "delete":
@@ -564,21 +611,31 @@ class ContainerPage(Page):
         )
 
     def _save_host(self) -> None:
-        if self.api is None:
+        if self.api is None or self._host_saving:
             return
         payload = {
             "execution_mode": widgets.dropdown_value(self.host_mode),
             "sandbox_network": self.sandbox_network.get_active(),
         }
+        self._host_saving = True
+        if getattr(self, "host_save_button", None) is not None:
+            self.host_save_button.set_sensitive(False)
 
         def _do() -> Any:
             return self.api.patch("/api/container/agents/host", payload, timeout=60)
 
-        widgets.run_async(
-            _do,
-            on_success=lambda _r: self.toast("本机 Claude Code 执行方式已保存"),
-            on_error=lambda exc: self.toast(f"保存失败：{exc}"),
-        )
+        def _done(_result: Any) -> None:
+            self._host_saving = False
+            self.toast("本机 Claude Code 执行方式已保存")
+            self.refresh()
+
+        def _failed(exc: BaseException) -> None:
+            self._host_saving = False
+            if getattr(self, "host_save_button", None) is not None:
+                self.host_save_button.set_sensitive(True)
+            self.toast(f"保存失败：{exc}")
+
+        widgets.run_async(_do, on_success=_done, on_error=_failed)
 
     # ------------------------------------------------------------------
     # Diagnostics / storage
@@ -724,6 +781,7 @@ class ContainerPage(Page):
     def _test(self) -> None:
         if self.api is None:
             return
+        self._last_error = None
         self.toast("正在准备容器；首次可能需要下载镜像，请稍候")
         self.test_button.set_sensitive(False)
         self.test_button.set_label("准备中…")
@@ -734,39 +792,67 @@ class ContainerPage(Page):
         def _done(result: dict[str, Any]) -> None:
             self.test_button.set_sensitive(True)
             self.test_button.set_label("一键准备 / 启动")
-            self.toast(
-                "容器已启动并通过测试"
-                if result.get("ok")
-                else "容器测试未通过"
-            )
+            inner = result.get("result") or {}
+            if result.get("ok"):
+                self._last_error = None
+                self.toast("容器已启动并通过测试")
+            else:
+                message = "容器测试未通过"
+                if inner.get("timed_out"):
+                    message += "（执行超时）"
+                elif inner.get("exit_code") is not None:
+                    message += f"（退出码 {inner.get('exit_code')}）"
+                self._last_error = {
+                    "message": message,
+                    "tail": _result_output_tail(inner),
+                }
+                self.toast(message)
             self.refresh()
 
         def _failed(exc: BaseException) -> None:
             self.test_button.set_sensitive(True)
             self.test_button.set_label("一键准备 / 启动")
+            self._last_error = {
+                "message": f"容器准备失败：{exc}",
+                "tail": _container_error_tail(exc),
+            }
             self.toast(f"容器准备失败：{exc}")
             self.refresh()
 
         widgets.run_async(_do, on_success=_done, on_error=_failed)
 
     def _reset(self) -> None:
+        if self._reset_busy:
+            return
+        self._reset_busy = True
+        self.reset_button.set_sensitive(False)
+
+        def _cancel() -> None:
+            self._reset_busy = False
+            self.reset_button.set_sensitive(True)
+
         def _reset_now() -> None:
             if self.api is None:
+                _cancel()
                 return
 
             def _do() -> Any:
                 return self.api.post("/api/container/reset", {}, timeout=180)
 
             def _done(_result: Any) -> None:
+                self._reset_busy = False
+                self.reset_button.set_sensitive(True)
+                self._last_error = None
                 self.toast("容器已重建")
                 self.file_browser.reset()
                 self.refresh()
 
-            widgets.run_async(
-                _do,
-                on_success=_done,
-                on_error=lambda exc: self.toast(f"重建失败：{exc}"),
-            )
+            def _failed(exc: BaseException) -> None:
+                self._reset_busy = False
+                self.reset_button.set_sensitive(True)
+                self.toast(f"重建失败：{exc}")
+
+            widgets.run_async(_do, on_success=_done, on_error=_failed)
 
         widgets.ConfirmDialog(
             self.app.window,
@@ -775,6 +861,7 @@ class ContainerPage(Page):
             confirm_label="重建",
             destructive=True,
             on_confirm=_reset_now,
+            on_cancel=_cancel,
         )
 
     def _adopt_size(self, size: int) -> None:
@@ -790,6 +877,7 @@ class ContainerPage(Page):
                 )
 
             def _done(_result: dict[str, Any]) -> None:
+                self._last_error = None
                 self.toast(f"已采用 {size} MiB；需要重启 Runtime 生效")
                 self.refresh()
                 widgets.ConfirmDialog(
@@ -797,7 +885,7 @@ class ContainerPage(Page):
                     heading="存储大小已更新",
                     body="需要重启 Runtime 才能使用新的存储大小。现在重启？",
                     confirm_label="重启 Runtime",
-                    on_confirm=self._restart_runtime,
+                    on_confirm=self._do_restart_runtime,
                 )
 
             widgets.run_async(
@@ -814,22 +902,93 @@ class ContainerPage(Page):
             on_confirm=_apply,
         )
 
-    def _restart_runtime(self) -> None:
+    def _restart_runtime(self, button: Gtk.Button | None = None) -> None:
         if self.api is None:
             return
+        widgets.ConfirmDialog(
+            self.app.window,
+            heading="重启 Runtime？",
+            body="正在进行的请求会被中断，通常需要几秒到一分钟。"
+            "这只是重建运行时，不会加载新的 Python 代码。",
+            confirm_label="重启 Runtime",
+            destructive=True,
+            on_confirm=lambda: self._do_restart_runtime(button),
+        )
+
+    def _do_restart_runtime(
+        self, button: Gtk.Button | None = None
+    ) -> None:
+        if self.api is None:
+            return
+        if button is not None:
+            button.set_sensitive(False)
 
         def _do() -> Any:
             return self.api.post("/api/system/restart", {}, timeout=180)
 
-        widgets.run_async(
-            _do,
-            on_success=lambda _r: (self.toast("Runtime 已重启"), self.refresh()),
-            on_error=lambda exc: self.toast(f"重启失败：{exc}"),
-        )
+        def _done(_result: Any) -> None:
+            self._last_error = None
+            self.toast("Runtime 已重启")
+            self.refresh()
+
+        def _failed(exc: BaseException) -> None:
+            if button is not None:
+                button.set_sensitive(True)
+            self.toast(f"重启失败：{exc}")
+
+        widgets.run_async(_do, on_success=_done, on_error=_failed)
 
     # ------------------------------------------------------------------
     # C storage setup
     # ------------------------------------------------------------------
+    def prompt_storage_setup(self) -> None:
+        """Refresh and, if C storage is unready, open the setup dialog.
+
+        Called by the settings page after enabling the container or switching
+        to ``image_fixed``; the save itself only writes config.
+        """
+        self._pending_storage_prompt = True
+        if self._refreshing:
+            return
+        self.refresh()
+
+    def _maybe_open_requested_storage_setup(
+        self, storage: dict[str, Any]
+    ) -> None:
+        if not self._pending_storage_prompt:
+            return
+        self._pending_storage_prompt = False
+        merged = dict(storage or {})
+        payload_storage = self._storage_payload.get("storage")
+        if isinstance(payload_storage, dict):
+            for key, value in payload_storage.items():
+                if merged.get(key) in (None, "", 0, False):
+                    merged[key] = value
+        mode = str(merged.get("mode") or "")
+        if mode != "image_fixed":
+            self.toast(
+                "当前运行中的存储仍是 B 命名卷；如刚修改了容器设置，"
+                "请先重启 Runtime，再初始化 C 存储。"
+            )
+            return
+        if merged.get("ready"):
+            self.toast("C 固定大小存储已经就绪")
+            return
+        if merged.get("code") == "container_storage_size_mismatch":
+            self.toast(
+                "C 存储的实际大小与配置不一致，请先在问题卡片里"
+                "「采用实际大小」。"
+            )
+            return
+        admin = self._storage_payload.get("admin") or {}
+        if not admin.get("available", True):
+            self.toast(
+                "没有可用的 sudo/PowerShell 提权方式；"
+                "请到容器页查看手动初始化命令。"
+            )
+            return
+        self._open_storage_setup()
+
     def _open_storage_setup(self) -> None:
         payload = self._storage_payload
         if not payload:
@@ -949,6 +1108,13 @@ class ContainerPage(Page):
         actions.append(submit)
         body.append(actions)
         window.set_child(body)
+
+        def _clear_password(*_args: Any) -> bool:
+            if password_entry is not None:
+                password_entry.set_text("")
+            return False
+
+        window.connect("close-request", _clear_password)
         window.present()
         if password_entry is not None:
             password_entry.grab_focus()
@@ -981,6 +1147,7 @@ class ContainerPage(Page):
             def _done(result: dict[str, Any]) -> None:
                 if password_entry is not None:
                     password_entry.set_text("")
+                self._last_error = None
                 window.close()
                 self.toast(
                     "存储已经就绪"
@@ -992,10 +1159,37 @@ class ContainerPage(Page):
             def _failed(exc: BaseException) -> None:
                 if password_entry is not None:
                     password_entry.set_text("")
-                status.set_text(f"初始化失败：{exc}")
+                message = f"初始化失败：{exc}"
+                tail = _container_error_tail(exc)
+                if tail:
+                    message += "\n\n" + tail
+                status.set_text(message)
                 submit.set_label("重试")
                 submit.set_sensitive(True)
 
             widgets.run_async(_do, on_success=_done, on_error=_failed)
 
         submit.connect("clicked", lambda _b: _do_setup())
+
+
+
+def _result_output_tail(result: dict[str, Any]) -> str:
+    parts = []
+    for key in ("stderr", "stdout", "output_tail"):
+        text = str(result.get(key) or "").strip()
+        if text:
+            parts.append(text)
+    return "\n".join(parts)[-2000:]
+
+
+def _container_error_tail(exc: BaseException) -> str:
+    detail = getattr(exc, "detail", None)
+    if not isinstance(detail, dict):
+        return ""
+    details = detail.get("details")
+    tail = ""
+    if isinstance(details, dict):
+        tail = str(details.get("output_tail") or "")
+    if not tail:
+        tail = str(detail.get("output_tail") or "")
+    return tail.strip()[-2000:]

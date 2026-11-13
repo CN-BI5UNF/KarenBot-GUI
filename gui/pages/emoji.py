@@ -47,6 +47,8 @@ class EmojiPage(Page):
         self.flow.set_homogeneous(True)
         self.body.append(self.flow)
         self._items: list[dict[str, Any]] = []
+        # 搜索时只做本地过滤，不能再为每张图重复发 HTTP 请求。
+        self._textures: dict[str, Gdk.Texture] = {}
 
     def refresh(self) -> None:
         if self.api is None:
@@ -78,9 +80,22 @@ class EmojiPage(Page):
     def _render_grid(self) -> None:
         widgets.clear(self.flow)
         query = self.search_entry.get_text().strip().lower()
-        items = [item for item in self._items if not query or query in str(item.get("name") or "").lower()]
+        items = [
+            item
+            for item in self._items
+            if not query or query in str(item.get("name") or "").lower()
+        ]
         if not items:
-            self.flow.append(widgets.muted("没有匹配的表情包。"))
+            if query:
+                self.flow.append(
+                    widgets.muted("没有匹配的表情包。换个名称再试。")
+                )
+            else:
+                self.flow.append(
+                    widgets.muted(
+                        "还没有添加任何表情包。点击右上角「添加表情包」选择图片。"
+                    )
+                )
             return
         for item in items:
             self.flow.append(self._tile(item))
@@ -113,6 +128,10 @@ class EmojiPage(Page):
     def _load_thumbnail(self, filename: str, picture: Gtk.Picture) -> None:
         if self.api is None or not filename:
             return
+        cached = self._textures.get(filename)
+        if cached is not None:
+            picture.set_paintable(cached)
+            return
         from urllib.parse import quote
 
         path = f"/api/emoji/file/{quote(filename, safe='')}"
@@ -123,9 +142,11 @@ class EmojiPage(Page):
         def _show(data: bytes) -> None:
             try:
                 texture = Gdk.Texture.new_from_bytes(GLib.Bytes.new(data))
-                picture.set_paintable(texture)
             except Exception:  # noqa: BLE001
                 picture.set_tooltip_text("图片预览失败")
+                return
+            self._textures[filename] = texture
+            picture.set_paintable(texture)
 
         widgets.run_async(_fetch, on_success=_show, on_error=lambda _e: None)
 
@@ -153,6 +174,7 @@ class EmojiPage(Page):
         )
         add_button = widgets.button("选择图片", icon="list-add-symbolic")
         body.append(add_button)
+        body.append(widgets.muted("也可以把图片直接拖进这个窗口。"))
         staging = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         scroller = Gtk.ScrolledWindow()
         scroller.set_vexpand(True)
@@ -160,7 +182,6 @@ class EmojiPage(Page):
         scroller.set_child(staging)
         body.append(scroller)
         status = widgets.muted("还没有选择文件。")
-        body.append(status)
         footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         footer.set_margin_top(8)
         footer.set_margin_bottom(12)
@@ -217,10 +238,13 @@ class EmojiPage(Page):
         def add_files() -> None:
             patterns = ["*" + ext for ext in self._supported]
             paths = widgets.files_picker(
-                self.app.window,
+                window,
                 title_text="选择表情包图片（可多选）",
                 patterns=patterns,
             )
+            add_paths(paths)
+
+        def add_paths(paths: list[str]) -> None:
             known = {str(entry["path"]) for entry in staged}
             for path in paths:
                 if path in known:
@@ -247,27 +271,55 @@ class EmojiPage(Page):
                 )
             refresh_staging()
 
+        def _drop_files(
+            _target: Gtk.DropTarget,
+            value: Any,
+            _x: int,
+            _y: int,
+        ) -> bool:
+            try:
+                files = value.get_files()
+            except AttributeError:
+                return False
+            paths = [item.get_path() for item in files if item.get_path()]
+            if paths:
+                add_paths(paths)
+            return bool(paths)
+
+        drop = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
+        drop.connect("drop", _drop_files)
+        window.add_controller(drop)
+
         def submit_files() -> None:
             if not staged:
                 status.set_text("还没有选择文件。")
                 return
             submit.set_sensitive(False)
-            status.set_text("正在添加…")
-            files: list[tuple[str, str, bytes, str]] = []
-            rename: dict[str, str] = {}
-            for entry in staged:
-                source = Path(entry["path"])
-                try:
-                    data = source.read_bytes()
-                except OSError as exc:
-                    status.set_text(f"读取 {source.name} 失败：{exc}")
-                    submit.set_sensitive(True)
-                    return
-                files.append(("files", source.name, data, _mime(source)))
-                rename[source.name] = entry["name"].get_text().strip() or source.stem
+            add_button.set_sensitive(False)
+            status.set_text("正在读取文件并添加…")
+            api = self.api
+            snapshot = [
+                (
+                    Path(str(entry["path"])),
+                    entry["name"].get_text().strip()
+                    or Path(str(entry["path"])).stem,
+                )
+                for entry in staged
+            ]
 
             def _do() -> dict[str, Any]:
-                return self.api.upload(
+                files: list[tuple[str, str, bytes, str]] = []
+                rename: dict[str, str] = {}
+                for source, display_name in snapshot:
+                    try:
+                        data = source.read_bytes()
+                    except OSError as exc:
+                        raise RuntimeError(
+                            f"读取 {source.name} 失败：{exc}"
+                        ) from exc
+                    files.append(("files", source.name, data, _mime(source)))
+                    rename[source.name] = display_name
+                return api.upload(
                     "/api/emoji/upload",
                     fields={"rename": json.dumps(rename, ensure_ascii=False)},
                     files=files,
@@ -278,14 +330,21 @@ class EmojiPage(Page):
                 added = int(result.get("count") or 0)
                 skipped = result.get("skipped") or []
                 deduped = result.get("deduped") or []
-                self.toast(f"已添加 {added} 个表情包")
-                for item in skipped[:3]:
+                summary = f"已添加 {added} 个表情包"
+                if skipped:
+                    summary += f"，跳过 {len(skipped)} 个"
+                if deduped:
+                    summary += f"，重名另存 {len(deduped)} 个"
+                self.toast(summary)
+                for item in skipped:
                     self.toast(
-                        f"{item.get('file') or '文件'}：{item.get('reason') or '已跳过'}"
+                        f"{item.get('file') or '文件'}："
+                        f"{item.get('reason') or '已跳过'}"
                     )
-                for item in deduped[:3]:
+                for item in deduped:
                     self.toast(
-                        f"{item.get('name') or '表情包'} 重名，已存为 {item.get('file')}"
+                        f"{item.get('name') or '表情包'} 与已有名称重名，"
+                        f"已存为 {item.get('file') or '新文件'}"
                     )
                 window.close()
                 self.refresh()
@@ -293,6 +352,7 @@ class EmojiPage(Page):
             def _failed(exc: BaseException) -> None:
                 status.set_text(f"上传失败：{exc}")
                 submit.set_sensitive(True)
+                add_button.set_sensitive(True)
 
             widgets.run_async(_do, on_success=_done, on_error=_failed)
 

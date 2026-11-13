@@ -22,6 +22,7 @@ class MemoryPage(Page):
     page_icon = "user-bookmarks-symbolic"
 
     def build(self) -> None:
+        self._load_seq = 0
         header_row = self.header()
         self.mode_badge = widgets.badge("模式：—")
         header_row.append(self.mode_badge)
@@ -31,12 +32,15 @@ class MemoryPage(Page):
         self.new_entry = widgets.text_view("", height=70)
         add_card.append(self.new_entry)
         add_card.append(widgets.muted("支持多行；重复内容不会被重复保存。"))
-        add_button = widgets.button("记下来", css="suggested-action")
-        add_button.connect("clicked", lambda _b: self._add())
-        add_card.append(add_button)
+        self.add_button = widgets.button("记下来", css="suggested-action")
+        self.add_button.connect("clicked", lambda _b: self._add())
+        add_card.append(self.add_button)
+        self.add_status = widgets.muted("")
+        add_card.append(self.add_status)
         self.body.append(add_card)
 
         switch = Gtk.StackSwitcher()
+        switch.set_halign(Gtk.Align.START)
         self.stack = Gtk.Stack()
         self.stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
         switch.set_stack(self.stack)
@@ -65,19 +69,48 @@ class MemoryPage(Page):
             self._load_important()
 
     def _load_important(self) -> None:
+        if self.api is None:
+            return
+        self._load_seq += 1
+        token = self._load_seq
+        target = self.important_box
+
         def _fetch() -> dict[str, Any]:
             return self.api.get("/api/memory", timeout=30)
 
-        widgets.run_async(_fetch, on_success=self._render_important, on_error=self._error)
+        def _ok(data: dict[str, Any]) -> None:
+            if token == self._load_seq:
+                self._render_important(data)
+
+        def _failed(exc: BaseException) -> None:
+            if token == self._load_seq:
+                self._error_for(target, exc)
+
+        widgets.run_async(_fetch, on_success=_ok, on_error=_failed)
 
     def _load_rag(self) -> None:
+        if self.api is None:
+            return
+        self._load_seq += 1
+        token = self._load_seq
+        target = self.rag_box
+        widgets.clear(target)
+        target.append(self.busy("读取 RAG 索引…"))
+
         def _fetch() -> dict[str, Any]:
             return self.api.get("/api/memory/rag?limit=300", timeout=30)
 
-        widgets.run_async(_fetch, on_success=self._render_rag, on_error=self._error)
+        def _ok(data: dict[str, Any]) -> None:
+            if token == self._load_seq:
+                self._render_rag(data)
 
-    def _error(self, exc: BaseException) -> None:
-        box = self.rag_box if self.stack.get_visible_child_name() == "rag" else self.important_box
+        def _failed(exc: BaseException) -> None:
+            if token == self._load_seq:
+                self._error_for(target, exc)
+
+        widgets.run_async(_fetch, on_success=_ok, on_error=_failed)
+
+    def _error_for(self, box: Gtk.Box, exc: BaseException) -> None:
         widgets.clear(box)
         box.append(widgets.muted(f"读取失败：{exc}"))
 
@@ -146,17 +179,34 @@ class MemoryPage(Page):
         content = widgets.text_value(self.new_entry).strip()
         if not content or self.api is None:
             return
-        buffer = self.new_entry.text_view.get_buffer()  # type: ignore[attr-defined]
-        buffer.set_text("")
+        self.add_button.set_sensitive(False)
+        self.add_status.set_text("正在保存…")
+        self.add_status.remove_css_class("danger-text")
 
         def _do() -> dict[str, Any]:
-            return self.api.post("/api/memory", {"content": content, "pinned": False}, timeout=30)
+            return self.api.post(
+                "/api/memory",
+                {"content": content, "pinned": False},
+                timeout=30,
+            )
 
         def _done(result: dict[str, Any]) -> None:
+            # Clear only after the server accepted the entry; a failed request
+            # must not destroy the draft.
+            buffer = self.new_entry.text_view.get_buffer()  # type: ignore[attr-defined]
+            buffer.set_text("")
+            self.add_status.set_text("")
+            self.add_button.set_sensitive(True)
             self.toast(str(result.get("message") or "已保存"))
             self._load_important()
 
-        widgets.run_async(_do, on_success=_done, on_error=lambda exc: self.toast(str(exc)))
+        def _failed(exc: BaseException) -> None:
+            self.add_status.set_text(f"保存失败：{exc}")
+            self.add_status.add_css_class("danger-text")
+            self.add_button.set_sensitive(True)
+            self.toast(f"保存失败：{exc}")
+
+        widgets.run_async(_do, on_success=_done, on_error=_failed)
 
     def _set_pinned(self, item_id: Any, pinned: bool) -> None:
         if self.api is None or not item_id:

@@ -13,7 +13,7 @@ gi.require_version("Gdk", "4.0")
 from gi.repository import Adw, Gdk, GLib, GObject, Gtk  # noqa: E402
 
 from .. import widgets  # noqa: E402
-from ..api import q  # noqa: E402
+from ..api import ApiError, q  # noqa: E402
 from .base import Page  # noqa: E402
 from .destructive_admin import open_persona_cleanup  # noqa: E402
 from .persona_dialogs import (  # noqa: E402
@@ -23,7 +23,7 @@ from .persona_dialogs import (  # noqa: E402
     open_refiner,
 )
 
-IMAGE_PATTERNS = ["*.png", "*.jpg", "*.jpeg", "*.webp", "*.gif", "*.bmp"]
+IMAGE_PATTERNS = ["*.png", "*.jpg", "*.jpeg", "*.gif"]
 
 
 class PersonasPage(Page):
@@ -81,6 +81,15 @@ class PersonasPage(Page):
             content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
             if count:
                 content.append(self._list_thumbnail(name))
+            else:
+                placeholder = Gtk.Image.new_from_icon_name(
+                    "avatar-default-symbolic"
+                )
+                placeholder.set_pixel_size(28)
+                placeholder.set_size_request(56, 56)
+                placeholder.set_valign(Gtk.Align.CENTER)
+                placeholder.add_css_class("persona-placeholder")
+                content.append(placeholder)
             info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
             info.set_hexpand(True)
             head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -98,12 +107,17 @@ class PersonasPage(Page):
                 info.append(widgets.muted(description))
             content.append(info)
             actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-            if count:
-                gallery = widgets.button(f"形象（{count}）")
-                gallery.connect(
-                    "clicked", lambda _b, n=name: self._show_appearance(n)
-                )
-                actions.append(gallery)
+            gallery = widgets.button(
+                f"形象（{count}）" if count else "角色形象"
+            )
+            gallery.set_tooltip_text("打开角色形象画廊并上传图片")
+            gallery.connect(
+                "clicked",
+                lambda _b, n=name: self._show_appearance(
+                    n, on_done=self.refresh
+                ),
+            )
+            actions.append(gallery)
             edit = widgets.button("编辑")
             edit.connect(
                 "clicked",
@@ -129,13 +143,49 @@ class PersonasPage(Page):
                     True,
                 ),
             ]
-            if not persona.get("builtin"):
+            if not persona.get("builtin") and not persona.get("active"):
                 menu_items.append(
                     ("删除人格定义", lambda n=name: self._confirm_delete(n), True)
                 )
             actions.append(self._more_menu(menu_items))
             content.append(actions)
             box.append(content)
+            # WebUI 把这些操作直接铺在行内；原生端保留菜单的同时也提供
+            # 可见按钮，避免常用操作藏在弹出菜单里。
+            quick_actions = Gtk.Box(
+                orientation=Gtk.Orientation.HORIZONTAL, spacing=6
+            )
+            quick_actions.set_halign(Gtk.Align.START)
+            for label, callback, destructive in (
+                ("查看人设", lambda n=name: self._show_source(n), False),
+                (
+                    "AI 改写",
+                    lambda n=name: open_refiner(self, n, self.refresh),
+                    False,
+                ),
+                ("导出", lambda n=name: export_persona(self, n), False),
+                ("复制", lambda n=name: self._duplicate_dialog(n), False),
+                (
+                    "清理运行数据",
+                    lambda n=name: open_persona_cleanup(
+                        self, n, on_done=self.refresh
+                    ),
+                    False,
+                ),
+            ):
+                quick = widgets.button(label, css="compact-button")
+                if destructive:
+                    quick.add_css_class("destructive-action")
+                quick.connect("clicked", lambda _b, cb=callback: cb())
+                quick_actions.append(quick)
+            if not persona.get("builtin") and not persona.get("active"):
+                quick = widgets.button("删除人格定义", css="compact-button")
+                quick.add_css_class("destructive-action")
+                quick.connect(
+                    "clicked", lambda _b, n=name: self._confirm_delete(n)
+                )
+                quick_actions.append(quick)
+            box.append(quick_actions)
             self.list_box.append(box)
 
     def _list_thumbnail(self, name: str) -> Gtk.Picture:
@@ -298,9 +348,10 @@ class PersonasPage(Page):
     # ------------------------------------------------------------------
     # Appearance
     # ------------------------------------------------------------------
-    def _show_appearance(self, name: str) -> None:
+    def _show_appearance(self, name: str, *, on_done: Any = None) -> None:
         if self.api is None:
             return
+        busy = {"value": False}
         window = Gtk.Window()
         window.set_title(f"{name} · 角色形象")
         window.set_default_size(860, 700)
@@ -317,12 +368,35 @@ class PersonasPage(Page):
         summary.set_hexpand(True)
         upload = widgets.button("添加形象", icon="list-add-symbolic")
         delete_all = widgets.button("删除全部", css="destructive-action")
+        delete_all.set_sensitive(False)
         refresh = widgets.icon_button("view-refresh-symbolic", "刷新")
         toolbar.append(summary)
         toolbar.append(upload)
         toolbar.append(delete_all)
         toolbar.append(refresh)
         outer.append(toolbar)
+        preview_card = widgets.card(spacing=5, padding=10)
+        preview_picture = Gtk.Picture()
+        preview_picture.set_content_fit(Gtk.ContentFit.CONTAIN)
+        preview_picture.set_size_request(420, 260)
+        preview_picture.set_halign(Gtk.Align.CENTER)
+        preview_meta = widgets.muted("点击下方图片查看大图与文件信息")
+        preview_card.append(preview_picture)
+        preview_card.append(preview_meta)
+        outer.append(preview_card)
+
+        def select_preview(paintable: Any, image: dict[str, Any]) -> None:
+            if paintable is not None:
+                preview_picture.set_paintable(paintable)
+            image_id = str(image.get("id") or "")
+            meta = (
+                f"{image_id[:12]} · {image.get('width') or '?'}×"
+                f"{image.get('height') or '?'}"
+            )
+            if image.get("size") is not None:
+                meta += f" · {widgets.format_bytes(image.get('size'))}"
+            preview_meta.set_text(meta)
+
         flow = Gtk.FlowBox()
         flow.set_max_children_per_line(4)
         flow.set_min_children_per_line(1)
@@ -339,12 +413,19 @@ class PersonasPage(Page):
         def reload() -> None:
             widgets.clear(flow)
             summary.set_text("正在读取…")
+            delete_all.set_sensitive(False)
 
             def _fetch() -> dict[str, Any]:
                 try:
                     return self.api.get(
                         f"/api/personas/{q(name)}/appearance", timeout=30
                     )
+                except ApiError as exc:
+                    # A persona without any cover returns 404; that is the
+                    # normal empty state, not a broken gallery.
+                    if exc.status == 404:
+                        return {"images": [], "cover_id": ""}
+                    return {"error": str(exc)}
                 except BaseException as exc:  # noqa: BLE001
                     return {"error": str(exc)}
 
@@ -355,11 +436,23 @@ class PersonasPage(Page):
                     return
                 images = data.get("images") or []
                 cover_id = str(data.get("cover_id") or "")
-                summary.set_text(f"共 {len(images)} 张 · 预览图已标记")
+                if images:
+                    summary.set_text(f"共 {len(images)} 张 · 预览图已标记")
+                else:
+                    summary.set_text("共 0 张；点「添加形象」上传第一张")
                 delete_all.set_sensitive(bool(images))
                 for image in images:
                     flow.append(
-                        self._appearance_tile(name, image, cover_id, reload)
+                        self._appearance_tile(
+                            name,
+                            image,
+                            cover_id,
+                            reload,
+                            on_done,
+                            busy,
+                            window,
+                            select_preview,
+                        )
                     )
 
             widgets.run_async(
@@ -369,53 +462,91 @@ class PersonasPage(Page):
             )
 
         def add_images() -> None:
+            if busy["value"]:
+                return
             paths = widgets.files_picker(
-                self.app.window,
+                window,
                 title_text="选择角色形象（可多选）",
                 patterns=IMAGE_PATTERNS,
             )
             if not paths:
                 return
+            busy["value"] = True
+            upload.set_sensitive(False)
+            delete_all.set_sensitive(False)
+            added = 0
+            errors: list[str] = []
 
-            def _do() -> tuple[int, list[str]]:
-                added = 0
-                errors: list[str] = []
-                for path in paths:
-                    try:
-                        self.api.upload_file(
-                            f"/api/personas/{q(name)}/appearance",
-                            Path(path),
-                            field="file",
-                            timeout=120,
-                        )
-                        added += 1
-                    except BaseException as exc:  # noqa: BLE001
-                        errors.append(f"{Path(path).name}: {exc}")
-                return added, errors
-
-            def _done(result: tuple[int, list[str]]) -> None:
-                added, errors = result
+            def _finish() -> None:
+                busy["value"] = False
+                upload.set_sensitive(True)
                 self.toast(
                     f"已添加 {added} 张形象"
                     + (f"，{len(errors)} 张失败" if errors else "")
                 )
-                if errors:
-                    self.toast(errors[0])
+                for message in errors[:3]:
+                    self.toast(message)
                 reload()
+                if callable(on_done):
+                    on_done()
 
-            widgets.run_async(
-                _do, on_success=_done, on_error=lambda exc: self.toast(str(exc))
-            )
+            def _upload_at(index: int) -> None:
+                if index >= len(paths):
+                    _finish()
+                    return
+                path = paths[index]
+                summary.set_text(
+                    f"正在上传 {index + 1}/{len(paths)}：{Path(path).name}"
+                )
+
+                def _do() -> Any:
+                    return self.api.upload_file(
+                        f"/api/personas/{q(name)}/appearance",
+                        Path(path),
+                        field="file",
+                        timeout=120,
+                    )
+
+                def _done(_result: Any) -> None:
+                    nonlocal added
+                    added += 1
+                    _upload_at(index + 1)
+
+                def _failed(exc: BaseException) -> None:
+                    errors.append(f"{Path(path).name}: {exc}")
+                    _upload_at(index + 1)
+
+                widgets.run_async(
+                    _do, on_success=_done, on_error=_failed
+                )
+
+            _upload_at(0)
 
         def delete_everything() -> None:
+            if busy["value"]:
+                return
+            busy["value"] = True
+            upload.set_sensitive(False)
+            delete_all.set_sensitive(False)
+
             def _do() -> Any:
                 return self.api.delete(f"/api/personas/{q(name)}/appearance", timeout=30)
 
-            widgets.run_async(
-                _do,
-                on_success=lambda _r: (self.toast("角色形象已全部删除"), reload()),
-                on_error=lambda exc: self.toast(str(exc)),
-            )
+            def _done(_result: Any) -> None:
+                busy["value"] = False
+                upload.set_sensitive(True)
+                self.toast("角色形象已全部删除")
+                reload()
+                if callable(on_done):
+                    on_done()
+
+            def _failed(exc: BaseException) -> None:
+                busy["value"] = False
+                upload.set_sensitive(True)
+                delete_all.set_sensitive(True)
+                self.toast(str(exc))
+
+            widgets.run_async(_do, on_success=_done, on_error=_failed)
 
         upload.connect("clicked", lambda _b: add_images())
         refresh.connect("clicked", lambda _b: reload())
@@ -438,6 +569,10 @@ class PersonasPage(Page):
         image: dict[str, Any],
         cover_id: str,
         reload: Any,
+        on_done: Any,
+        busy: dict[str, bool],
+        parent: Gtk.Window,
+        on_select: Any = None,
     ) -> Gtk.Widget:
         card = widgets.card(spacing=5, padding=8)
         picture = Gtk.Picture()
@@ -460,11 +595,20 @@ class PersonasPage(Page):
                 picture.set_tooltip_text("预览失败")
 
         widgets.run_async(_load, on_success=_loaded, on_error=lambda _e: None)
+        if on_select is not None:
+            gesture = Gtk.GestureClick()
+            gesture.connect(
+                "pressed",
+                lambda *_a: on_select(picture.get_paintable(), image),
+            )
+            card.add_controller(gesture)
         head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         head.append(widgets.muted(image_id[:8]))
         if image_id == cover_id:
             head.append(widgets.badge("预览图", css="badge badge-green"))
         size = f"{image.get('width') or '?'}×{image.get('height') or '?'}"
+        if image.get("size") is not None:
+            size += f" · {widgets.format_bytes(image.get('size'))}"
         head.append(widgets.muted(size))
         card.append(head)
         actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
@@ -473,24 +617,40 @@ class PersonasPage(Page):
             cover.connect(
                 "clicked",
                 lambda _b: self._appearance_action(
-                    "cover", name, image_id, reload
+                    "cover", name, image_id, reload, on_done, busy
                 ),
             )
             actions.append(cover)
         delete = widgets.button("删除", css="destructive-action")
         delete.connect(
             "clicked",
-            lambda _b: self._appearance_action("delete", name, image_id, reload),
+            lambda _b: widgets.ConfirmDialog(
+                parent,
+                heading="删除这张角色形象？",
+                body="删除后无法恢复；聊天记录不受影响。",
+                confirm_label="删除",
+                destructive=True,
+                on_confirm=lambda: self._appearance_action(
+                    "delete", name, image_id, reload, on_done, busy
+                ),
+            ),
         )
         actions.append(delete)
         card.append(actions)
         return card
 
     def _appearance_action(
-        self, action: str, name: str, image_id: str, reload: Any
+        self,
+        action: str,
+        name: str,
+        image_id: str,
+        reload: Any,
+        on_done: Any,
+        busy: dict[str, bool],
     ) -> None:
-        if self.api is None:
+        if self.api is None or busy["value"]:
             return
+        busy["value"] = True
 
         def _do() -> Any:
             if action == "cover":
@@ -504,14 +664,18 @@ class PersonasPage(Page):
                 timeout=30,
             )
 
-        widgets.run_async(
-            _do,
-            on_success=lambda _r: (
-                self.toast("已设为预览图" if action == "cover" else "形象已删除"),
-                reload(),
-            ),
-            on_error=lambda exc: self.toast(str(exc)),
-        )
+        def _done(_result: Any) -> None:
+            busy["value"] = False
+            self.toast("已设为预览图" if action == "cover" else "形象已删除")
+            reload()
+            if callable(on_done):
+                on_done()
+
+        def _failed(exc: BaseException) -> None:
+            busy["value"] = False
+            self.toast(str(exc))
+
+        widgets.run_async(_do, on_success=_done, on_error=_failed)
 
     # ------------------------------------------------------------------
     # Copy and import
@@ -530,14 +694,17 @@ class PersonasPage(Page):
         window.add_row("新目录名", new_name)
         error = widgets.muted("")
         window.body_box.append(error)
+        busy = {"value": False}
 
         def _save() -> None:
-            if self.api is None:
+            if self.api is None or busy["value"]:
                 return
             target = new_name.get_text().strip()
             if not target:
                 error.set_text("目录名不能为空。")
                 return
+            busy["value"] = True
+            window.submit_button.set_sensitive(False)
 
             def _do() -> dict[str, Any]:
                 return self.api.post(
@@ -547,13 +714,17 @@ class PersonasPage(Page):
                 )
 
             def _done(result: dict[str, Any]) -> None:
+                busy["value"] = False
                 window.close()
                 self.toast(str(result.get("message") or "已复制"))
                 self.refresh()
 
-            widgets.run_async(
-                _do, on_success=_done, on_error=lambda exc: error.set_text(str(exc))
-            )
+            def _failed(exc: BaseException) -> None:
+                busy["value"] = False
+                window.submit_button.set_sensitive(True)
+                error.set_text(str(exc))
+
+            widgets.run_async(_do, on_success=_done, on_error=_failed)
 
         window.present()
 

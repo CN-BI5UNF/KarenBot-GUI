@@ -19,6 +19,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from .paths import default_data_root
+
 logger = logging.getLogger(__name__)
 
 
@@ -37,14 +39,14 @@ class LocalControlServer:
         host: str = "127.0.0.1",
     ) -> None:
         self.project_root = Path(project_root)
-        # The GUI must never silently attach to the live KarenBot data root.
-        # ``AppPaths`` treats this checkout as its default project and would
-        # otherwise resolve to the user data directory used by the running
-        # service.  Use an isolated data directory unless the caller opts in.
+        # Development checkouts stay isolated in ``<checkout>/data``.  Packaged
+        # builds (no ``.git``) use the per-user data root, which is outside the
+        # source tree so the in-app updater is not permanently blocked by its
+        # ``data_dir_inside_project`` guard.  ``--data-dir`` still wins.
         self.data_root = (
             Path(data_root).expanduser()
             if data_root
-            else self.project_root / "data"
+            else default_data_root(self.project_root)
         )
         self.host = host
         self.port = 0
@@ -231,6 +233,7 @@ class LocalControlServer:
             version=__version__,
             docs=False,
             auth_error_message="未授权：请使用 GUI 生成的本地令牌",
+            frontend="gui",
         )
         self.app = app
 

@@ -10,7 +10,7 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Gtk  # noqa: E402
+from gi.repository import GLib, Gtk  # noqa: E402
 
 from .. import widgets  # noqa: E402
 from .base import Page  # noqa: E402
@@ -19,11 +19,45 @@ PROTOCOLS = [
     ("openai_compat", "OpenAI 兼容"),
     ("anthropic", "Anthropic"),
 ]
+VENDOR_OPTIONS = [
+    ("", "自动识别（按模型 ID）"),
+    ("gemini", "Google Gemini"),
+    ("anthropic", "Anthropic Claude"),
+    ("openai", "OpenAI"),
+    ("deepseek", "DeepSeek"),
+    ("qwen", "通义千问 Qwen"),
+    ("glm", "智谱 GLM"),
+    ("moonshot", "月之暗面 Kimi"),
+    ("xai", "xAI Grok"),
+    ("volcengine", "火山引擎豆包"),
+    ("mimo", "小米 MiMo"),
+]
+REASONING_STYLES = [
+    ("", "跟随预设（自定义则不发任何字段）"),
+    ("thinking_extra_body", "thinking_extra_body — DeepSeek / GLM / MiMo 风格"),
+    ("qwen_enable_thinking", "qwen_enable_thinking — 通义千问"),
+    ("openai_native", "openai_native — OpenAI 官方（不发字段）"),
+    ("none", "none — 什么都不发"),
+]
+REASONING_EFFORT_STYLES = [
+    ("", "跟随预设（自定义则不发送）"),
+    ("none", "none — 不发送 reasoning_effort"),
+    ("openai", "openai — 发送 reasoning_effort"),
+    ("deepseek", "deepseek — DeepSeek 风格"),
+]
 MODEL_IMAGES = [
     ("auto", "auto（按预设能力自动附图）"),
     ("on", "on（明确允许主模型接收图片）"),
     ("off", "off（不向主模型附图）"),
 ]
+EFFORT_LABELS = {
+    "minimal": "最小",
+    "low": "低",
+    "medium": "中",
+    "high": "高",
+    "xhigh": "极高",
+    "max": "最大",
+}
 SEARCH_PROVIDERS = [
     ("bing_rss", "Bing RSS（默认，免密钥）"),
     ("baidu", "百度"),
@@ -57,11 +91,15 @@ class SetupPage(Page):
         self._current = "welcome"
         self._is_last = False
         self._progress = [0, 1]
+        self._progress_ok = False
+        self._progress_retry_source = 0
         self._busy = False
         self._building_step = False
         self._error = ""
         self._validate_step: Callable[[], str | None] = lambda: None
         self._provider: dict[str, Any] = {}
+        # 切到预设再切回“自定义”时恢复手填的中转站字段。
+        self._custom_provider_draft: dict[str, Any] = {}
         self._chat: dict[str, Any] = {}
         self._agents: dict[str, dict[str, Any]] = {}
         self._features: dict[str, dict[str, Any]] = {}
@@ -71,7 +109,10 @@ class SetupPage(Page):
         self._persona_brief = ""
         self._max_context_tokens: int | None = None
 
-        self.body.append(self.header(refresh=False))
+        # 向导自身不再滚动整页：步骤内容放进内部滚动区，底部按钮始终可见。
+        self.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.NEVER)
+        self.body.set_vexpand(True)
+        self.body.append(self.header())
         intro = widgets.card(spacing=4)
         intro.append(
             widgets.label(
@@ -101,11 +142,13 @@ class SetupPage(Page):
         self.step_card.append(
             widgets.muted("正在准备向导…")
         )
-        self.body.append(self.step_card)
-
         self.error_label = widgets.label("", css="danger-text", wrap=True)
         self.error_label.set_visible(False)
-        self.body.append(self.error_label)
+        step_scroll = Gtk.ScrolledWindow()
+        step_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        step_scroll.set_vexpand(True)
+        step_scroll.set_child(self.step_card)
+        self.body.append(step_scroll)
 
         footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.back_button = widgets.button("上一步")
@@ -123,6 +166,7 @@ class SetupPage(Page):
         self.body.append(footer)
         self.status_label = widgets.muted("")
         self.body.append(self.status_label)
+        self.body.append(self.error_label)
         self._set_ready(False)
         self.refresh()
 
@@ -265,6 +309,10 @@ class SetupPage(Page):
     def _refresh_progress(self) -> None:
         if self.api is None:
             return
+        self._progress_ok = False
+        if not self._busy:
+            self.next_button.set_sensitive(False)
+            self.skip_button.set_sensitive(False)
         token = (self._current, self._path, self._persona_source)
 
         def _do() -> dict[str, Any]:
@@ -282,6 +330,10 @@ class SetupPage(Page):
         def _done(result: dict[str, Any]) -> None:
             if token != (self._current, self._path, self._persona_source):
                 return
+            self._progress_ok = True
+            if self._progress_retry_source:
+                GLib.source_remove(self._progress_retry_source)
+                self._progress_retry_source = 0
             progress = result.get("progress") or [0, 1]
             try:
                 index, total = int(progress[0]), int(progress[1])
@@ -298,13 +350,30 @@ class SetupPage(Page):
                 not self._is_last
                 and bool((self._steps_meta.get(self._current) or {}).get("can_skip"))
             )
+            if not self._busy:
+                self.next_button.set_sensitive(True)
+                self.skip_button.set_sensitive(True)
 
         def _failed(exc: BaseException) -> None:
             if token != (self._current, self._path, self._persona_source):
                 return
-            self._set_error(f"读取向导进度失败：{exc}")
+            self._progress_ok = False
+            self.next_button.set_sensitive(False)
+            self.skip_button.set_sensitive(False)
+            self._set_error(f"读取向导进度失败：{exc}，请稍后重试")
+            if not self._progress_retry_source:
+                self._progress_retry_source = GLib.timeout_add_seconds(
+                    3, self._retry_progress
+                )
 
         widgets.run_async(_do, on_success=_done, on_error=_failed)
+
+    def _retry_progress(self) -> bool:
+        self._progress_retry_source = 0
+        if self._busy or self._progress_ok or self.api is None:
+            return False
+        self._refresh_progress()
+        return False
 
     def _advance(self) -> None:
         if self._busy:
@@ -315,6 +384,10 @@ class SetupPage(Page):
             return
         self._error = ""
         self.error_label.set_visible(False)
+        if not self._progress_ok:
+            self._set_error("向导进度尚未确认，请稍后重试。")
+            self._refresh_progress()
+            return
         if self._is_last:
             self._submit()
             return
@@ -373,14 +446,14 @@ class SetupPage(Page):
             self.back_button.set_sensitive(False)
             self.skip_button.set_sensitive(False)
         else:
-            self.next_button.set_sensitive(True)
+            self.next_button.set_sensitive(self._progress_ok)
             self.back_button.set_sensitive(self._current != "welcome")
-            self.skip_button.set_sensitive(True)
+            self.skip_button.set_sensitive(self._progress_ok)
 
     def _set_ready(self, ready: bool) -> None:
-        self.next_button.set_sensitive(ready)
+        self.next_button.set_sensitive(ready and self._progress_ok)
         self.back_button.set_sensitive(False)
-        self.skip_button.set_sensitive(ready)
+        self.skip_button.set_sensitive(ready and self._progress_ok)
 
     def _set_error(self, message: str) -> None:
         self._error = message
@@ -422,16 +495,60 @@ class SetupPage(Page):
         preset = self._preset(preset_id)
         return list((preset or {}).get("models") or [])
 
+    def _reasoning_options(self) -> list[str]:
+        preset = self._preset(str(self._provider.get("preset") or ""))
+        model_id = str(self._provider.get("model") or "")
+        model = next(
+            (
+                item
+                for item in (preset or {}).get("models") or []
+                if str(item.get("id") or "") == model_id
+            ),
+            None,
+        )
+        options = list((model or {}).get("reasoning_effort_options") or [])
+        if not options:
+            options = list(
+                (preset or {}).get("reasoning_effort_options") or []
+            )
+        return [str(item) for item in options] or ["low", "medium", "high"]
+
     def _apply_preset(self, preset_id: str) -> None:
         preset = self._preset(preset_id)
+        if not self._provider.get("preset"):
+            # 离开展开中的自定义表单前，把手填内容存进草稿。
+            self._custom_provider_draft = {
+                key: self._provider.get(key)
+                for key in (
+                    "id",
+                    "display_name",
+                    "protocol",
+                    "base_url",
+                    "model",
+                    "model_vendor",
+                    "reasoning_style",
+                    "reasoning_effort_style",
+                )
+            }
         self._provider["preset"] = preset_id or None
         if preset is None:
-            self._provider["id"] = "main_provider"
-            self._provider["display_name"] = "自定义提供商"
-            self._provider["protocol"] = "openai_compat"
-            self._provider["base_url"] = ""
-            self._provider["reasoning_style"] = ""
-            self._provider["model"] = ""
+            draft = self._custom_provider_draft
+            self._provider["id"] = str(draft.get("id") or "main_provider")
+            self._provider["display_name"] = str(
+                draft.get("display_name") or "自定义提供商"
+            )
+            self._provider["protocol"] = str(
+                draft.get("protocol") or "openai_compat"
+            )
+            self._provider["base_url"] = str(draft.get("base_url") or "")
+            self._provider["model"] = str(draft.get("model") or "")
+            self._provider["model_vendor"] = draft.get("model_vendor") or None
+            self._provider["reasoning_style"] = str(
+                draft.get("reasoning_style") or ""
+            )
+            self._provider["reasoning_effort_style"] = str(
+                draft.get("reasoning_effort_style") or ""
+            )
             return
         self._provider["id"] = (
             f"{preset_id}_main" if preset_id != "deepseek" else "deepseek_main"
@@ -441,8 +558,12 @@ class SetupPage(Page):
         )
         self._provider["protocol"] = str(preset.get("protocol") or "openai_compat")
         self._provider["base_url"] = str(preset.get("base_url") or "")
+        self._provider["model_vendor"] = preset.get("model_vendor") or None
         self._provider["reasoning_style"] = str(
             preset.get("reasoning_style") or ""
+        )
+        self._provider["reasoning_effort_style"] = str(
+            preset.get("reasoning_effort_style") or ""
         )
         models = self._preset_models(preset_id)
         if not self._provider.get("model") or not any(
@@ -646,6 +767,36 @@ class SetupPage(Page):
                 "protocol", widgets.dropdown_value(protocol)
             ),
         )
+        model_vendor = widgets.dropdown(
+            VENDOR_OPTIONS, str(self._provider.get("model_vendor") or "")
+        )
+        model_vendor.connect(
+            "notify::selected",
+            lambda *_args: self._provider.__setitem__(
+                "model_vendor",
+                widgets.dropdown_value(model_vendor) or None,
+            ),
+        )
+        reasoning_style = widgets.dropdown(
+            REASONING_STYLES, str(self._provider.get("reasoning_style") or "")
+        )
+        reasoning_style.connect(
+            "notify::selected",
+            lambda *_args: self._provider.__setitem__(
+                "reasoning_style", widgets.dropdown_value(reasoning_style)
+            ),
+        )
+        effort_style = widgets.dropdown(
+            REASONING_EFFORT_STYLES,
+            str(self._provider.get("reasoning_effort_style") or ""),
+        )
+        effort_style.connect(
+            "notify::selected",
+            lambda *_args: self._provider.__setitem__(
+                "reasoning_effort_style",
+                widgets.dropdown_value(effort_style),
+            ),
+        )
         base_url = Gtk.Entry()
         base_url.set_text(str(self._provider.get("base_url") or ""))
         base_url.set_placeholder_text("https://api.example.com/v1")
@@ -674,6 +825,20 @@ class SetupPage(Page):
                 "api_key", entry.get_text().strip()
             ),
         )
+        key_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        key_entry.set_hexpand(True)
+        key_row.append(key_entry)
+        key_toggle = widgets.button("显示")
+        key_toggle.connect(
+            "clicked",
+            lambda _b: (
+                key_entry.set_visibility(not key_entry.get_visibility()),
+                key_toggle.set_label(
+                    "隐藏" if key_entry.get_visibility() else "显示"
+                ),
+            ),
+        )
+        key_row.append(key_toggle)
         timeout = Gtk.SpinButton.new_with_range(5, 600, 1)
         timeout.set_value(float(self._provider.get("timeout_seconds") or 120))
         timeout.connect(
@@ -698,20 +863,34 @@ class SetupPage(Page):
             lambda spin: self._chat.__setitem__("max_tokens", int(spin.get_value())),
         )
         reasoning = widgets.switch(bool(self._chat.get("reasoning")))
+        reasoning_options = self._reasoning_options()
+        current_budget = str(self._chat.get("reasoning_budget") or "")
+        if current_budget not in reasoning_options:
+            current_budget = (
+                "medium"
+                if "medium" in reasoning_options
+                else reasoning_options[0]
+            )
+            self._chat["reasoning_budget"] = current_budget
         budget = widgets.dropdown(
             [
-                ("low", "低"),
-                ("medium", "中"),
-                ("high", "高"),
-                ("xhigh", "极高"),
-                ("max", "最大"),
+                (
+                    value,
+                    EFFORT_LABELS.get(value, value),
+                )
+                for value in reasoning_options
             ],
-            str(self._chat.get("reasoning_budget") or "medium"),
+            current_budget,
         )
-        reasoning.connect(
-            "notify::active",
-            lambda widget, *_args: self._chat.__setitem__("reasoning", bool(widget.get_active())),
-        )
+
+        def _toggle_reasoning(
+            widget: Gtk.Switch, *_args: Any
+        ) -> None:
+            active = bool(widget.get_active())
+            self._chat["reasoning"] = active
+            budget_field.set_visible(active)
+
+        reasoning.connect("notify::active", _toggle_reasoning)
         budget.connect(
             "notify::selected",
             lambda *_args: self._chat.__setitem__(
@@ -727,6 +906,16 @@ class SetupPage(Page):
         reasoning_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         reasoning_row.append(reasoning)
         reasoning_row.append(widgets.label("启用思考模式"))
+        budget_field = self._field(
+            "思考强度",
+            budget,
+            (
+                "档位来自当前预设模型文档；越高越慢越贵。"
+                if "max" in reasoning_options
+                else "越高越慢越贵，复杂任务再调高。"
+            ),
+        )
+        budget_field.set_visible(bool(self._chat.get("reasoning")))
         self._add(
             widgets.muted(
                 "中转站也走这里：预设选「自定义」，把 Base URL 换成中转地址即可。"
@@ -735,15 +924,18 @@ class SetupPage(Page):
             self._field("Provider ID", provider_id),
             self._field("显示名称", display_name),
             self._field("协议", protocol),
+            self._field("上游模型厂商（能力识别）", model_vendor),
             self._field("Base URL", base_url),
             self._field("模型 ID", model_entry),
-            self._field("API Key", key_entry),
+            self._field("API Key", key_row),
+            self._field("思考参数风格", reasoning_style),
+            self._field("思考强度传递", effort_style),
             self._field("请求超时（秒）", timeout),
             self._field("温度", temp),
             self._field("top_p", top_p),
             self._field("最大输出 token", max_tokens),
             reasoning_row,
-            self._field("思考强度", budget),
+            budget_field,
         )
         self._validate_step = self._validate_provider_custom
 
@@ -842,6 +1034,30 @@ class SetupPage(Page):
         self._add(
             widgets.muted("这些功能都可以之后再开，这里不选也不影响启动。")
         )
+        # 主模型原生附图与独立 describe_image 是两条独立链路：即使不开
+        # 独立视觉服务，也要让用户能声明主模型能否直接收图。
+        vision_section = self._feature("vision")
+        native_card = widgets.card(spacing=4, padding=10)
+        native_card.append(
+            widgets.label("主模型原生图片输入", css="section-title")
+        )
+        native_images = widgets.dropdown(
+            MODEL_IMAGES,
+            str(vision_section.get("main_model_images") or "auto"),
+        )
+        native_images.connect(
+            "notify::selected",
+            lambda *_args: vision_section.__setitem__(
+                "main_model_images", widgets.dropdown_value(native_images)
+            ),
+        )
+        native_card.append(native_images)
+        native_card.append(
+            widgets.muted(
+                "关闭不影响下面的独立视觉接口；同时开启也不代表自动双调用。"
+            )
+        )
+        self._add(native_card)
         for key, title, desc in (
             ("vision", "独立视觉识别", "主模型不能看图时，用另一个多模态模型提供 describe_image。"),
             ("web_search", "联网搜索", "让模型查实时信息；免费后端优先。"),
@@ -866,15 +1082,9 @@ class SetupPage(Page):
     def _feature_fields(self, key: str, card: Gtk.Box) -> None:
         section = self._feature(key)
         if key == "vision":
-            images = widgets.dropdown(
-                MODEL_IMAGES, str(section.get("main_model_images") or "auto")
-            )
-            images.connect(
-                "notify::selected",
-                lambda *_args: section.__setitem__(
-                    "main_model_images", widgets.dropdown_value(images)
-                ),
-            )
+            default_provider = str(self._provider.get("id") or "")
+            if default_provider and not section.get("provider"):
+                section["provider"] = default_provider
             provider = Gtk.Entry()
             provider.set_placeholder_text("已有 provider ID（可复用其密钥/地址）")
             provider.set_text(str(section.get("provider") or ""))
@@ -913,7 +1123,9 @@ class SetupPage(Page):
                 ),
             )
             reserve = _int_spin(
-                1, 1_000_000, int(section.get("image_token_reserve") or 1024)
+                256,
+                65536,
+                int(section.get("image_token_reserve") or 8192),
             )
             reserve.connect(
                 "value-changed",
@@ -921,12 +1133,35 @@ class SetupPage(Page):
                     "image_token_reserve", int(spin.get_value())
                 ),
             )
-            card.append(self._field("主模型原生图片", images))
+            limits = section.setdefault("image_limits", {})
+            max_images = _int_spin(
+                1,
+                20,
+                int(limits.get("max_images_per_request") or 20),
+            )
+
+            def _set_max_images(spin: Gtk.SpinButton) -> None:
+                limits["max_images_per_request"] = int(spin.get_value())
+
+            max_images.connect("value-changed", _set_max_images)
             card.append(self._field("视觉 provider", provider))
             card.append(self._field("视觉模型", model))
             card.append(self._field("独立 Base URL", base_url))
             card.append(self._field("独立 API Key", api_key))
-            card.append(self._field("每图 token 预留", reserve))
+            card.append(
+                self._field(
+                    "每图 token 预留",
+                    reserve,
+                    "项目资源预留，不是供应商精确账单；默认 8192。",
+                )
+            )
+            card.append(
+                self._field(
+                    "单请求最大图片数",
+                    max_images,
+                    "资源护栏，只能调低到 1–20；需重启生效。",
+                )
+            )
         elif key == "web_search":
             free = widgets.switch(bool(section.get("free_enabled", True)))
             free.connect(
@@ -1045,12 +1280,8 @@ class SetupPage(Page):
         if vision.get("enabled"):
             if not vision.get("model"):
                 return "启用独立视觉后必须填写视觉模型 ID。"
-            if not vision.get("provider") and not (
-                vision.get("base_url") and vision.get("api_key")
-            ):
-                return (
-                    "独立视觉需要已有 provider，或同时填写 Base URL 与 API Key。"
-                )
+            # provider 留空时后端会继承主 provider 的地址与密钥；只有
+            # 用户显式填写自定义端点时才需要额外配置。
         search = self._features.get("web_search") or {}
         if search.get("enabled"):
             if not search.get("free_enabled"):
@@ -1263,24 +1494,60 @@ class SetupPage(Page):
                 "mode", widgets.dropdown_value(wl_mode)
             ),
         )
-        wl_qq = Gtk.Entry()
-        wl_qq.set_placeholder_text("QQ 号，逗号或空格分隔")
-        wl_qq.set_text(", ".join(str(x) for x in whitelist.get("qq_ids") or []))
-        wl_qq.connect(
+        wl_qq = widgets.text_view(
+            ", ".join(str(x) for x in whitelist.get("qq_ids") or []),
+            height=72,
+        )
+        wl_qq.text_view.get_buffer().connect(
             "changed",
-            lambda entry: whitelist.__setitem__(
-                "qq_ids", _parse_ids(entry.get_text())
+            lambda buffer: whitelist.__setitem__(
+                "qq_ids",
+                _parse_ids(
+                    buffer.get_text(
+                        buffer.get_start_iter(), buffer.get_end_iter(), True
+                    )
+                ),
             ),
         )
-        wl_group = Gtk.Entry()
-        wl_group.set_placeholder_text("群号，逗号或空格分隔")
-        wl_group.set_text(", ".join(str(x) for x in whitelist.get("group_ids") or []))
-        wl_group.connect(
+        wl_group = widgets.text_view(
+            ", ".join(str(x) for x in whitelist.get("group_ids") or []),
+            height=72,
+        )
+        wl_group.text_view.get_buffer().connect(
             "changed",
-            lambda entry: whitelist.__setitem__(
-                "group_ids", _parse_ids(entry.get_text())
+            lambda buffer: whitelist.__setitem__(
+                "group_ids",
+                _parse_ids(
+                    buffer.get_text(
+                        buffer.get_start_iter(), buffer.get_end_iter(), True
+                    )
+                ),
             ),
         )
+        process_field = self._field("NapCat 进程路径", process_path)
+        wl_mode_field = self._field("入站策略", wl_mode)
+        wl_qq_field = self._field(
+            "白名单 QQ",
+            wl_qq,
+            "一行一个，也可用逗号、空格、顿号或分号分隔。",
+        )
+        wl_group_field = self._field(
+            "白名单群",
+            wl_group,
+            "一行一个，也可用逗号、空格、顿号或分号分隔。",
+        )
+
+        def _sync_adapter_visibility(*_args: Any) -> None:
+            managing = bool(manage.get_active())
+            process_field.set_visible(managing)
+            restart_row.set_visible(managing)
+            whitelisted = widgets.dropdown_value(wl_mode) == "whitelist"
+            wl_qq_field.set_visible(whitelisted)
+            wl_group_field.set_visible(whitelisted)
+
+        manage.connect("notify::active", _sync_adapter_visibility)
+        wl_mode.connect("notify::selected", _sync_adapter_visibility)
+        _sync_adapter_visibility()
         self._add(
             widgets.muted(
                 "连接 NapCat 后才会收发 QQ 消息；先跳过也不影响人格试跑。"
@@ -1292,11 +1559,11 @@ class SetupPage(Page):
             self._field("WebSocket 路径", path),
             self._field("Access Token", token),
             manage_row,
-            self._field("NapCat 进程路径", process_path),
+            process_field,
             restart_row,
-            self._field("入站策略", wl_mode),
-            self._field("白名单 QQ", wl_qq),
-            self._field("白名单群", wl_group),
+            wl_mode_field,
+            wl_qq_field,
+            wl_group_field,
         )
         self._validate_step = lambda: None
 
@@ -1519,7 +1786,11 @@ class SetupPage(Page):
             "protocol": provider.get("protocol") or None,
             "base_url": provider.get("base_url") or None,
             "api_key": provider.get("api_key") or "",
+            "model_vendor": provider.get("model_vendor") or None,
             "reasoning_style": provider.get("reasoning_style") or None,
+            "reasoning_effort_style": (
+                provider.get("reasoning_effort_style") or None
+            ),
             "timeout_seconds": float(provider.get("timeout_seconds") or 120.0),
         }
         agents: dict[str, Any] = {}
@@ -1538,26 +1809,35 @@ class SetupPage(Page):
         features: dict[str, Any] = {}
         secrets: dict[str, str] = {}
         vision = self._features.get("vision") or {}
+        image_limits = vision.get("image_limits") or {}
+        vision_common = {
+            "main_model_images": str(
+                vision.get("main_model_images") or "auto"
+            ),
+            "image_token_reserve": int(
+                vision.get("image_token_reserve") or 8192
+            ),
+            "image_limits": {
+                "max_images_per_request": int(
+                    image_limits.get("max_images_per_request") or 20
+                )
+            },
+        }
         if vision.get("enabled"):
             vision_payload = {
                 "enabled": True,
                 "type": "api",
-                "main_model_images": str(
-                    vision.get("main_model_images") or "auto"
-                ),
+                **vision_common,
                 "provider": vision.get("provider") or None,
                 "model": str(vision.get("model") or ""),
                 "base_url": vision.get("base_url") or None,
-                "image_token_reserve": int(
-                    vision.get("image_token_reserve") or 1024
-                ),
             }
             if vision.get("api_key"):
                 vision_payload["api_key"] = str(vision["api_key"])
                 secrets["vision_key"] = str(vision["api_key"])
             features["vision"] = vision_payload
         else:
-            features["vision"] = {"enabled": False}
+            features["vision"] = {"enabled": False, **vision_common}
         search = self._features.get("web_search") or {}
         if search.get("enabled"):
             features["web_search"] = {
@@ -1685,7 +1965,7 @@ def _float_spin(
 
 def _parse_ids(text: str) -> list[int]:
     result: list[int] = []
-    for chunk in re.split(r"[\s,，、]+", str(text or "")):
+    for chunk in re.split(r"[\s,，、;；]+", str(text or "")):
         chunk = chunk.strip()
         if not chunk:
             continue

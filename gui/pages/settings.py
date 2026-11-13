@@ -50,6 +50,7 @@ _SPECIAL_PATHS = {
 
 
 class SettingsPage(Page):
+    refresh_on_activate = True
     page_id = "settings"
     page_title = "设置"
     page_subtitle = "运行参数、模型与路径诊断。改动即时写入 config.yaml；需要重启的会给出提示。"
@@ -62,6 +63,7 @@ class SettingsPage(Page):
         self.body.set_vexpand(True)
         self._data: dict[str, Any] = {}
         self._groups: list[dict[str, Any]] = []
+        self._refresh_busy = False
         self._group_pages: dict[str, Gtk.Widget] = {}
         self._group_panels: dict[str, list[Any]] = {}
         self._specs: dict[str, dict[str, Any]] = {}
@@ -119,8 +121,11 @@ class SettingsPage(Page):
     # Loading
     # ------------------------------------------------------------------
     def refresh(self) -> None:
-        if self.api is None:
+        if self.api is None or self._refresh_busy:
             return
+        self._refresh_busy = True
+        if not self._groups and not self._data:
+            self._show_loading()
 
         def _fetch() -> dict[str, Any]:
             from concurrent.futures import ThreadPoolExecutor
@@ -148,15 +153,38 @@ class SettingsPage(Page):
 
         widgets.run_async(_fetch, on_success=self._render, on_error=self._error)
 
+    def _show_loading(self) -> None:
+        page = self.group_stack.get_child_by_name("loading")
+        if page is None:
+            page = self.busy("正在读取设置…")
+            self.group_stack.add_named(page, "loading")
+        self.group_stack.set_visible_child(page)
+
+    def _retry_settings(self) -> None:
+        if self._refresh_busy:
+            return
+        self._show_loading()
+        self.refresh()
+
     def _error(self, exc: BaseException) -> None:
+        self._refresh_busy = False
         widgets.clear(self.group_list)
         widgets.clear(self.group_stack)
-        self.group_stack.add_named(widgets.muted(f"读取设置失败：{exc}"), "error")
+        paths_row = Gtk.ListBoxRow()
+        paths_row.group_key = "__paths__"  # type: ignore[attr-defined]
+        paths_row.add_css_class("nav-row")
+        paths_row.set_child(widgets.label("路径与诊断"))
+        self.group_list.append(paths_row)
+        self.group_stack.add_named(
+            self._settings_error_page(f"读取设置失败：{exc}"), "error"
+        )
         self.group_stack.set_visible_child_name("error")
 
     def _render(self, data: dict[str, Any]) -> None:
+        self._refresh_busy = False
         payload = data.get("settings") or {}
         self._data = payload
+        settings_error = str(payload.get("error") or "")
         self._groups = list(payload.get("groups") or [])
         self._specs = {}
         for group in self._groups:
@@ -190,6 +218,13 @@ class SettingsPage(Page):
         paths_row.add_css_class("nav-row")
         paths_row.set_child(widgets.label("路径与诊断"))
         self.group_list.append(paths_row)
+        if settings_error:
+            self.group_stack.add_named(
+                self._settings_error_page(settings_error), "__error__"
+            )
+            self.group_stack.set_visible_child_name("__error__")
+            GLib.idle_add(self._apply_pending_selection)
+            return
         target = self._row_for_group(previous)
         if target is None and previous == "__paths__":
             target = paths_row
@@ -199,11 +234,43 @@ class SettingsPage(Page):
             self.group_list.select_row(target)
         GLib.idle_add(self._apply_pending_selection)
 
+    def _settings_error_page(self, message: str) -> Gtk.Widget:
+        card = widgets.card(spacing=10)
+        card.append(widgets.label("设置暂时不可用", css="section-title"))
+        card.append(
+            widgets.muted(
+                "后端还没有就绪，或读取设置失败。Runtime 被维护/兼容门禁阻止时，"
+                "这里不会显示任何配置项。"
+            )
+        )
+        card.append(widgets.label(message, css="danger-text", wrap=True, selectable=True))
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        retry = widgets.button("重试读取设置", css="suggested-action")
+        retry.connect("clicked", lambda _b: self._retry_settings())
+        actions.append(retry)
+        paths = widgets.button("打开路径与诊断")
+        paths.connect(
+            "clicked",
+            lambda _b: self.select_group("__paths__"),
+        )
+        actions.append(paths)
+        card.append(actions)
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_vexpand(True)
+        scroller.set_child(card)
+        return scroller
+
     def _apply_pending_selection(self) -> bool:
         key = self._pending_section
         if not key:
             return False
         row = self._row_for_group(key)
+        if row is None:
+            if not self._groups:
+                return False
+            self._pending_section = ""
+            self.toast(f"未知的设置分区：{key}")
+            row = self.group_list.get_row_at_index(0)
         if row is not None:
             if self.group_list.get_selected_row() is not row:
                 self.group_list.select_row(row)
@@ -347,21 +414,39 @@ class SettingsPage(Page):
 
         if kind == "bool":
             control = widgets.switch(bool(value))
-            previous = bool(value)
+            state = {"value": bool(value), "suppress": False}
 
-            def _toggle(w: Gtk.Switch, _pspec: Any = None, f=field, old=previous) -> None:
-                self._save(
-                    f,
-                    bool(w.get_active()),
-                    on_error=lambda _exc, sw=w, prev=old: _restore_switch(sw, prev),
-                )
+            def _toggle(
+                w: Gtk.Switch,
+                _pspec: Any = None,
+                f=field,
+                st=state,
+            ) -> None:
+                if st["suppress"]:
+                    return
+                selected = bool(w.get_active())
+                if selected == st["value"]:
+                    return
+
+                def _saved(_result: Any, current=selected) -> None:
+                    st["value"] = bool(current)
+                    f["value"] = bool(current)
+
+                def _failed(_exc: BaseException, current=st["value"]) -> None:
+                    st["suppress"] = True
+                    try:
+                        w.set_active(bool(current))
+                    finally:
+                        st["suppress"] = False
+
+                self._save(f, selected, on_success=_saved, on_error=_failed)
 
             control.connect("notify::active", _toggle)
             box.append(control)
         elif kind == "enum":
             options = [(str(v), str(label)) for v, label in (field.get("options") or [])]
             control = widgets.dropdown(options, str(value or ""))
-            previous = str(value or "")
+            state = {"value": str(value or ""), "suppress": False}
             option_help = field.get("option_help") or {}
 
             def _refresh_hint(*_args: Any) -> None:
@@ -370,14 +455,31 @@ class SettingsPage(Page):
                 help_label.set_text(text)
                 help_label.set_visible(bool(text))
 
-            def _changed(w: Gtk.DropDown, _pspec: Any = None, f=field, old=previous) -> None:
+            def _changed(
+                w: Gtk.DropDown,
+                _pspec: Any = None,
+                f=field,
+                st=state,
+            ) -> None:
+                if st["suppress"]:
+                    return
                 _refresh_hint()
                 selected = widgets.dropdown_value(w)
-                self._save(
-                    f,
-                    selected,
-                    on_error=lambda _exc, dd=w, prev=old: _select_dropdown(dd, prev),
-                )
+                if selected == st["value"]:
+                    return
+
+                def _saved(_result: Any, current=selected) -> None:
+                    st["value"] = str(current)
+                    f["value"] = str(current)
+
+                def _failed(_exc: BaseException, current=st["value"]) -> None:
+                    st["suppress"] = True
+                    try:
+                        _select_dropdown(w, str(current))
+                    finally:
+                        st["suppress"] = False
+
+                self._save(f, selected, on_success=_saved, on_error=_failed)
 
             control.connect("notify::selected", _changed)
             _refresh_hint()
@@ -401,13 +503,10 @@ class SettingsPage(Page):
             box.append(row)
         elif kind == "list_str":
             area = widgets.text_view("\n".join(str(x) for x in (value or [])), height=64)
-            self._bind_text_commit(field, area, help_label)
-            box.append(area)
             save = widgets.button("保存")
-            save.connect(
-                "clicked",
-                lambda _b, f=field, a=area: self._commit_text_view(f, a),
-            )
+            self._bind_text_commit(field, area, help_label, save)
+            save.connect("clicked", lambda _b, a=area: a.commit_text())
+            box.append(area)
             box.append(save)
         elif kind == "json":
             area = widgets.text_view(
@@ -415,16 +514,14 @@ class SettingsPage(Page):
                 height=110,
                 monospace=True,
             )
-            self._bind_text_commit(field, area, help_label)
-            box.append(area)
             save = widgets.button("保存 JSON")
-            save.connect(
-                "clicked",
-                lambda _b, f=field, a=area: self._commit_text_view(f, a),
-            )
+            self._bind_text_commit(field, area, help_label, save)
+            save.connect("clicked", lambda _b, a=area: a.commit_text())
+            box.append(area)
             box.append(save)
         elif kind == "list_int":
             entry = Gtk.Entry()
+            entry.set_placeholder_text("逗号分隔的整数，例如 1, 2, 3")
             entry.set_text(
                 ", ".join(str(x) for x in (value or []))
                 if isinstance(value, list)
@@ -433,19 +530,32 @@ class SettingsPage(Page):
             self._bind_entry_commit(field, entry, kind, help_label)
             box.append(entry)
         elif kind in {"int", "float", "int_or_none"} and _bounded(field):
-            low = int(field.get("min", 0))
-            high = int(field.get("max", 1_000_000_000))
-            control = Gtk.SpinButton.new_with_range(low, high, 1)
+            is_float = kind == "float"
+            low = float(field.get("min", 0))
+            high = float(field.get("max", 1_000_000_000))
+            step = float(
+                field.get("step") or (0.1 if is_float else 1)
+            )
+            control = Gtk.SpinButton.new_with_range(low, high, step)
+            control.set_digits(
+                int(field.get("digits", 2 if is_float else 0))
+                if is_float
+                else 0
+            )
             control.set_numeric(True)
             control.set_halign(Gtk.Align.START)
             try:
-                control.set_value(int(value if value is not None else low))
+                control.set_value(float(value if value is not None else low))
             except (TypeError, ValueError):
                 control.set_value(low)
-            last = [int(control.get_value())]
+            last = [control.get_value()]
 
-            def _spin_commit(w: Gtk.SpinButton, f=field, state=last) -> None:
-                current = int(w.get_value())
+            def _spin_commit(
+                w: Gtk.SpinButton, f=field, state=last, floating=is_float
+            ) -> None:
+                current: Any = (
+                    float(w.get_value()) if floating else int(w.get_value())
+                )
                 if current == state[0]:
                     return
                 self._save(
@@ -489,6 +599,11 @@ class SettingsPage(Page):
         help_label: Gtk.Label,
     ) -> None:
         last = {"raw": entry.get_text()}
+        base_help = help_label.get_text()
+
+        def _restore_help() -> None:
+            help_label.set_text(base_help)
+            help_label.set_visible(bool(base_help))
 
         def _commit() -> None:
             raw = entry.get_text().strip()
@@ -502,14 +617,16 @@ class SettingsPage(Page):
                 self.toast(str(exc))
                 entry.set_text(last["raw"])
                 return
-            help_label.set_visible(False)
+            _restore_help()
 
             def _done(_result: Any) -> None:
                 last["raw"] = display
                 entry.set_text(display)
+                _restore_help()
 
             def _failed(_exc: BaseException) -> None:
                 entry.set_text(last["raw"])
+                _restore_help()
 
             self._save(field, value, on_success=_done, on_error=_failed)
 
@@ -523,50 +640,91 @@ class SettingsPage(Page):
         field: dict[str, Any],
         area: Gtk.ScrolledWindow,
         help_label: Gtk.Label,
+        save_button: Gtk.Button,
     ) -> None:
         view: Gtk.TextView = area.text_view  # type: ignore[attr-defined]
+        base_help = help_label.get_text()
+        kind = str(field.get("type") or "")
+        state: dict[str, Any] = {
+            "saved_text": widgets.text_value(area),
+            "inflight": False,
+        }
+
+        def _restore_help() -> None:
+            help_label.set_text(base_help)
+            help_label.set_visible(bool(base_help))
+
+        def _sync_button() -> None:
+            save_button.set_sensitive(
+                widgets.text_value(area) != state["saved_text"]
+            )
+
+        def _parse() -> tuple[bool, Any, str]:
+            text = widgets.text_value(area)
+            if kind == "list_str":
+                return True, _parse_list_str(text), ""
+            try:
+                return True, (json.loads(text) if text.strip() else None), ""
+            except json.JSONDecodeError as exc:
+                return (
+                    False,
+                    None,
+                    f"JSON 解析失败：第 {exc.lineno} 行，{exc.msg}",
+                )
+
+        def _send(value: Any) -> None:
+            state["inflight"] = True
+            save_button.set_sensitive(False)
+
+            def _done(_result: Any) -> None:
+                state["inflight"] = False
+                state["saved_text"] = widgets.text_value(area)
+                _restore_help()
+                _sync_button()
+
+            def _failed(_exc: BaseException) -> None:
+                state["inflight"] = False
+                _restore_help()
+                _sync_button()
+
+            self._save(field, value, on_success=_done, on_error=_failed)
 
         def _commit() -> None:
-            text = widgets.text_value(area)
-            current = field.get("value", field.get("default"))
-            if str(field.get("type")) == "list_str":
-                value = _parse_list_str(text)
-                if value == list(current or []):
-                    return
-            else:
-                try:
-                    value = json.loads(text) if text.strip() else None
-                except json.JSONDecodeError as exc:
-                    help_label.set_text(f"JSON 解析失败：第 {exc.lineno} 行，{exc.msg}")
-                    help_label.set_visible(True)
-                    return
-                if value == current:
-                    return
-            help_label.set_visible(False)
-            self._save(field, value)
+            ok, value, message = _parse()
+            if not ok:
+                help_label.set_text(message)
+                help_label.set_visible(True)
+                self.toast(message)
+                return
+            if value == field.get("value", field.get("default")):
+                state["saved_text"] = widgets.text_value(area)
+                _restore_help()
+                _sync_button()
+                return
+            if state["inflight"]:
+                # Focus leaving the editor and the save button's click can both
+                # fire before the first PATCH returns. Keep only one request.
+                return
+            _restore_help()
+            _send(value)
 
+        def _on_changed(_buffer: Gtk.TextBuffer) -> None:
+            _sync_button()
+
+        view.get_buffer().connect("changed", _on_changed)
+        area.commit_text = _commit  # type: ignore[attr-defined]
         key = Gtk.EventControllerKey()
         key.connect(
             "key-pressed",
-            lambda _c, keyval, _code, state: _hotkey_commit(keyval, state, _commit),
+            lambda _c, keyval, _code, state_: _hotkey_commit(
+                keyval, state_, _commit
+            ),
         )
         view.add_controller(key)
         focus = Gtk.EventControllerFocus()
         focus.connect("leave", lambda _c: _commit())
         view.add_controller(focus)
-
-    def _commit_text_view(self, field: dict[str, Any], area: Gtk.ScrolledWindow) -> None:
-        kind = str(field.get("type") or "")
-        text = widgets.text_value(area)
-        if kind == "list_str":
-            value = _parse_list_str(text)
-        else:
-            try:
-                value = json.loads(text) if text.strip() else None
-            except json.JSONDecodeError as exc:
-                self.toast(f"JSON 解析失败：第 {exc.lineno} 行，{exc.msg}")
-                return
-        self._save(field, value)
+        _sync_button()
 
     def _pick_backup_dir(self, field: dict[str, Any], entry: Gtk.Entry) -> None:
         path = widgets.path_picker(
@@ -619,6 +777,22 @@ class SettingsPage(Page):
                 )
             if callable(on_success):
                 on_success(result)
+            container_setup_trigger = (
+                path == "features.container.storage_mode"
+                and str(stored) == "image_fixed"
+            ) or (
+                path == "features.container.enabled"
+                and bool(stored)
+                and str(
+                    self.spec_value("features.container.storage_mode", "")
+                )
+                == "image_fixed"
+            )
+            if container_setup_trigger:
+                page = self.app._ensure_page("container")
+                prompt = getattr(page, "prompt_storage_setup", None)
+                if callable(prompt):
+                    prompt()
 
         def _failed(exc: BaseException) -> None:
             self.toast(f"保存失败：{exc}")
@@ -638,7 +812,7 @@ class SettingsPage(Page):
             widgets.ConfirmDialog(
                 self.app.window,
                 heading="清空这个密钥？",
-                body=key_id,
+                body=f"{key_id}\n引用它的配置会改为“未设置”，依赖该密钥的功能将不可用。",
                 confirm_label="清空",
                 destructive=True,
                 on_confirm=lambda: self._put_secret(field, key_id, "", entry),
@@ -659,37 +833,60 @@ class SettingsPage(Page):
 
         def _do() -> dict[str, Any]:
             secret = self.api.put(
-                "/api/settings/secrets", {"key_id": key_id, "value": value}, timeout=30
+                "/api/settings/secrets",
+                {"key_id": key_id, "value": value},
+                timeout=30,
             )
+            ref_result: dict[str, Any] = {}
             ref_error = ""
-            if value and ref_path:
+            current_ref = str(field.get("value") or "")
+            ref_target = key_id if value else ""
+            # Saving a new secret must point the config at it; clearing the
+            # secret must also clear the dangling reference in config.
+            needs_ref_update = bool(ref_path) and current_ref != ref_target
+            if needs_ref_update:
                 try:
-                    self.api.patch(
+                    patched = self.api.patch(
                         "/api/settings",
-                        {"path": ref_path, "value": key_id},
+                        {"path": ref_path, "value": ref_target},
                         timeout=60,
                     )
+                    if isinstance(patched, dict):
+                        ref_result = patched
                 except BaseException as exc:  # noqa: BLE001
                     ref_error = str(exc)
-            return {"secret": secret, "ref_error": ref_error}
+            return {
+                "secret": secret if isinstance(secret, dict) else {},
+                "ref": ref_result,
+                "ref_error": ref_error,
+            }
 
         def _done(result: dict[str, Any]) -> None:
             entry.set_text("")
+            secret = result.get("secret") or {}
             if value:
-                entry.set_placeholder_text(f"已保存（ID: {key_id}，留空不修改）")
+                entry.set_placeholder_text(
+                    f"已保存（ID: {key_id}，留空不修改）"
+                )
                 field["value"] = key_id
                 self.update_spec_value(ref_path, key_id)
-                if result.get("ref_error"):
-                    self.toast(
-                        f"密钥已保存，但更新配置引用失败：{result['ref_error']}"
-                    )
-                else:
-                    self.toast("密钥已保存")
-                self.mark_restart()
             else:
                 entry.set_placeholder_text("未设置")
                 field["value"] = ""
-                self.toast("密钥已清空")
+            if result.get("ref_error"):
+                action = "保存" if value else "清空"
+                self.toast(
+                    f"密钥已{action}，但更新配置引用失败：{result['ref_error']}"
+                )
+            else:
+                self.toast(
+                    str(secret.get("message") or ("密钥已保存" if value else "密钥已清空"))
+                )
+            if (
+                secret.get("needs_restart")
+                or (result.get("ref") or {}).get("needs_restart")
+            ):
+                self.mark_restart()
 
         widgets.run_async(_do, on_success=_done, on_error=lambda exc: self.toast(str(exc)))
 
@@ -769,14 +966,62 @@ class SettingsPage(Page):
             btn = widgets.button(label)
             btn.connect(
                 "clicked",
-                lambda _b, endpoint=path, name=label: self._runtime_action(endpoint, name),
+                lambda _b, endpoint=path, name=label: self._request_runtime_action(
+                    endpoint, name
+                ),
             )
             row.append(btn)
+        quit_button = widgets.button("退出 GUI", css="destructive-action")
+        quit_button.connect("clicked", lambda _b: self._confirm_quit_gui())
+        row.append(quit_button)
+        storage_button = widgets.button("存储与数据")
+        storage_button.connect(
+            "clicked", lambda _b: self.app.show_page("storage")
+        )
+        row.append(storage_button)
         controls.append(row)
         box.append(controls)
         scroller.set_child(box)
         self._group_pages["__paths__"] = scroller
         return scroller
+
+    def has_unsaved_changes(self) -> bool:
+        return any(
+            getattr(panel, "dirty", False)
+            for panels in self._group_panels.values()
+            for panel in panels
+        )
+
+    def discard_unsaved_changes(self) -> None:
+        for panels in self._group_panels.values():
+            for panel in panels:
+                if hasattr(panel, "dirty"):
+                    panel.dirty = False
+        self.refresh()
+
+    def _request_runtime_action(self, path: str, label: str) -> None:
+        if path == "/api/system/start":
+            self._runtime_action(path, label)
+            return
+        widgets.ConfirmDialog(
+            self.app.window,
+            heading=f"{label}？",
+            body="正在处理的请求会被中断。停止后可以再次启动；"
+            "重启只会重建 Runtime，不会重新加载磁盘上的 Python 代码。",
+            confirm_label=label,
+            destructive=path == "/api/system/stop",
+            on_confirm=lambda: self._runtime_action(path, label),
+        )
+
+    def _confirm_quit_gui(self) -> None:
+        widgets.ConfirmDialog(
+            self.app.window,
+            heading="退出 GUI？",
+            body="本地控制服务会一并停止。未保存的黑白名单/触发规则会先提示。",
+            confirm_label="退出 GUI",
+            destructive=True,
+            on_confirm=self.app.close,
+        )
 
     def _runtime_action(self, path: str, label: str) -> None:
         if self.api is None:
@@ -795,14 +1040,20 @@ class SettingsPage(Page):
     # Navigation
     # ------------------------------------------------------------------
     def select_group(self, key: str) -> None:
-        if not self._groups:
+        if key == "paths":
+            key = "__paths__"
+        if not self._groups and key != "__paths__":
             self._pending_section = key
             return
         row = self._row_for_group(key)
         if row is None:
-            self._pending_section = key
-            GLib.idle_add(self._apply_pending_selection)
-            return
+            if self._groups:
+                self.toast(f"未知的设置分区：{key}")
+                row = self.group_list.get_row_at_index(0)
+            else:
+                self._pending_section = key
+                GLib.idle_add(self._apply_pending_selection)
+                return
         self.group_list.select_row(row)
         selected = self.group_list.get_selected_row()
         if selected is not row:
