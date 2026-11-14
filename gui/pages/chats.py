@@ -17,6 +17,10 @@ from .. import widgets  # noqa: E402
 from .base import Page  # noqa: E402
 
 _EMOJI_LABEL_RE = re.compile(r"\[表情包\s*[:：]\s*([^\]]+?)\s*\]")
+_ATTACHMENT_TEXT_RE = re.compile(
+    r"\[[^\[\]\n]{0,240}?workspace=(?:incoming|workspace|outgoing)[/\\][^\s\]]+[^\]]*\]",
+    re.IGNORECASE,
+)
 
 
 class ChatsPage(Page):
@@ -34,6 +38,11 @@ class ChatsPage(Page):
         self._disposed = False
         self._load_serial = 0
         self._display_limit = 300
+        self._latest_items: list[dict[str, Any]] = []
+        self._older_items: list[dict[str, Any]] = []
+        self._older_cursor: str | None = None
+        self._older_has_more = False
+        self._older_loading = False
         self._last_signature: tuple[Any, ...] | None = None
         self._conversations: list[dict[str, Any]] = []
         self._conversations_signature: tuple[Any, ...] | None = None
@@ -51,6 +60,8 @@ class ChatsPage(Page):
         self._emoji_names_busy = False
         self._emoji_textures: dict[str, Gdk.Texture] = {}
         self._emoji_texture_busy: set[str] = set()
+        self._chat_media_textures: dict[str, Gdk.Texture] = {}
+        self._chat_media_busy: set[str] = set()
         self._emoji_texture_waiters: dict[
             str, list[tuple[Gtk.Picture, Gtk.Label]]
         ] = {}
@@ -61,7 +72,7 @@ class ChatsPage(Page):
         self.body.append(header_row)
         toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.search_entry = Gtk.SearchEntry()
-        self.search_entry.set_placeholder_text("搜索会话内容…")
+        self.search_entry.set_property("placeholder-text", "搜索会话内容…")
         self.search_entry.set_hexpand(True)
         self.search_entry.connect("search-changed", lambda _e: self._schedule_search())
         self.show_chat = Gtk.CheckButton(label="聊天")
@@ -119,7 +130,7 @@ class ChatsPage(Page):
         left.set_size_request(280, -1)
         left.append(widgets.label("会话", css="section-title"))
         self.conversation_search = Gtk.SearchEntry()
-        self.conversation_search.set_placeholder_text("搜索会话名或预览…")
+        self.conversation_search.set_property("placeholder-text", "搜索会话名或预览…")
         self.conversation_search.set_margin_top(6)
         self.conversation_search.set_margin_bottom(6)
         self.conversation_search.connect(
@@ -253,7 +264,7 @@ class ChatsPage(Page):
                 self._last_display_data = None
                 self._expanded_ids.clear()
                 self._collapsed_ids.clear()
-                self._display_limit = 300
+                self._reset_paging()
                 self._load_selected(scroll="bottom")
             self.refresh(load_display=False)
 
@@ -508,10 +519,9 @@ class ChatsPage(Page):
                 if conversation_id:
                     self._selected_key = conversation_id
                     self._last_signature = None
-                    self._last_display_data = None
                     self._expanded_ids.clear()
                     self._collapsed_ids.clear()
-                    self._display_limit = 300
+                    self._reset_paging()
                 self.toast(str(result.get("message") or "消息已注入"))
                 if conversation_id:
                     self._load_selected(scroll="bottom")
@@ -635,9 +645,7 @@ class ChatsPage(Page):
             return
         if key != self._selected_key:
             self._selected_key = key
-            self._display_limit = 300
-            self._last_signature = None
-            self._last_display_data = None
+            self._reset_paging()
             self._expanded_ids.clear()
             self._collapsed_ids.clear()
             self.more_button.set_visible(False)
@@ -659,24 +667,252 @@ class ChatsPage(Page):
 
     def _search_fired(self) -> bool:
         self._search_timer = 0
-        self._display_limit = 300
+        self._reset_paging()
         self._load_selected(scroll="bottom")
         return False
 
     def _reset_and_load(self) -> None:
-        self._display_limit = 300
-        self._last_signature = None
+        self._reset_paging()
         self._load_selected(scroll="bottom")
 
     def _load_more(self) -> None:
-        if self._display_limit <= 0:
+        if self.api is None or not self._selected_key or self._older_loading:
             return
-        self._display_limit += 300
-        self._load_selected(scroll="top")
+        items = self._merge_display()
+        anchor = str(items[0].get("id") or "") if items else ""
+        cursor = self._older_cursor or ""
+        if not cursor and not anchor:
+            return
+        self._older_loading = True
+        self.more_button.set_label("加载中…")
+        self.more_button.set_sensitive(False)
+        self.all_button.set_sensitive(False)
+        serial = self._load_serial
+        path = self._display_page_path(
+            before_id="" if cursor else anchor,
+            cursor=cursor,
+        )
+
+        def _fetch() -> dict[str, Any]:
+            return self.api.get(path, timeout=90)
+
+        def _done(data: dict[str, Any]) -> None:
+            if serial != self._load_serial:
+                return
+            self._older_loading = False
+            self._older_items = self._merge_older(
+                data.get("items") or [], self._older_items
+            )
+            self._older_cursor = str(data.get("next_cursor") or "") or None
+            self._older_has_more = bool(data.get("has_more"))
+            self._rerender_combined(scroll="prepend")
+
+        def _failed(exc: BaseException) -> None:
+            if serial != self._load_serial:
+                return
+            self._older_loading = False
+            if getattr(exc, "status", 0) == 409:
+                self._older_items = []
+                self._older_cursor = None
+                self._older_has_more = False
+                self.toast("记录位置已变化，正在重新加载")
+                self._load_selected(scroll="preserve")
+            else:
+                self.toast(f"加载更早记录失败：{exc}")
+                self._rerender_combined(scroll="preserve")
+
+        widgets.run_async(_fetch, on_success=_done, on_error=_failed)
 
     def _show_all(self) -> None:
-        self._display_limit = 0
-        self._load_selected(scroll="top")
+        if self.api is None or not self._selected_key or self._older_loading:
+            return
+        items = self._merge_display()
+        anchor = str(items[0].get("id") or "") if items else ""
+        initial_cursor = self._older_cursor or ""
+        if not initial_cursor and not anchor:
+            return
+        self._older_loading = True
+        self.more_button.set_label("加载中…")
+        self.more_button.set_sensitive(False)
+        self.all_button.set_sensitive(False)
+        serial = self._load_serial
+        # GTK 控件只能在主线程读取；先把筛选条件冻结成参数列表。
+        prefix = self._display_page_params()
+
+        def _fetch() -> list[dict[str, Any]]:
+            pages: list[dict[str, Any]] = []
+            cursor = initial_cursor
+            before_id = "" if cursor else anchor
+            for _ in range(20):
+                params = list(prefix)
+                if cursor:
+                    params.append(f"cursor={_quote(cursor)}")
+                elif before_id:
+                    params.append(f"before_id={_quote(before_id)}")
+                path = "/api/chats/display/page?" + "&".join(params)
+                data = self.api.get(path, timeout=90)
+                pages.append(data)
+                cursor = str(data.get("next_cursor") or "") or ""
+                before_id = ""
+                if not data.get("has_more"):
+                    break
+            return pages
+
+        def _done(pages: list[dict[str, Any]]) -> None:
+            if serial != self._load_serial:
+                return
+            self._older_loading = False
+            for data in pages:
+                self._older_items = self._merge_older(
+                    data.get("items") or [], self._older_items
+                )
+                self._older_cursor = str(data.get("next_cursor") or "") or None
+                self._older_has_more = bool(data.get("has_more"))
+            self._rerender_combined(scroll="prepend")
+            if self._older_has_more:
+                self.toast("一次最多加载 20 页，可继续点“加载更早”")
+
+        def _failed(exc: BaseException) -> None:
+            if serial != self._load_serial:
+                return
+            self._older_loading = False
+            if getattr(exc, "status", 0) == 409:
+                self._older_items = []
+                self._older_cursor = None
+                self._older_has_more = False
+                self.toast("记录位置已变化，正在重新加载")
+                self._load_selected(scroll="preserve")
+            else:
+                self.toast(f"加载更早记录失败：{exc}")
+                self._rerender_combined(scroll="preserve")
+
+        widgets.run_async(_fetch, on_success=_done, on_error=_failed)
+
+    def _rerender_combined(self, *, scroll: str) -> None:
+        if self._last_display_data is None:
+            self._load_selected(scroll=scroll)
+            return
+        self._last_display_data = self._combined_display_data(self._last_display_data)
+        self._render_display(self._last_display_data, scroll=scroll)
+
+    def _fetch_bridge(self, before_id: str, serial: int) -> None:
+        """最新窗口滑动后，补齐它和已加载旧页之间的空隙。"""
+        path = self._display_page_path(before_id=before_id, cursor="")
+
+        def _fetch() -> dict[str, Any]:
+            return self.api.get(path, timeout=90)
+
+        def _done(data: dict[str, Any]) -> None:
+            if serial != self._load_serial:
+                return
+            self._older_items = self._merge_older(
+                data.get("items") or [], self._older_items
+            )
+            if self._last_display_data is not None:
+                self._last_display_data = self._combined_display_data(
+                    self._last_display_data
+                )
+                self._render_display(self._last_display_data, scroll="preserve")
+
+        def _failed(exc: BaseException) -> None:
+            if getattr(exc, "status", 0) == 409:
+                self._older_items = []
+                self._older_cursor = None
+                self._older_has_more = False
+
+        widgets.run_async(_fetch, on_success=_done, on_error=_failed)
+
+    def _reset_paging(self) -> None:
+        self._display_limit = 300
+        self._latest_items = []
+        self._older_items = []
+        self._older_cursor = None
+        self._older_has_more = False
+        self._older_loading = False
+        self._last_signature = None
+        self._last_display_data = None
+
+    def _display_page_params(self) -> list[str]:
+        params = [
+            f"conversation_id={_quote(self._selected_key)}",
+            f"limit={self._display_limit}",
+            f"show_chat={'true' if self.show_chat.get_active() else 'false'}",
+            f"show_system={'true' if self.show_system.get_active() else 'false'}",
+            f"show_tools={'true' if self.show_tools.get_active() else 'false'}",
+            f"show_reasoning={'true' if self.show_reasoning.get_active() else 'false'}",
+            f"media_only={'true' if self.media_only.get_active() else 'false'}",
+        ]
+        search = self.search_entry.get_text().strip()
+        if search:
+            params.append(f"q={_quote(search)}")
+        return params
+
+    def _display_page_path(
+        self, *, before_id: str = "", cursor: str = ""
+    ) -> str:
+        params = self._display_page_params()
+        if cursor:
+            params.append(f"cursor={_quote(cursor)}")
+        elif before_id:
+            params.append(f"before_id={_quote(before_id)}")
+        return "/api/chats/display/page?" + "&".join(params)
+
+    @staticmethod
+    def _dedupe_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        seen: set[str] = set()
+        result: list[dict[str, Any]] = []
+        for item in items:
+            item_id = str(item.get("id") or "")
+            if not item_id or item_id in seen:
+                continue
+            seen.add(item_id)
+            result.append(item)
+        return result
+
+    def _merge_older(
+        self,
+        fresh: list[dict[str, Any]],
+        existing: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not fresh:
+            return existing
+        if not existing:
+            return self._dedupe_items(fresh)
+        existing_ids = {str(item.get("id") or "") for item in existing}
+        first_overlap = -1
+        last_overlap = -1
+        for index, item in enumerate(fresh):
+            if str(item.get("id") or "") not in existing_ids:
+                continue
+            if first_overlap < 0:
+                first_overlap = index
+            last_overlap = index
+        if first_overlap >= 0:
+            return self._dedupe_items(
+                [
+                    *fresh[:first_overlap],
+                    *existing,
+                    *fresh[last_overlap + 1 :],
+                ]
+            )
+        return self._dedupe_items([*fresh, *existing])
+
+    def _merge_display(self) -> list[dict[str, Any]]:
+        latest_ids = {str(item.get("id") or "") for item in self._latest_items}
+        older_only = [
+            item
+            for item in self._older_items
+            if str(item.get("id") or "") not in latest_ids
+        ]
+        return [*older_only, *self._latest_items]
+
+    def _combined_display_data(self, data: dict[str, Any]) -> dict[str, Any]:
+        merged = self._merge_display()
+        out = dict(data)
+        out["items"] = merged
+        out["filtered_total"] = len(merged)
+        out["truncated"] = self._older_has_more or bool(data.get("truncated"))
+        return out
 
     def _load_selected(
         self,
@@ -691,6 +927,9 @@ class ChatsPage(Page):
         serial = self._load_serial
         if not silent:
             self.conversation_title.set_text(f"正在加载 {self._selected_key}…")
+        previous_first = (
+            str(self._latest_items[0].get("id") or "") if self._latest_items else ""
+        )
         query = [
             f"conversation_id={_quote(self._selected_key)}",
             f"limit={self._display_limit}",
@@ -712,20 +951,34 @@ class ChatsPage(Page):
             if serial != self._load_serial:
                 return
             self._load_busy = False
-            items = data.get("items") or []
-            last = items[-1] if items else {}
+            new_latest = data.get("items") or []
+            first_id = str(new_latest[0].get("id") or "") if new_latest else ""
+            shifted = bool(
+                previous_first and first_id and first_id != previous_first
+            )
+            self._latest_items = new_latest
+            if not self._older_items:
+                self._older_has_more = bool(data.get("truncated"))
+            merged_data = self._combined_display_data(data)
+            merged_items = merged_data.get("items") or []
+            last = merged_items[-1] if merged_items else {}
             signature = (
                 data.get("total"),
                 data.get("filtered_total"),
-                len(items),
+                len(merged_items),
                 data.get("truncated"),
+                first_id,
                 last.get("timestamp"),
                 str(last.get("text") or last.get("summary") or "")[:120],
+                len(self._older_items),
             )
             if silent and signature == self._last_signature:
                 return
             self._last_signature = signature
-            self._render_display(data, scroll=scroll)
+            self._last_display_data = merged_data
+            self._render_display(merged_data, scroll=scroll)
+            if shifted and self._older_items and first_id:
+                self._fetch_bridge(first_id, serial)
 
         def _failed(exc: BaseException) -> None:
             if serial != self._load_serial:
@@ -743,6 +996,8 @@ class ChatsPage(Page):
             self._search_timer = 0
         self._emoji_texture_waiters.clear()
         self._emoji_texture_busy.clear()
+        self._chat_media_textures.clear()
+        self._chat_media_busy.clear()
 
     def _poll(self) -> bool:
         if self._disposed:
@@ -767,6 +1022,8 @@ class ChatsPage(Page):
         # 会永久留在页面上。
         self._last_signature = None
         self.conversation_title.set_text("加载失败")
+        self.more_button.set_visible(False)
+        self.all_button.set_visible(False)
         widgets.clear(self.display_box)
         self.display_box.append(widgets.muted(f"无法读取会话：{exc}"))
 
@@ -774,28 +1031,30 @@ class ChatsPage(Page):
         self._last_display_data = data
         adjustment = self.display_scroller.get_vadjustment()
         old_value = adjustment.get_value()
+        old_upper = adjustment.get_upper()
         at_bottom = (
-            adjustment.get_upper() <= 0
-            or old_value + adjustment.get_page_size()
-            >= adjustment.get_upper() - 40
+            old_upper <= 0
+            or old_value + adjustment.get_page_size() >= old_upper - 40
         )
         widgets.clear(self.display_box)
         conv = data.get("conversation") or {}
         title = str(conv.get("label") or self._selected_key)
         total = data.get("total")
-        filtered = data.get("filtered_total")
-        shown = filtered if filtered is not None else len(data.get("items") or [])
+        items = data.get("items") or []
         self.conversation_title.set_text(
-            f"{title} · {shown} 项"
+            f"{title} · {len(items)} 项"
             + (f" / {total} 条记录" if total else "")
         )
-        items = data.get("items") or []
         total_count = int(total or 0)
-        filtered_count = int(filtered or 0)
-        hidden = max(0, filtered_count - len(items))
-        self.more_button.set_visible(hidden > 0 and self._display_limit > 0)
-        self.more_button.set_label(f"加载更早（{min(hidden, 300)}）")
-        self.all_button.set_visible(hidden > 0)
+        filtered_count = int(data.get("filtered_total") or 0)
+        can_load_older = self._older_has_more or (
+            not self._older_items and bool(data.get("truncated"))
+        )
+        self.more_button.set_visible(can_load_older)
+        self.more_button.set_label("加载中…" if self._older_loading else "加载更早")
+        self.more_button.set_sensitive(not self._older_loading)
+        self.all_button.set_visible(can_load_older)
+        self.all_button.set_sensitive(not self._older_loading)
         self._building_display = True
         try:
             if not items:
@@ -812,14 +1071,13 @@ class ChatsPage(Page):
                     )
             for item in items:
                 self.display_box.append(self._display_row(item))
-            if hidden > 0:
+            if can_load_older:
                 self.display_box.append(
                     widgets.muted(
-                        f"还有 {hidden} 条更早的记录未显示；可点上方"
-                        "「加载更早」或「显示全部」。"
+                        "还有更早的记录未显示；可点上方「加载更早」或「显示全部」。"
                     )
                 )
-            elif data.get("truncated"):
+            elif self._older_items:
                 self.display_box.append(widgets.muted("已显示全部记录。"))
         finally:
             self._building_display = False
@@ -828,15 +1086,20 @@ class ChatsPage(Page):
             mode = "bottom"
         GLib.timeout_add(
             60,
-            lambda: self._restore_scroll(mode, old_value),
+            lambda: self._restore_scroll(mode, old_value, old_upper),
         )
 
-    def _restore_scroll(self, mode: str, old_value: float) -> bool:
+    def _restore_scroll(self, mode: str, old_value: float, old_upper: float) -> bool:
         adjustment = self.display_scroller.get_vadjustment()
         if mode == "bottom":
-            adjustment.set_value(max(0.0, adjustment.get_upper() - adjustment.get_page_size()))
+            adjustment.set_value(
+                max(0.0, adjustment.get_upper() - adjustment.get_page_size())
+            )
         elif mode == "top":
             adjustment.set_value(0.0)
+        elif mode == "prepend":
+            added = max(0.0, adjustment.get_upper() - old_upper)
+            adjustment.set_value(max(0.0, old_value + added))
         else:
             adjustment.set_value(old_value)
         return False
@@ -903,11 +1166,16 @@ class ChatsPage(Page):
         expander.set_expanded(self._is_expanded(item))
         full_text = str(item.get("text") or "")
         truncated = kind == "tool_result" and len(full_text) > 4000
-        text = full_text[:4000] if truncated else full_text
-        if text:
+        text = self._display_text(item)
+        text = text[:4000] if truncated else text
+        attachments = self._attachments_widget(item)
+        if text or attachments is not None:
             wrapper = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
             wrapper.set_margin_start(16)
-            wrapper.append(self._rich_text_widget(text))
+            if text:
+                wrapper.append(self._rich_text_widget(text))
+            if attachments is not None:
+                wrapper.append(attachments)
             if truncated:
                 wrapper.append(
                     widgets.muted(
@@ -951,6 +1219,178 @@ class ChatsPage(Page):
         area = widgets.text_view(text, height=520, monospace=True)
         window.add_row("完整内容（可选中复制）", area)
         window.present()
+
+    @staticmethod
+    def _format_bytes(value: Any) -> str:
+        try:
+            size = int(value)
+        except (TypeError, ValueError):
+            return ""
+        if size < 0:
+            return ""
+        if size < 1024:
+            return f"{size} B"
+        if size < 1024 * 1024:
+            return f"{size / 1024:.1f} KB"
+        if size < 1024 * 1024 * 1024:
+            return f"{size / 1024 / 1024:.1f} MB"
+        return f"{size / 1024 / 1024 / 1024:.1f} GB"
+
+    @staticmethod
+    def _attachment_name(att: dict[str, Any]) -> str:
+        return str(att.get("name") or att.get("path") or "文件")
+
+    @staticmethod
+    def _display_text(item: dict[str, Any]) -> str:
+        text = str(item.get("text") or "")
+        attachments = item.get("attachments") or []
+        if not attachments:
+            return text
+        return _ATTACHMENT_TEXT_RE.sub("", text).strip()
+
+    def _launch_attachment(self, path: str, action: str) -> None:
+        if self.api is None or not path:
+            return
+
+        def _do() -> dict[str, Any]:
+            return self.api.post(
+                "/api/workspace/files/launch",
+                {"path": path, "action": action},
+                timeout=30,
+            )
+
+        def _done(_result: dict[str, Any]) -> None:
+            self.toast(
+                "已在文件夹中显示" if action == "reveal" else "已用默认应用打开"
+            )
+
+        def _failed(exc: BaseException) -> None:
+            self.toast(f"打开附件失败：{exc}")
+
+        widgets.run_async(_do, on_success=_done, on_error=_failed)
+
+    def _load_chat_media_texture(self, path: str, picture: Gtk.Picture) -> None:
+        cached = self._chat_media_textures.get(path)
+        if cached is not None:
+            picture.set_paintable(cached)
+            return
+        if self.api is None or path in self._chat_media_busy:
+            return
+        self._chat_media_busy.add(path)
+        api = self.api
+        request_path = (
+            "/api/workspace/files/raw?path=" + _quote(path)
+        )
+
+        def _fetch() -> bytes:
+            return api.raw(request_path, timeout=30)
+
+        def _done(data: bytes) -> None:
+            self._chat_media_busy.discard(path)
+            try:
+                texture = Gdk.Texture.new_from_bytes(GLib.Bytes.new(data))
+            except Exception:  # noqa: BLE001
+                return
+            self._chat_media_textures[path] = texture
+            while len(self._chat_media_textures) > 64:
+                self._chat_media_textures.pop(next(iter(self._chat_media_textures)))
+            picture.set_paintable(texture)
+
+        def _failed(_exc: BaseException) -> None:
+            self._chat_media_busy.discard(path)
+
+        widgets.run_async(_fetch, on_success=_done, on_error=_failed)
+
+    def _open_image_preview(self, att: dict[str, Any]) -> None:
+        name = self._attachment_name(att)
+        path = str(att.get("path") or "")
+        window = Gtk.Window()
+        window.set_title(name)
+        window.set_default_size(920, 720)
+        window.set_transient_for(self.app.window)
+        window.set_modal(True)
+        window.set_titlebar(Gtk.HeaderBar())
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        picture = Gtk.Picture()
+        picture.set_content_fit(Gtk.ContentFit.CONTAIN)
+        picture.set_hexpand(True)
+        picture.set_vexpand(True)
+        outer.append(picture)
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        actions.set_halign(Gtk.Align.END)
+        actions.set_margin_bottom(10)
+        actions.set_margin_end(12)
+        reveal = widgets.button("在文件夹中显示")
+        reveal.connect(
+            "clicked",
+            lambda _b: self._launch_attachment(path, "reveal"),
+        )
+        open_button = widgets.button("用默认应用打开", css="suggested-action")
+        open_button.connect(
+            "clicked",
+            lambda _b: self._launch_attachment(path, "open"),
+        )
+        close = widgets.button("关闭")
+        close.connect("clicked", lambda _b: window.close())
+        actions.append(reveal)
+        actions.append(open_button)
+        actions.append(close)
+        outer.append(actions)
+        window.set_child(outer)
+        self._load_chat_media_texture(path, picture)
+        window.present()
+
+    def _attachments_widget(self, item: dict[str, Any]) -> Gtk.Widget | None:
+        attachments = item.get("attachments") or []
+        if not isinstance(attachments, list) or not attachments:
+            return None
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.add_css_class("chat-attachments")
+        box.set_margin_top(6)
+        for raw_att in attachments:
+            if not isinstance(raw_att, dict):
+                continue
+            path = str(raw_att.get("path") or "")
+            if not path:
+                continue
+            name = self._attachment_name(raw_att)
+            kind = str(raw_att.get("kind") or "file")
+            size_text = self._format_bytes(raw_att.get("size"))
+            if kind == "image":
+                picture = Gtk.Picture()
+                picture.set_content_fit(Gtk.ContentFit.CONTAIN)
+                picture.set_size_request(320, 200)
+                picture.set_tooltip_text(f"点击预览 {name}")
+                self._load_chat_media_texture(path, picture)
+                button = Gtk.Button()
+                button.add_css_class("flat")
+                button.set_child(picture)
+                button.connect(
+                    "clicked",
+                    lambda _b, att=raw_att: self._open_image_preview(att),
+                )
+                box.append(button)
+                box.append(widgets.muted(name))
+                continue
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            row.add_css_class("chat-file-attachment")
+            row.append(widgets.label(name, ellipsize=True))
+            if size_text:
+                row.append(widgets.label(size_text, css="muted"))
+            open_button = widgets.button("打开")
+            open_button.connect(
+                "clicked",
+                lambda _b, value=path: self._launch_attachment(value, "open"),
+            )
+            reveal_button = widgets.button("在文件夹中显示")
+            reveal_button.connect(
+                "clicked",
+                lambda _b, value=path: self._launch_attachment(value, "reveal"),
+            )
+            row.append(open_button)
+            row.append(reveal_button)
+            box.append(row)
+        return box if box.get_first_child() is not None else None
 
     def _display_row(self, item: dict[str, Any]) -> Gtk.Widget:
         kind = str(item.get("kind") or "chat")
@@ -1007,11 +1447,14 @@ class ChatsPage(Page):
             )
         head.set_hexpand(True)
         row.append(head)
-        text = str(item.get("text") or "")
+        text = self._display_text(item)
+        attachments = self._attachments_widget(item)
         if text:
             row.append(self._rich_text_widget(text))
-        elif kind in {"inbound_message", "outbound_message"}:
+        elif kind in {"inbound_message", "outbound_message"} and attachments is None:
             row.append(widgets.muted("（空）"))
+        if attachments is not None:
+            row.append(attachments)
         return row
 
 

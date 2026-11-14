@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "id": "gui",
+  "name": "KarenBot GUI",
+  "kind": "frontend",
+  "api_version": 1,
+  "entry": "gui.plugin:GuiFrontendPlugin",
+  "description": "原生 GTK4 桌面控制台",
+  "capabilities": ["desktop", "gtk4"]
+}

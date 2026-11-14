@@ -27,6 +27,8 @@ class KnowledgePage(Page):
         self._persona_id = ""
         self._search_timer = 0
         self._research_busy = False
+        self._dedupe_busy = False
+        self._writable = False
         self._shared_switch_guard = False
         self._share_busy: set[str] = set()
         header_row = self.header()
@@ -40,13 +42,16 @@ class KnowledgePage(Page):
         )
         self.add_button.connect("clicked", lambda _b: self._editor(None))
         header_row.append(self.add_button)
+        self.dedupe_button = widgets.button("检查重复")
+        self.dedupe_button.connect("clicked", lambda _b: self._dedupe())
+        header_row.append(self.dedupe_button)
         self.trend_button = widgets.button("获取当前热梗")
         self.trend_button.connect("clicked", lambda _b: self._trends())
         header_row.append(self.trend_button)
         self.body.append(header_row)
         toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.search_entry = Gtk.SearchEntry()
-        self.search_entry.set_placeholder_text("搜索标题 / 内容 / 标签…")
+        self.search_entry.set_property("placeholder-text", "搜索标题 / 内容 / 标签…")
         self.search_entry.set_hexpand(True)
         self.search_entry.connect("search-changed", lambda _e: self._schedule_search())
         self.kind_filter = widgets.dropdown([("", "全部类型")] + KINDS, "")
@@ -124,7 +129,9 @@ class KnowledgePage(Page):
         state = data.get("state") or {}
         self._persona_id = str(data.get("persona_id") or "")
         writable = data.get("writable") is not False
+        self._writable = writable
         self.add_button.set_sensitive(writable)
+        self.dedupe_button.set_sensitive(writable and not self._dedupe_busy)
         self.research_button.set_sensitive(writable)
         self.trend_button.set_sensitive(writable)
         bits = [
@@ -417,6 +424,72 @@ class KnowledgePage(Page):
             self.toast(f"共享设置失败：{exc}")
 
         widgets.run_async(_do, on_success=_done, on_error=_failed)
+
+    def _dedupe(self) -> None:
+        if self.api is None or self._dedupe_busy:
+            return
+
+        def _set_busy(busy: bool) -> None:
+            self._dedupe_busy = busy
+            self.dedupe_button.set_sensitive(not busy and self._writable)
+
+        _set_busy(True)
+
+        def _preview() -> dict[str, Any]:
+            return self.api.post("/api/knowledge/dedupe", {"dry_run": True}, timeout=60)
+
+        def _preview_done(result: dict[str, Any]) -> None:
+            removed = result.get("removed") or []
+            if not removed:
+                _set_busy(False)
+                self.toast("没有发现可合并的重复条目")
+                return
+            lines = []
+            for item in removed[:8]:
+                title = item.get("title") or item.get("id") or "无标题"
+                kept = item.get("kept_title") or item.get("kept_id") or "—"
+                lines.append(f"· {title} → 保留 {kept}")
+            if len(removed) > 8:
+                lines.append(f"…另有 {len(removed) - 8} 条")
+            body = (
+                f"合并前 {result.get('before', '—')} 条，合并后 "
+                f"{result.get('after', '—')} 条；写盘前会自动备份知识库。\n\n"
+                + "\n".join(lines)
+            )
+
+            def _apply() -> None:
+                _set_busy(True)
+
+                def _request() -> dict[str, Any]:
+                    return self.api.post(
+                        "/api/knowledge/dedupe", {"dry_run": False}, timeout=60
+                    )
+
+                def _done(merged: dict[str, Any]) -> None:
+                    _set_busy(False)
+                    self.toast(f"已合并 {merged.get('removed_count', 0)} 条重复项")
+                    self.refresh()
+
+                def _failed(exc: BaseException) -> None:
+                    _set_busy(False)
+                    self.toast(f"合并失败：{exc}")
+
+                widgets.run_async(_request, on_success=_done, on_error=_failed)
+
+            widgets.ConfirmDialog(
+                self.app.window,
+                heading=f"发现 {len(removed)} 条可合并重复项",
+                body=body,
+                confirm_label="合并并备份",
+                on_confirm=_apply,
+                on_cancel=lambda: _set_busy(False),
+            )
+
+        def _preview_failed(exc: BaseException) -> None:
+            _set_busy(False)
+            self.toast(f"检查重复失败：{exc}")
+
+        widgets.run_async(_preview, on_success=_preview_done, on_error=_preview_failed)
 
     def _set_research_busy(self, busy: bool) -> None:
         self._research_busy = busy

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import traceback
 from collections.abc import Callable
 from typing import Any
 
@@ -301,6 +302,12 @@ class SetupPage(Page):
                         "配置完成后可在设置页调整。"
                     )
                 )
+        except Exception as exc:  # noqa: BLE001
+            traceback.print_exc()
+            self._set_busy(False)
+            self._set_error(
+                f"步骤「{step_id}」加载失败：{type(exc).__name__}: {exc}"
+            )
         finally:
             self._building_step = False
         if refresh_progress:
@@ -425,15 +432,24 @@ class SetupPage(Page):
 
         def _done(result: dict[str, Any]) -> None:
             self._set_busy(False)
+            self.status_label.set_text("")
             target = result.get("next") if direction == "next" else result.get("prev")
             if not target:
                 if direction == "next":
                     self._submit()
                 return
-            self._show_step(str(target))
+            try:
+                self._show_step(str(target))
+            except Exception as exc:  # noqa: BLE001
+                traceback.print_exc()
+                self._set_busy(False)
+                self._set_error(
+                    f"打开下一步失败：{type(exc).__name__}: {exc}"
+                )
 
         def _failed(exc: BaseException) -> None:
             self._set_busy(False)
+            self.status_label.set_text("")
             self._set_error(f"步骤切换失败：{exc}")
 
         widgets.run_async(_do, on_success=_done, on_error=_failed)
@@ -1163,21 +1179,14 @@ class SetupPage(Page):
                 )
             )
         elif key == "web_search":
-            free = widgets.switch(bool(section.get("free_enabled", True)))
-            free.connect(
-                "notify::active",
-                lambda widget, *_args: section.__setitem__(
-                    "free_enabled", bool(widget.get_active())
-                ),
-            )
+            # 免费搜索后端是内置能力：Bing RSS / 百度都不需要地址或密钥。
+            # 这里必须把默认值写回 section，否则 UI 显示“已启用”、校验却
+            # 读到 None，会误报“需要启用免费搜索后端”。
+            section.setdefault("free_enabled", True)
+            section.setdefault("provider", "bing_rss")
+            section.setdefault("max_results", 5)
             provider = widgets.dropdown(
                 SEARCH_PROVIDERS, str(section.get("provider") or "bing_rss")
-            )
-            provider.connect(
-                "notify::selected",
-                lambda *_args: section.__setitem__(
-                    "provider", widgets.dropdown_value(provider)
-                ),
             )
             searxng = Gtk.Entry()
             searxng.set_placeholder_text("https://searxng.example.com")
@@ -1188,6 +1197,21 @@ class SetupPage(Page):
                     "searxng_base_url", entry.get_text().strip()
                 ),
             )
+            searxng_field = self._field(
+                "SearXNG 地址",
+                searxng,
+                "仅选择 SearXNG 时需要；Bing RSS / 百度为内置后端，无需地址。",
+            )
+
+            def _provider_changed(*_args: Any) -> None:
+                value = widgets.dropdown_value(provider)
+                section["provider"] = value
+                section["free_enabled"] = True
+                searxng_field.set_visible(value == "searxng")
+
+            provider.connect("notify::selected", _provider_changed)
+            _provider_changed()
+
             results = _int_spin(1, 20, int(section.get("max_results") or 5))
             results.connect(
                 "value-changed",
@@ -1195,12 +1219,14 @@ class SetupPage(Page):
                     "max_results", int(spin.get_value())
                 ),
             )
-            free_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-            free_row.append(free)
-            free_row.append(widgets.label("启用免费搜索后端"))
-            card.append(free_row)
-            card.append(self._field("免费后端", provider))
-            card.append(self._field("SearXNG 地址", searxng))
+            card.append(self._field("搜索后端（内置免费）", provider))
+            card.append(searxng_field)
+            card.append(
+                widgets.muted(
+                    "Bing RSS 和百度是内置免费后端，不需要填写地址或密钥；"
+                    "只有自建 SearXNG 才需要地址。"
+                )
+            )
             card.append(self._field("最多返回结果", results))
         elif key == "weather":
             host = Gtk.Entry()
@@ -1284,11 +1310,10 @@ class SetupPage(Page):
             # 用户显式填写自定义端点时才需要额外配置。
         search = self._features.get("web_search") or {}
         if search.get("enabled"):
-            if not search.get("free_enabled"):
-                return "联网搜索目前需要在向导中启用免费搜索后端。"
-            if search.get("provider") == "searxng" and not search.get(
-                "searxng_base_url"
-            ):
+            provider = str(search.get("provider") or "bing_rss")
+            if provider == "searxng" and not str(
+                search.get("searxng_base_url") or ""
+            ).strip():
                 return "选择 SearXNG 后必须填写实例地址。"
         weather = self._features.get("weather") or {}
         if weather.get("enabled") and not weather.get("api_key"):

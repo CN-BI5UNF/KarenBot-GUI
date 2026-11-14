@@ -5,7 +5,7 @@
 window {
   background-color: @karen_bg;
   color: @karen_fg;
-  font-family: "Noto Sans CJK SC";
+  font-family: "Noto Sans CJK SC", "Noto Sans SC", "Source Han Sans SC", "Microsoft YaHei UI", "Segoe UI", sans-serif;
   font-size: 14px;
 }
 
@@ -159,7 +159,7 @@ headerbar.app-topbar windowcontrols button {
 
 .page-title {
   color: @karen_fg;
-  font-family: "Noto Serif CJK SC";
+  font-family: "Noto Serif CJK SC", "Noto Serif SC", "Source Han Serif SC", "Songti SC", "SimSun", serif;
   font-size: 20px;
   font-weight: 500;
 }
@@ -365,7 +365,7 @@ headerbar.app-topbar windowcontrols button {
 }
 
 .monospace {
-  font-family: "DejaVu Sans Mono";
+  font-family: "DejaVu Sans Mono", "Cascadia Mono", "Consolas", "Noto Sans Mono CJK SC", monospace;
   font-size: 12px;
 }
 
@@ -537,7 +537,7 @@ combobox > button {
 }
 
 .chat-tool .chat-text {
-  font-family: "DejaVu Sans Mono";
+  font-family: "DejaVu Sans Mono", "Cascadia Mono", "Consolas", "Noto Sans Mono CJK SC", monospace;
   font-size: 12px;
   color: @karen_text_secondary;
 }
@@ -628,7 +628,7 @@ button.choice-card:checked {
 }
 
 .log-row {
-  font-family: "DejaVu Sans Mono";
+  font-family: "DejaVu Sans Mono", "Cascadia Mono", "Consolas", "Noto Sans Mono CJK SC", monospace;
   font-size: 12px;
   padding: 2px 0;
 }

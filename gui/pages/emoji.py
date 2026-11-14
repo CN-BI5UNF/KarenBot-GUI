@@ -35,7 +35,7 @@ class EmojiPage(Page):
         self.info = widgets.muted("")
         self.body.append(self.info)
         self.search_entry = Gtk.SearchEntry()
-        self.search_entry.set_placeholder_text("按名称筛选…")
+        self.search_entry.set_property("placeholder-text", "按名称筛选…")
         self.search_entry.connect("search-changed", lambda _e: self._render_grid())
         self.body.append(self.search_entry)
         self.flow = Gtk.FlowBox()

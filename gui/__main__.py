@@ -1,5 +1,5 @@
 from __future__ import annotations
 
-from .app import main
+from .launcher import main
 
 raise SystemExit(main())

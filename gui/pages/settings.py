@@ -10,8 +10,9 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Gdk", "4.0")
-from gi.repository import Gdk, GLib, Gtk  # noqa: E402
+from gi.repository import Gdk, GLib, GObject, Gtk  # noqa: E402
 
+from .. import theme as skin_theme  # noqa: E402
 from .. import widgets  # noqa: E402
 from .base import Page  # noqa: E402
 from .settings_panels import (  # noqa: E402
@@ -78,6 +79,27 @@ class SettingsPage(Page):
         self.restart_hint = widgets.card()
         self.restart_hint.set_visible(False)
         self.body.append(self.restart_hint)
+        self._skin_updating = False
+        self.appearance_card = widgets.card(spacing=8)
+        self.appearance_card.append(
+            widgets.section_header(
+                "外观主题",
+                "Karen 暖色最接近 Linux 目标机；选择外部主题时会叠加其 "
+                "gtk-4.0/gtk.css，可能与自带样式冲突。",
+            )
+        )
+        skin_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.skin_dropdown = widgets.dropdown(
+            skin_theme.skin_options(), skin_theme.read_skin()
+        )
+        self.skin_dropdown.set_hexpand(True)
+        self.skin_dropdown.connect("notify::selected", self._on_skin_changed)
+        skin_row.append(self.skin_dropdown)
+        refresh_skins = widgets.button("刷新主题列表")
+        refresh_skins.connect("clicked", lambda _b: self._refresh_skin_options())
+        skin_row.append(refresh_skins)
+        self.appearance_card.append(skin_row)
+        self.body.append(self.appearance_card)
         # 分组导航与字段区可拖动分隔条调整占比；默认只占 156px，
         # 给右侧正文留更多宽度（WebUI 的设置导航也是窄栏）。
         split = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
@@ -314,6 +336,25 @@ class SettingsPage(Page):
             on_show = getattr(panel, "on_show", None)
             if callable(on_show):
                 on_show()
+
+    def _on_skin_changed(self, *_args: Any) -> None:
+        if self._skin_updating:
+            return
+        value = widgets.dropdown_value(self.skin_dropdown)
+        skin_theme.write_skin(value)
+        self.app.reload_skin()
+        self.toast("外观主题已切换")
+
+    def _refresh_skin_options(self) -> None:
+        current = skin_theme.read_skin()
+        self._skin_updating = True
+        try:
+            widgets.set_dropdown_options(
+                self.skin_dropdown, skin_theme.skin_options(), current
+            )
+        finally:
+            self._skin_updating = False
+        self.toast("主题列表已刷新")
 
     def _build_group(self, group: dict[str, Any]) -> Gtk.Widget:
         scroller = Gtk.ScrolledWindow()
@@ -568,7 +609,8 @@ class SettingsPage(Page):
             focus = Gtk.EventControllerFocus()
             focus.connect("leave", lambda _c, w=control: _spin_commit(w))
             control.add_controller(focus)
-            control.connect("activate", lambda w: _spin_commit(w))
+            if GObject.signal_lookup("activate", Gtk.SpinButton):
+                control.connect("activate", lambda w: _spin_commit(w))
             box.append(control)
         else:
             entry = Gtk.Entry()

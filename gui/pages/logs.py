@@ -53,7 +53,7 @@ class LogsPage(Page):
         self.module_entry.set_width_chars(24)
         self.module_entry.connect("changed", lambda _e: self._schedule_search())
         self.search_entry = Gtk.SearchEntry()
-        self.search_entry.set_placeholder_text("关键字…")
+        self.search_entry.set_property("placeholder-text", "关键字…")
         self.search_entry.connect("search-changed", lambda _e: self._schedule_search())
         self.auto_switch = Gtk.CheckButton(label="自动刷新")
         self.auto_switch.set_active(True)

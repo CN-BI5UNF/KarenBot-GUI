@@ -16,6 +16,7 @@ gi.require_version("Adw", "1")
 gi.require_version("Gdk", "4.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
+from . import theme as skin_theme  # noqa: E402
 from . import widgets  # noqa: E402
 from .api import ApiClient  # noqa: E402
 from .identity import application_id  # noqa: E402
@@ -55,6 +56,7 @@ SIDEBAR_COLLAPSED_WIDTH = 64
 
 
 _CSS_PROVIDER: Gtk.CssProvider | None = None
+_EXTERNAL_CSS_PROVIDER: Gtk.CssProvider | None = None
 
 _LIGHT_PALETTE = """
 /* 与 webui/static/app.css 的暖米色 / 青瓷青设计令牌保持一致。 */
@@ -193,35 +195,56 @@ def _dark_preferred() -> bool:
 
 
 def load_css(dark: bool | None = None) -> None:
-    global _CSS_PROVIDER
+    global _CSS_PROVIDER, _EXTERNAL_CSS_PROVIDER
     if dark is None:
         dark = _dark_preferred()
-    css_path = Path(__file__).with_name("style.css")
-    try:
-        rules = css_path.read_text(encoding="utf-8")
-    except OSError:
-        logger.warning("读取 GUI 样式失败", exc_info=True)
-        return
-    provider = Gtk.CssProvider()
-    try:
-        provider.load_from_string(
-            (_DARK_PALETTE if dark else _LIGHT_PALETTE) + "\n" + rules
-        )
-    except Exception:  # noqa: BLE001
-        logger.warning("加载 GUI 样式失败", exc_info=True)
-        return
     display = Gdk.Display.get_default()
     if display is None:
         return
-    if _CSS_PROVIDER is not None:
+    for provider in (_CSS_PROVIDER, _EXTERNAL_CSS_PROVIDER):
+        if provider is None:
+            continue
         try:
-            Gtk.StyleContext.remove_provider_for_display(display, _CSS_PROVIDER)
+            Gtk.StyleContext.remove_provider_for_display(display, provider)
         except Exception:  # noqa: BLE001
             pass
-    Gtk.StyleContext.add_provider_for_display(
-        display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
-    )
-    _CSS_PROVIDER = provider
+    _CSS_PROVIDER = None
+    _EXTERNAL_CSS_PROVIDER = None
+
+    skin = skin_theme.read_skin()
+    if skin != skin_theme.SYSTEM_SKIN:
+        css_path = Path(__file__).with_name("style.css")
+        try:
+            rules = css_path.read_text(encoding="utf-8")
+        except OSError:
+            logger.warning("读取 GUI 样式失败", exc_info=True)
+            rules = ""
+        if rules:
+            provider = Gtk.CssProvider()
+            try:
+                provider.load_from_string(
+                    (_DARK_PALETTE if dark else _LIGHT_PALETTE) + "\n" + rules
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning("加载 GUI 样式失败", exc_info=True)
+            else:
+                Gtk.StyleContext.add_provider_for_display(
+                    display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+                )
+                _CSS_PROVIDER = provider
+
+    external = skin_theme.external_theme_css()
+    if external:
+        provider = Gtk.CssProvider()
+        try:
+            provider.load_from_string(external)
+        except Exception:  # noqa: BLE001
+            logger.warning("加载外部 GTK4 主题失败", exc_info=True)
+        else:
+            Gtk.StyleContext.add_provider_for_display(
+                display, provider, Gtk.STYLE_PROVIDER_PRIORITY_USER
+            )
+            _EXTERNAL_CSS_PROVIDER = provider
 
 
 class MainWindow(Adw.ApplicationWindow):
@@ -1142,6 +1165,10 @@ class KarenApplication(Adw.Application):
 
     def _apply_theme(self) -> None:
         load_css(_dark_preferred())
+
+    def reload_skin(self) -> None:
+        """用户切换皮肤后重新加载 CSS；内置/外部主题都可即时生效。"""
+        self._apply_theme()
 
     def _on_activate(self, _app: Gio.Application) -> None:
         if self.window is not None:

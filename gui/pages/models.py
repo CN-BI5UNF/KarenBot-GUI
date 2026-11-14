@@ -953,9 +953,30 @@ class ModelsPage(Page):
                 return
             fetch_button.set_sensitive(False)
             status.set_text("正在获取模型列表…")
+            typed_key = bool(key_entry.get_text().strip())
+            # 连接参数没动过时直接用后端密钥库里的密钥；改过就必须走未保存配置，
+            # 否则会拿到旧地址的模型列表。
+            reuse_saved = (
+                editing
+                and not typed_key
+                and bool(current.get("has_key"))
+                and base_url.get_text().strip() == str(current.get("base_url") or "")
+                and (widgets.dropdown_value(protocol) or "openai_compat")
+                == (str(current.get("protocol") or "") or "openai_compat")
+                and widgets.dropdown_value(preset) == str(current.get("preset") or "")
+                and widgets.dropdown_value(vendor)
+                == str(current.get("model_vendor") or "")
+            )
             payload = _payload(for_probe=True)
+            saved_id = str(current.get("id") or "")
 
             def _do() -> dict[str, Any]:
+                if reuse_saved:
+                    return self.api.post(
+                        f"/api/providers/{_quote(saved_id)}/fetch-models",
+                        {},
+                        timeout=120,
+                    )
                 return self.api.post(
                     "/api/providers/fetch-models", payload, timeout=120
                 )

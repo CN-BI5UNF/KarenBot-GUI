@@ -171,22 +171,48 @@ class UpdatesPage(Page):
         self.available_card = widgets.card(spacing=5)
         self.body.append(self.available_card)
 
-        self.body.append(
-            widgets.section_header(
-                "远端版本", "标注了当前、可更新、可回退与兼容状态"
-            )
+        self.component_sections: dict[str, dict[str, Any]] = {}
+        self._frontend_key = "gui"
+        self._module_mode = False
+        self._build_component_section("backend", "后端更新")
+        self._build_component_section("frontend", "前端更新")
+        self.legacy_card = widgets.card(spacing=5)
+        self.legacy_card.append(
+            widgets.label("远端版本", css="section-title")
         )
-        self.releases_box = Gtk.Box(
+        self.legacy_releases_box = Gtk.Box(
             orientation=Gtk.Orientation.VERTICAL, spacing=8
         )
-        self.body.append(self.releases_box)
+        self.legacy_card.append(self.legacy_releases_box)
+        self.legacy_card.set_visible(False)
+        self.body.append(self.legacy_card)
         self.load_button = widgets.button(
-            "加载远端版本列表", icon="view-refresh-symbolic"
+            "加载全部远端版本", icon="view-refresh-symbolic"
         )
         self.load_button.connect(
             "clicked", lambda _b: self._load_releases(force=True)
         )
         self.body.append(self.load_button)
+
+    def _build_component_section(self, key: str, title: str) -> None:
+        card = widgets.card(spacing=4)
+        title_label = widgets.label(title, css="section-title")
+        info_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=2
+        )
+        releases_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=8
+        )
+        card.append(title_label)
+        card.append(info_box)
+        card.append(releases_box)
+        self.body.append(card)
+        self.component_sections[key] = {
+            "card": card,
+            "title": title_label,
+            "info": info_box,
+            "releases": releases_box,
+        }
 
     def refresh(self) -> None:
         if self.api is None:
@@ -221,21 +247,18 @@ class UpdatesPage(Page):
         available = data.get("available") or {}
         self.info_card.append(widgets.label("当前版本", css="section-title"))
         if status.get("mode") == "module":
+            self._module_mode = True
+            self.legacy_card.set_visible(False)
+            self._frontend_key = str(status.get("frontend") or "gui")
+            for section in self.component_sections.values():
+                section["card"].set_visible(True)
             self.info_card.append(
                 widgets.property_row(
                     "前端类型",
-                    str(status.get("frontend_label") or status.get("frontend") or ""),
+                    str(status.get("frontend_label") or self._frontend_key),
                 )
             )
-            for key, component in (status.get("components") or {}).items():
-                installed = component.get("installed") or {}
-                self.info_card.append(
-                    widgets.property_row(
-                        str(component.get("label") or key),
-                        f"{installed.get('version') or installed.get('tag') or '未记录'} · "
-                        f"{MODULE_REPO_TEXT.get(key, component.get('repo') or '')}",
-                    )
-                )
+            self._render_component_info(status)
             self.info_card.append(
                 widgets.property_row(
                     "更新仓库",
@@ -296,6 +319,10 @@ class UpdatesPage(Page):
             if not self._releases_loaded and not self._releases_busy:
                 self._load_releases(force=False)
             return
+        self._module_mode = False
+        self.legacy_card.set_visible(True)
+        for section in self.component_sections.values():
+            section["card"].set_visible(False)
         for name, value in (
             ("版本标签", version.get("version_label")),
             ("提交", version.get("commit_short") or version.get("commit")),
@@ -385,6 +412,49 @@ class UpdatesPage(Page):
             )
         if not self._releases_loaded and not self._releases_busy:
             self._load_releases(force=False)
+
+    def _render_component_info(self, status: dict[str, Any]) -> None:
+        components = status.get("components") or {}
+        frontend_label = str(status.get("frontend_label") or "前端")
+        self.component_sections["backend"]["title"].set_text("后端更新")
+        self.component_sections["frontend"]["title"].set_text(
+            f"{frontend_label} 更新"
+        )
+        self._fill_component_info(
+            "backend", components.get("backend") or {}
+        )
+        self._fill_component_info(
+            "frontend", components.get(self._frontend_key) or {}
+        )
+
+    def _fill_component_info(
+        self, section_key: str, component: dict[str, Any]
+    ) -> None:
+        box = self.component_sections[section_key]["info"]
+        widgets.clear(box)
+        if not component:
+            box.append(widgets.muted("未找到该组件的版本记录。"))
+            return
+        installed = component.get("installed") or {}
+        stable = component.get("latest_stable") or {}
+        prerelease = component.get("latest_prerelease") or {}
+        version = lambda item: (  # noqa: E731
+            str(item.get("version") or item.get("release_tag") or item.get("tag") or "—")
+        )
+        if component.get("update_available"):
+            state = "有稳定版可更新"
+        elif component.get("prerelease_available"):
+            state = "有 Pre-release 可手动选择"
+        else:
+            state = "已是最新"
+        for name, value in (
+            ("已安装", version(installed) if installed else "未记录"),
+            ("最新稳定版", version(stable)),
+            ("最新 Pre-release", version(prerelease)),
+            ("状态", state),
+            ("仓库", str(component.get("repo") or "—")),
+        ):
+            box.append(widgets.property_row(name, value))
 
     def _toggle_notify(self, switch: Gtk.Switch, *_args: Any) -> None:
         if self._notify_guard or self.api is None:
@@ -479,14 +549,37 @@ class UpdatesPage(Page):
             widgets.property_row("目标", target_name)
         )
         updates = [item for item in result.get("updates") or [] if isinstance(item, dict)]
+        grouped: dict[str, list[dict[str, Any]]] = {}
         for item in updates:
+            grouped.setdefault(str(item.get("component") or "other"), []).append(item)
+        for key, title in (
+            ("backend", "后端更新"),
+            (self._frontend_key, "前端更新"),
+        ):
+            items = grouped.pop(key, [])
+            if not items:
+                continue
             self.check_card.append(
-                widgets.property_row(
-                    _component_text(item) or "组件",
-                    _release_tag(item)
-                    + ("（Pre-release，极不稳定）" if item.get("prerelease") else ""),
-                )
+                widgets.label(title, css="section-title")
             )
+            for item in items:
+                self.check_card.append(
+                    widgets.property_row(
+                        _release_tag(item) or "版本",
+                        ("Pre-release，极不稳定" if item.get("prerelease") else "稳定版"),
+                    )
+                )
+        for key, items in grouped.items():
+            self.check_card.append(
+                widgets.label(f"其它组件（{key}）", css="section-title")
+            )
+            for item in items:
+                self.check_card.append(
+                    widgets.property_row(
+                        _release_tag(item) or "版本",
+                        _component_text(item) or key,
+                    )
+                )
         commit = str(
             result.get("target_commit_short")
             or result.get("target_commit")
@@ -573,8 +666,11 @@ class UpdatesPage(Page):
         self.load_button.set_sensitive(False)
         path = "/api/update/releases" + ("?force=true" if force else "")
         if not self._releases_loaded:
-            widgets.clear(self.releases_box)
-            self.releases_box.append(self.busy("正在读取远端版本…"))
+            for section in self.component_sections.values():
+                widgets.clear(section["releases"])
+                section["releases"].append(self.busy("正在读取远端版本…"))
+            widgets.clear(self.legacy_releases_box)
+            self.legacy_releases_box.append(self.busy("正在读取远端版本…"))
 
         def _do() -> dict[str, Any]:
             return self.api.get(path, timeout=330)
@@ -591,37 +687,82 @@ class UpdatesPage(Page):
             if self._releases_loaded:
                 self.toast(f"刷新远端版本失败：{exc}")
                 return
-            widgets.clear(self.releases_box)
-            self.releases_box.append(
+            for section in self.component_sections.values():
+                widgets.clear(section["releases"])
+                section["releases"].append(
+                    widgets.muted(f"加载远端版本失败：{exc}")
+                )
+                retry = widgets.button("重试")
+                retry.connect(
+                    "clicked", lambda _b: self._load_releases(force=False)
+                )
+                section["releases"].append(retry)
+            widgets.clear(self.legacy_releases_box)
+            self.legacy_releases_box.append(
                 widgets.muted(f"加载远端版本失败：{exc}")
             )
-            retry = widgets.button("重试")
-            retry.connect(
-                "clicked", lambda _b: self._load_releases(force=False)
-            )
-            self.releases_box.append(retry)
 
         widgets.run_async(_do, on_success=_done, on_error=_failed)
 
     def _render_releases(self, data: dict[str, Any]) -> None:
-        widgets.clear(self.releases_box)
+        for section in self.component_sections.values():
+            widgets.clear(section["releases"])
+        widgets.clear(self.legacy_releases_box)
         self._release_buttons = []
         errors = data.get("errors") or {}
-        if errors:
-            self.releases_box.append(
-                widgets.label(
-                    "部分仓库读取失败："
-                    + "；".join(f"{key}: {value}" for key, value in errors.items()),
-                    css="danger-text",
-                    wrap=True,
-                )
-            )
         releases = data.get("releases") or []
-        if not releases:
-            self.releases_box.append(widgets.muted("远端没有可用版本。"))
+        if not self._module_mode:
+            if errors:
+                self.legacy_releases_box.append(
+                    widgets.label(
+                        "部分仓库读取失败："
+                        + "；".join(
+                            f"{key}: {value}" for key, value in errors.items()
+                        ),
+                        css="danger-text",
+                        wrap=True,
+                    )
+                )
+            if not releases:
+                self.legacy_releases_box.append(
+                    widgets.muted("远端没有可用版本。")
+                )
+            for release in releases:
+                self.legacy_releases_box.append(self._release_card(release))
             return
+        groups: dict[str, list[dict[str, Any]]] = {}
         for release in releases:
-            self.releases_box.append(self._release_card(release))
+            key = str(release.get("component") or "")
+            groups.setdefault(key, []).append(release)
+        section_keys = {
+            "backend": "backend",
+            "frontend": self._frontend_key,
+        }
+        for section_name, section in self.component_sections.items():
+            component_key = section_keys[section_name]
+            box = section["releases"]
+            if errors.get(component_key):
+                box.append(
+                    widgets.label(
+                        f"{component_key} 仓库读取失败：{errors[component_key]}",
+                        css="danger-text",
+                        wrap=True,
+                    )
+                )
+            items = groups.pop(component_key, [])
+            if not items:
+                box.append(
+                    widgets.muted("该组件在远端还没有可用版本。")
+                )
+            for release in items:
+                box.append(self._release_card(release))
+        # 未知组件（例如未来新增前端）统一放在前端区域，避免静默丢失。
+        leftovers = [item for values in groups.values() for item in values]
+        if leftovers:
+            box = self.component_sections["frontend"]["releases"]
+            box.append(widgets.muted("其它组件版本："))
+            for release in leftovers:
+                box.append(self._release_card(release))
 
     def _release_card(self, release: dict[str, Any]) -> Gtk.Widget:
         card = widgets.card(spacing=5)

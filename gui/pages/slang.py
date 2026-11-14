@@ -52,7 +52,7 @@ class SlangPage(Page):
         )
         self.conversation_entry.connect("activate", lambda _e: self.refresh())
         self.search_entry = Gtk.SearchEntry()
-        self.search_entry.set_placeholder_text("搜索词条、释义、用法…")
+        self.search_entry.set_property("placeholder-text", "搜索词条、释义、用法…")
         self.search_entry.set_hexpand(True)
         self.search_entry.connect("search-changed", lambda _e: self._schedule_search())
         self.status_filter = widgets.dropdown(

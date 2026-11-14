@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.1.1-alpha.1 — 2026-11-15
+
+- 与 `KarenBot-backend`、`KarenBot-WebUI` 的 v0.1.1-alpha.1 配套。
+- GUI 注册为前端插件：`gui/plugin.json` + `gui/plugin.py`，支持 `python main.py --frontend gui` 统一入口。
+- 更新页把“后端更新”和“GUI 前端更新”拆成独立区块，分别展示版本、状态和 Release 列表。
+- 新增启动器渲染回退（`gui/launcher.py`）、字体/fontconfig、主题管理；设置页增加外观主题。
+- 聊天页支持分页、附件图片预览/大图、文件默认应用打开或定位目录。
+- 同步最新页面修复与设置兼容性改动。
+
 ## v0.1.1-alpha — 2026-11-13
 
 首个公开发布版本。
