@@ -1351,7 +1351,24 @@ class ChatsPage(Page):
             if not isinstance(raw_att, dict):
                 continue
             path = str(raw_att.get("path") or "")
-            if not path:
+            missing = bool(raw_att.get("missing"))
+            if missing or not path:
+                name = self._attachment_name(raw_att)
+                row = Gtk.Box(
+                    orientation=Gtk.Orientation.HORIZONTAL, spacing=6
+                )
+                row.add_css_class("chat-file-attachment")
+                row.append(widgets.label(name, ellipsize=True))
+                reason = str(
+                    raw_att.get("missing_reason")
+                    or "原图/文件已被清理，无法预览"
+                )
+                row.append(widgets.label(reason, css="muted"))
+                if raw_att.get("remote_url"):
+                    row.append(widgets.label(
+                        "可在 WebUI 中尝试从原链接恢复", css="muted"
+                    ))
+                box.append(row)
                 continue
             name = self._attachment_name(raw_att)
             kind = str(raw_att.get("kind") or "file")
