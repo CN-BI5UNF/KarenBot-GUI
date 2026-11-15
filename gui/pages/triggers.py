@@ -153,14 +153,17 @@ class TriggersPage(Page):
         group_entry.connect("changed", lambda *_: self._mark_dirty())
         if rule.get("group_id"):
             group_entry.set_tooltip_text("群号是规则身份；要修改请移除后重新添加")
-        max_spin = Gtk.SpinButton.new_with_range(0, 1000, 1)
-        max_spin.set_value(int(rule.get("max_messages") or 0))
+        max_spin = widgets.spin_button(
+            0, 1000, 1, value=int(rule.get("max_messages") or 0)
+        )
         max_spin.set_tooltip_text("0 表示不限条数")
-        window_spin = Gtk.SpinButton.new_with_range(0, 1440, 1)
-        window_spin.set_value(int(rule.get("window_minutes") or 0))
+        window_spin = widgets.spin_button(
+            0, 1440, 1, value=int(rule.get("window_minutes") or 0)
+        )
         window_spin.set_tooltip_text("0 表示不限时间")
-        cache_spin = Gtk.SpinButton.new_with_range(0, 500, 1)
-        cache_spin.set_value(int(rule.get("cache_messages") or 0))
+        cache_spin = widgets.spin_button(
+            0, 500, 1, value=int(rule.get("cache_messages") or 0)
+        )
         cache_spin.set_tooltip_text("0 表示不缓存被过滤消息")
         for spin in (max_spin, window_spin, cache_spin):
             spin.connect("value-changed", lambda *_: self._mark_dirty())

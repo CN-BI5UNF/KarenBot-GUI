@@ -258,15 +258,16 @@ class KnowledgePage(Page):
             str((entry or {}).get("status") or "active"),
         )
         shared = widgets.switch(bool((entry or {}).get("shared")))
-        confidence = Gtk.SpinButton.new_with_range(0, 1, 0.05)
-        confidence.set_digits(2)
         raw_confidence = (entry or {}).get("confidence")
         if raw_confidence is None:
             raw_confidence = 1.0
         try:
-            confidence.set_value(float(raw_confidence))
+            confidence_value = float(raw_confidence)
         except (TypeError, ValueError):
-            confidence.set_value(1.0)
+            confidence_value = 1.0
+        confidence = widgets.spin_button(
+            0, 1, 0.05, value=confidence_value, digits=2
+        )
         window.add_row("类型", kind)
         window.add_row("标题", title)
         window.add_row("内容", content)

@@ -80,6 +80,7 @@ class SettingsPage(Page):
         self.restart_hint.set_visible(False)
         self.body.append(self.restart_hint)
         self._skin_updating = False
+        self._font_scale_source = 0
         self.appearance_card = widgets.card(spacing=8)
         self.appearance_card.append(
             widgets.section_header(
@@ -99,6 +100,33 @@ class SettingsPage(Page):
         refresh_skins.connect("clicked", lambda _b: self._refresh_skin_options())
         skin_row.append(refresh_skins)
         self.appearance_card.append(skin_row)
+
+        font_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        font_row.append(widgets.label("字体大小", css="field-label"))
+        current_scale = skin_theme.read_font_scale()
+        self.font_scale_spin = widgets.spin_button(
+            80,
+            160,
+            5,
+            value=round(current_scale * 100),
+            digits=0,
+        )
+        self.font_scale_spin.set_tooltip_text(
+            "80%–160%；只影响界面文字，不改动系统字体。"
+        )
+        self.font_scale_spin.connect(
+            "value-changed", self._on_font_scale_changed
+        )
+        font_row.append(self.font_scale_spin)
+        font_row.append(widgets.muted("%"))
+        reset_font = widgets.button("恢复 100%")
+        reset_font.connect(
+            "clicked",
+            lambda _b: self.font_scale_spin.set_value(100),
+        )
+        font_row.append(reset_font)
+        font_row.append(widgets.muted("修改后立即生效"))
+        self.appearance_card.append(font_row)
         self.body.append(self.appearance_card)
         # 分组导航与字段区可拖动分隔条调整占比；默认只占 156px，
         # 给右侧正文留更多宽度（WebUI 的设置导航也是窄栏）。
@@ -345,6 +373,21 @@ class SettingsPage(Page):
         self.app.reload_skin()
         self.toast("外观主题已切换")
 
+    def _on_font_scale_changed(self, spin: Gtk.SpinButton) -> None:
+        value = round(float(spin.get_value()) / 100.0, 2)
+        if abs(value - skin_theme.read_font_scale()) < 0.005:
+            return
+        skin_theme.write_font_scale(value)
+        if self._font_scale_source:
+            GLib.source_remove(self._font_scale_source)
+        # 拖动/连点时合并刷新，避免每个刻度都重建 CSS provider。
+        self._font_scale_source = GLib.timeout_add(150, self._apply_font_scale)
+
+    def _apply_font_scale(self) -> bool:
+        self._font_scale_source = 0
+        self.app.reload_skin()
+        return False
+
     def _refresh_skin_options(self) -> None:
         current = skin_theme.read_skin()
         self._skin_updating = True
@@ -577,18 +620,22 @@ class SettingsPage(Page):
             step = float(
                 field.get("step") or (0.1 if is_float else 1)
             )
-            control = Gtk.SpinButton.new_with_range(low, high, step)
-            control.set_digits(
-                int(field.get("digits", 2 if is_float else 0))
-                if is_float
-                else 0
-            )
-            control.set_numeric(True)
-            control.set_halign(Gtk.Align.START)
             try:
-                control.set_value(float(value if value is not None else low))
+                initial = float(value if value is not None else low)
             except (TypeError, ValueError):
-                control.set_value(low)
+                initial = low
+            control = widgets.spin_button(
+                low,
+                high,
+                step,
+                value=initial,
+                digits=(
+                    int(field.get("digits", 2 if is_float else 0))
+                    if is_float
+                    else 0
+                ),
+            )
+            control.set_halign(Gtk.Align.START)
             last = [control.get_value()]
 
             def _spin_commit(

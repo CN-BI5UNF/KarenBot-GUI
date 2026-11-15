@@ -75,6 +75,48 @@ SUB_AGENTS = [
     ("persona_gen", "人格生成", "后台按时间慢慢丰满人格设定。", 0.7, 8192),
 ]
 
+PROVIDER_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
+URL_RE = re.compile(r"^https?://[^\s]+$", re.IGNORECASE)
+HOST_RE = re.compile(r"^[A-Za-z0-9.-]+(?::[0-9]{1,5})?$")
+
+
+def _ascii_field_problem(value: str, field_name: str) -> str | None:
+    """API Key / 模型 ID 等字段只接受可见 ASCII，中文填写会直接报错。"""
+    text = str(value or "")
+    if not text:
+        return None
+    if not text.isascii() or any(ord(ch) < 33 or ord(ch) > 126 for ch in text):
+        return f"{field_name}只能填写英文、数字和常见符号，不能包含中文或空格。"
+    return None
+
+
+def _model_problem(value: str, field_name: str = "模型 ID") -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    problem = _ascii_field_problem(text, field_name)
+    if problem:
+        return problem
+    if not MODEL_ID_RE.match(text):
+        return (
+            f"{field_name}格式不正确：应以英文字母或数字开头，"
+            "只能包含英文字母、数字和 . _ : / @ + -。"
+        )
+    return None
+
+
+def _url_problem(value: str, field_name: str) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    problem = _ascii_field_problem(text, field_name)
+    if problem:
+        return problem
+    if not URL_RE.match(text):
+        return f"{field_name}必须以 http:// 或 https:// 开头，且不能包含空格。"
+    return None
+
 
 class SetupPage(Page):
     page_id = "setup"
@@ -154,6 +196,14 @@ class SetupPage(Page):
         footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.back_button = widgets.button("上一步")
         self.back_button.connect("clicked", lambda _b: self._go_back())
+        self.reset_button = widgets.button("恢复默认")
+        self.reset_button.set_tooltip_text("清空本次向导填写的内容并回到第一步")
+        self.reset_button.connect("clicked", lambda _b: self._confirm_reset())
+        self.defer_button = widgets.button("稍后配置")
+        self.defer_button.set_tooltip_text(
+            "不写配置直接进入控制台；Runtime 不会启动，可随时回来继续配置"
+        )
+        self.defer_button.connect("clicked", lambda _b: self._confirm_defer())
         self.skip_button = widgets.button("跳过")
         self.skip_button.connect("clicked", lambda _b: self._skip())
         self.next_button = widgets.button("下一步", css="suggested-action")
@@ -161,7 +211,9 @@ class SetupPage(Page):
         spacer = Gtk.Box()
         spacer.set_hexpand(True)
         footer.append(self.back_button)
+        footer.append(self.reset_button)
         footer.append(spacer)
+        footer.append(self.defer_button)
         footer.append(self.skip_button)
         footer.append(self.next_button)
         self.body.append(footer)
@@ -461,20 +513,55 @@ class SetupPage(Page):
             self.next_button.set_sensitive(False)
             self.back_button.set_sensitive(False)
             self.skip_button.set_sensitive(False)
+            self.reset_button.set_sensitive(False)
+            self.defer_button.set_sensitive(False)
         else:
             self.next_button.set_sensitive(self._progress_ok)
             self.back_button.set_sensitive(self._current != "welcome")
             self.skip_button.set_sensitive(self._progress_ok)
+            self.reset_button.set_sensitive(True)
+            self.defer_button.set_sensitive(True)
 
     def _set_ready(self, ready: bool) -> None:
         self.next_button.set_sensitive(ready and self._progress_ok)
         self.back_button.set_sensitive(False)
         self.skip_button.set_sensitive(ready and self._progress_ok)
+        self.reset_button.set_sensitive(ready)
+        self.defer_button.set_sensitive(ready)
 
     def _set_error(self, message: str) -> None:
         self._error = message
         self.error_label.set_text(message)
         self.error_label.set_visible(bool(message))
+
+    def _confirm_reset(self) -> None:
+        if self._busy:
+            return
+        widgets.ConfirmDialog(
+            self.app.window,
+            heading="恢复默认设置？",
+            body=(
+                "将清空本次向导填写的 API Key、模型、功能开关、渠道与人格设置，"
+                "并回到第一步。此操作不可撤销。"
+            ),
+            confirm_label="恢复默认",
+            destructive=True,
+            on_confirm=self._reset_defaults,
+        )
+
+    def _reset_defaults(self) -> None:
+        if self._busy:
+            return
+        if self._options:
+            self._render_options(self._options)
+        else:
+            self.refresh()
+        self.toast("已恢复默认设置")
+
+    def _confirm_defer(self) -> None:
+        if self._busy:
+            return
+        self.app.request_defer_setup()
 
     # ------------------------------------------------------------------
     # Field helpers
@@ -742,11 +829,17 @@ class SetupPage(Page):
     def _validate_provider_quick(self) -> str | None:
         if not self._provider.get("api_key"):
             return "还没填 API Key。"
+        problem = _ascii_field_problem(
+            str(self._provider.get("api_key") or ""), "API Key"
+        )
+        if problem:
+            return problem
         if not self._provider.get("model"):
             return "还没选择模型。"
-        if not re.match(
-            r"^[a-z][a-z0-9_-]{0,63}$", str(self._provider.get("id") or "")
-        ):
+        problem = _model_problem(str(self._provider.get("model") or ""))
+        if problem:
+            return problem
+        if not PROVIDER_ID_RE.match(str(self._provider.get("id") or "")):
             return "Provider ID 只能用小写字母开头，后跟小写字母、数字、下划线或短横线。"
         return None
 
@@ -855,8 +948,13 @@ class SetupPage(Page):
             ),
         )
         key_row.append(key_toggle)
-        timeout = Gtk.SpinButton.new_with_range(5, 600, 1)
-        timeout.set_value(float(self._provider.get("timeout_seconds") or 120))
+        timeout = widgets.spin_button(
+            5,
+            600,
+            1,
+            value=float(self._provider.get("timeout_seconds") or 120),
+            digits=0,
+        )
         timeout.connect(
             "value-changed",
             lambda spin: self._provider.__setitem__(
@@ -956,19 +1054,28 @@ class SetupPage(Page):
         self._validate_step = self._validate_provider_custom
 
     def _validate_provider_custom(self) -> str | None:
-        if not re.match(
-            r"^[a-z][a-z0-9_-]{0,63}$", str(self._provider.get("id") or "")
-        ):
+        if not PROVIDER_ID_RE.match(str(self._provider.get("id") or "")):
             return "Provider ID 只能用小写字母开头，后跟小写字母、数字、下划线或短横线。"
         if not self._provider.get("api_key"):
             return "还没填 API Key。"
+        problem = _ascii_field_problem(
+            str(self._provider.get("api_key") or ""), "API Key"
+        )
+        if problem:
+            return problem
         if not self._provider.get("model"):
             return "还没填模型 ID。"
-        if (
-            not self._provider.get("preset")
-            and not self._provider.get("base_url")
-        ):
-            return "自定义提供商必须填写 Base URL。"
+        problem = _model_problem(str(self._provider.get("model") or ""))
+        if problem:
+            return problem
+        if not self._provider.get("preset"):
+            if not self._provider.get("base_url"):
+                return "自定义提供商必须填写 Base URL。"
+            problem = _url_problem(
+                str(self._provider.get("base_url") or ""), "Base URL"
+            )
+            if problem:
+                return problem
         return None
 
     # ------------------------------------------------------------------
@@ -980,6 +1087,10 @@ class SetupPage(Page):
                 "这三个可以各自用不同的模型。不折腾的话让它们跟随主模型就行。"
             )
         )
+        main_provider = str(self._provider.get("id") or "")
+        provider_options = [("", "跟随主模型")]
+        if main_provider:
+            provider_options.append((main_provider, main_provider))
         for key, label, desc, default_temp, default_tokens in SUB_AGENTS:
             cfg = self._agents.setdefault(
                 key,
@@ -991,6 +1102,11 @@ class SetupPage(Page):
                     "max_tokens": default_tokens,
                 },
             )
+            # 主 provider ID 可能在上一步被改过；旧值已不存在时回到“跟随主模型”。
+            if str(cfg.get("provider") or "") not in {
+                value for value, _name in provider_options
+            }:
+                cfg["provider"] = ""
             card, toggle = self._switch_row(label, desc, bool(cfg.get("enabled", True)))
             toggle.connect(
                 "notify::active",
@@ -998,17 +1114,17 @@ class SetupPage(Page):
                     "enabled", bool(widget.get_active())
                 ),
             )
-            provider = Gtk.Entry()
-            provider.set_placeholder_text("留空跟随主模型")
-            provider.set_text(str(cfg.get("provider") or ""))
+            provider = widgets.dropdown(
+                provider_options, str(cfg.get("provider") or "")
+            )
             provider.connect(
-                "changed",
-                lambda entry, c=cfg: c.__setitem__(
-                    "provider", entry.get_text().strip()
+                "notify::selected",
+                lambda _widget, _pspec, c=cfg, w=provider: c.__setitem__(
+                    "provider", widgets.dropdown_value(w)
                 ),
             )
             model = Gtk.Entry()
-            model.set_placeholder_text("留空跟随主模型")
+            model.set_placeholder_text("留空跟随主模型（仅英文模型 ID）")
             model.set_text(str(cfg.get("model") or ""))
             model.connect(
                 "changed",
@@ -1034,11 +1150,43 @@ class SetupPage(Page):
                     "max_tokens", int(spin.get_value())
                 ),
             )
-            card.append(self._field("提供商 ID", provider))
-            card.append(self._field("模型 ID", model))
+            card.append(
+                self._field(
+                    "提供商",
+                    provider,
+                    "首次配置只创建主 provider；这里只能跟随主模型。",
+                )
+            )
+            card.append(
+                self._field(
+                    "模型 ID",
+                    model,
+                    "留空即跟随主模型；填写时只能使用英文/数字和 . _ : / @ + -。",
+                )
+            )
             card.append(self._field("温度", temp))
             card.append(self._field("最大输出 token", tokens))
             self._add(card)
+        self._validate_step = self._validate_agents
+
+    def _validate_agents(self) -> str | None:
+        main_provider = str(self._provider.get("id") or "")
+        for key, label, _desc, _temp, _tokens in SUB_AGENTS:
+            cfg = self._agents.get(key) or {}
+            if not cfg.get("enabled", True):
+                continue
+            provider = str(cfg.get("provider") or "")
+            if provider and provider != main_provider:
+                return (
+                    f"「{label}」引用了未定义的 provider「{provider}」；"
+                    "请选择“跟随主模型”，或先在上一步创建该 provider。"
+                )
+            problem = _model_problem(
+                str(cfg.get("model") or ""), "子 Agent 模型 ID"
+            )
+            if problem:
+                return f"「{label}」：{problem}"
+        return None
 
     # ------------------------------------------------------------------
     # Step: features
@@ -1101,13 +1249,22 @@ class SetupPage(Page):
             default_provider = str(self._provider.get("id") or "")
             if default_provider and not section.get("provider"):
                 section["provider"] = default_provider
-            provider = Gtk.Entry()
-            provider.set_placeholder_text("已有 provider ID（可复用其密钥/地址）")
-            provider.set_text(str(section.get("provider") or ""))
+            vision_provider_options = [("", "使用独立 Base URL / 密钥")]
+            if default_provider:
+                vision_provider_options.insert(
+                    0, (default_provider, f"{default_provider}（复用主 provider）")
+                )
+            if str(section.get("provider") or "") not in {
+                value for value, _name in vision_provider_options
+            }:
+                section["provider"] = ""
+            provider = widgets.dropdown(
+                vision_provider_options, str(section.get("provider") or "")
+            )
             provider.connect(
-                "changed",
-                lambda entry: section.__setitem__(
-                    "provider", entry.get_text().strip()
+                "notify::selected",
+                lambda _widget, _pspec, s=section, w=provider: s.__setitem__(
+                    "provider", widgets.dropdown_value(w)
                 ),
             )
             base_url = Gtk.Entry()
@@ -1160,9 +1317,27 @@ class SetupPage(Page):
                 limits["max_images_per_request"] = int(spin.get_value())
 
             max_images.connect("value-changed", _set_max_images)
-            card.append(self._field("视觉 provider", provider))
-            card.append(self._field("视觉模型", model))
-            card.append(self._field("独立 Base URL", base_url))
+            card.append(
+                self._field(
+                    "视觉 provider",
+                    provider,
+                    "复用主 provider 的密钥/地址，或留空并在下面单独填写端点。",
+                )
+            )
+            card.append(
+                self._field(
+                    "视觉模型",
+                    model,
+                    "仅英文模型 ID，例如 glm-4v / qwen-vl-max。",
+                )
+            )
+            card.append(
+                self._field(
+                    "独立 Base URL",
+                    base_url,
+                    "可选；必须以 http:// 或 https:// 开头。",
+                )
+            )
             card.append(self._field("独立 API Key", api_key))
             card.append(
                 self._field(
@@ -1308,6 +1483,28 @@ class SetupPage(Page):
                 return "启用独立视觉后必须填写视觉模型 ID。"
             # provider 留空时后端会继承主 provider 的地址与密钥；只有
             # 用户显式填写自定义端点时才需要额外配置。
+            problem = _model_problem(
+                str(vision.get("model") or ""), "视觉模型 ID"
+            )
+            if problem:
+                return problem
+            problem = _url_problem(
+                str(vision.get("base_url") or ""), "视觉 Base URL"
+            )
+            if problem:
+                return problem
+            problem = _ascii_field_problem(
+                str(vision.get("api_key") or ""), "视觉 API Key"
+            )
+            if problem:
+                return problem
+            vision_provider = str(vision.get("provider") or "")
+            main_provider = str(self._provider.get("id") or "")
+            if vision_provider and vision_provider != main_provider:
+                return (
+                    "视觉 provider 必须是已定义的 provider；"
+                    "请选择主 provider，或留空并填写独立端点。"
+                )
         search = self._features.get("web_search") or {}
         if search.get("enabled"):
             provider = str(search.get("provider") or "bing_rss")
@@ -1315,9 +1512,26 @@ class SetupPage(Page):
                 search.get("searxng_base_url") or ""
             ).strip():
                 return "选择 SearXNG 后必须填写实例地址。"
+            problem = _url_problem(
+                str(search.get("searxng_base_url") or ""), "SearXNG 地址"
+            )
+            if problem:
+                return problem
         weather = self._features.get("weather") or {}
-        if weather.get("enabled") and not weather.get("api_key"):
-            return "启用天气后必须填写和风天气 API Key。"
+        if weather.get("enabled"):
+            if not weather.get("api_key"):
+                return "启用天气后必须填写和风天气 API Key。"
+            problem = _ascii_field_problem(
+                str(weather.get("api_key") or ""), "和风天气 API Key"
+            )
+            if problem:
+                return problem
+            host = str(weather.get("host") or "devapi.qweather.com").strip()
+            if not HOST_RE.match(host):
+                return (
+                    "天气 API 主机只能填写域名（可带端口），"
+                    "例如 devapi.qweather.com，不要带 http://。"
+                )
         tts = self._features.get("tts") or {}
         if tts.get("enabled"):
             if str(tts.get("type") or "api") == "api":
@@ -1325,8 +1539,19 @@ class SetupPage(Page):
                     "api_key"
                 ):
                     return "讯飞 TTS 需要填写 API Key。"
+                problem = _ascii_field_problem(
+                    str(tts.get("api_key") or ""), "TTS API Key"
+                )
+                if problem:
+                    return problem
             elif not str(tts.get("local_model") or "").strip():
                 return "本地 TTS 需要填写本地模型名。"
+            else:
+                problem = _model_problem(
+                    str(tts.get("local_model") or ""), "本地 TTS 模型名"
+                )
+                if problem:
+                    return problem
         return None
 
     # ------------------------------------------------------------------
@@ -1371,13 +1596,21 @@ class SetupPage(Page):
         )
         self._add(self._field("Embedding 类型", emb_type))
         if str(embedding.get("type") or "api") == "api":
-            provider = Gtk.Entry()
-            provider.set_placeholder_text("引用一个支持 embeddings 的 provider ID")
-            provider.set_text(str(embedding.get("provider") or ""))
+            main_provider = str(self._provider.get("id") or "")
+            if main_provider and not embedding.get("provider"):
+                embedding["provider"] = main_provider
+            if str(embedding.get("provider") or "") != main_provider:
+                embedding["provider"] = ""
+            provider = widgets.dropdown(
+                [("", "请选择 provider"), (main_provider, main_provider)]
+                if main_provider
+                else [("", "没有可用的 provider")],
+                str(embedding.get("provider") or ""),
+            )
             provider.connect(
-                "changed",
-                lambda entry: embedding.__setitem__(
-                    "provider", entry.get_text().strip()
+                "notify::selected",
+                lambda _widget, _pspec, s=embedding, w=provider: s.__setitem__(
+                    "provider", widgets.dropdown_value(w)
                 ),
             )
             model = Gtk.Entry()
@@ -1390,8 +1623,12 @@ class SetupPage(Page):
                 ),
             )
             self._add(
-                self._field("provider", provider),
-                self._field("模型", model),
+                self._field(
+                    "provider",
+                    provider,
+                    "首次配置只有主 provider；它必须支持 embeddings。",
+                ),
+                self._field("模型", model, "仅英文模型 ID。"),
             )
         else:
             quality = widgets.dropdown(
@@ -1420,11 +1657,20 @@ class SetupPage(Page):
         if str(memory.get("mode") or "file") != "rag":
             return None
         embedding = self._features.get("embedding") or {}
-        if (
-            str(embedding.get("type") or "api") == "api"
-            and not embedding.get("provider")
-        ):
-            return "选了向量检索，就得填一个 embedding provider。"
+        if str(embedding.get("type") or "api") == "api":
+            if not embedding.get("provider"):
+                return "选了向量检索，就得选择一个 embedding provider。"
+            main_provider = str(self._provider.get("id") or "")
+            if str(embedding.get("provider")) != main_provider:
+                return (
+                    "embedding provider 必须是已定义的 provider；"
+                    "请选择主 provider，或先回到上一步创建。"
+                )
+            problem = _model_problem(
+                str(embedding.get("api_model") or ""), "Embedding 模型 ID"
+            )
+            if problem:
+                return problem
         return None
 
     # ------------------------------------------------------------------
@@ -1759,6 +2005,7 @@ class SetupPage(Page):
         )
         for validator in (
             provider_validator,
+            self._validate_agents,
             self._validate_features,
             self._validate_embedding,
         ):
@@ -1824,10 +2071,18 @@ class SetupPage(Page):
             if not cfg.get("enabled", True):
                 agents[key] = {"enabled": False}
                 continue
+            agent_provider = str(cfg.get("provider") or "")
+            if agent_provider != provider_id:
+                # 首次配置只创建主 provider；旧值/手填值一律回落到主模型，
+                # 避免后端 RootConfig 报“provider 未在 providers 中定义”。
+                agent_provider = provider_id
+            agent_model = str(cfg.get("model") or "").strip()
+            if not MODEL_ID_RE.match(agent_model):
+                agent_model = ""
             agents[key] = {
                 "enabled": True,
-                "provider": cfg.get("provider") or provider_id,
-                "model": cfg.get("model") or provider.get("model") or "",
+                "provider": agent_provider,
+                "model": agent_model or provider.get("model") or "",
                 "temperature": float(cfg.get("temperature") or 0.3),
                 "max_tokens": int(cfg.get("max_tokens") or 4096),
             }
@@ -1849,13 +2104,16 @@ class SetupPage(Page):
             },
         }
         if vision.get("enabled"):
+            vision_provider = str(vision.get("provider") or "")
+            if vision_provider != provider_id:
+                vision_provider = ""
             vision_payload = {
                 "enabled": True,
                 "type": "api",
                 **vision_common,
-                "provider": vision.get("provider") or None,
-                "model": str(vision.get("model") or ""),
-                "base_url": vision.get("base_url") or None,
+                "provider": vision_provider or None,
+                "model": str(vision.get("model") or "").strip(),
+                "base_url": str(vision.get("base_url") or "").strip() or None,
             }
             if vision.get("api_key"):
                 vision_payload["api_key"] = str(vision["api_key"])
@@ -1915,11 +2173,14 @@ class SetupPage(Page):
         }
         embedding = self._features.get("embedding") or {}
         if str(memory.get("mode") or "file") == "rag":
+            embedding_provider = str(embedding.get("provider") or "")
+            if embedding_provider != provider_id:
+                embedding_provider = ""
             features["embedding"] = {
                 "enabled": True,
                 "type": str(embedding.get("type") or "api"),
-                "provider": embedding.get("provider") or None,
-                "api_model": str(embedding.get("api_model") or ""),
+                "provider": embedding_provider or None,
+                "api_model": str(embedding.get("api_model") or "").strip(),
                 "local_quality": str(
                     embedding.get("local_quality") or "performance"
                 ),
@@ -1973,19 +2234,19 @@ class SetupPage(Page):
 
 
 def _int_spin(low: int, high: int, value: int) -> Gtk.SpinButton:
-    spin = Gtk.SpinButton.new_with_range(low, high, 1)
-    spin.set_numeric(True)
-    spin.set_value(int(value))
-    return spin
+    return widgets.spin_button(low, high, 1, value=int(value), digits=0)
 
 
 def _float_spin(
     low: float, high: float, step: float, value: float
 ) -> Gtk.SpinButton:
-    spin = Gtk.SpinButton.new_with_range(low, high, step)
-    spin.set_digits(2 if step < 0.1 else 1)
-    spin.set_value(float(value))
-    return spin
+    return widgets.spin_button(
+        low,
+        high,
+        step,
+        value=float(value),
+        digits=2 if step < 0.1 else 1,
+    )
 
 
 def _parse_ids(text: str) -> list[int]:

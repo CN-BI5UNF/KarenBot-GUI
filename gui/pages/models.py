@@ -682,12 +682,16 @@ class ModelsPage(Page):
             REASONING_EFFORT_STYLES,
             str(current.get("reasoning_effort_style") or ""),
         )
-        timeout = Gtk.SpinButton.new_with_range(1, 3600, 1)
-        timeout.set_numeric(True)
-        timeout.set_value(
-            120.0
-            if current.get("timeout_seconds") is None
-            else float(current["timeout_seconds"])
+        timeout = widgets.spin_button(
+            1,
+            3600,
+            1,
+            value=(
+                120.0
+                if current.get("timeout_seconds") is None
+                else float(current["timeout_seconds"])
+            ),
+            digits=0,
         )
         model_entry = Gtk.Entry()
         model_entry.set_placeholder_text("模型 ID，例如 deepseek-chat")
@@ -1163,19 +1167,32 @@ class ModelsPage(Page):
         budget = widgets.dropdown(budget_options, initial_budget)
 
         temperature_value = agent.get("temperature")
-        temperature = Gtk.SpinButton.new_with_range(0, 2, 0.05)
-        temperature.set_digits(2)
-        temperature.set_value(
-            0.0 if temperature_value is None else float(temperature_value)
+        temperature = widgets.spin_button(
+            0,
+            2,
+            0.05,
+            value=(
+                0.0 if temperature_value is None else float(temperature_value)
+            ),
+            digits=2,
         )
         top_p_value = agent.get("top_p")
-        top_p = Gtk.SpinButton.new_with_range(0, 1, 0.05)
-        top_p.set_digits(2)
-        top_p.set_value(1.0 if top_p_value is None else float(top_p_value))
+        top_p = widgets.spin_button(
+            0,
+            1,
+            0.05,
+            value=1.0 if top_p_value is None else float(top_p_value),
+            digits=2,
+        )
         max_tokens_value = agent.get("max_tokens")
-        max_tokens = Gtk.SpinButton.new_with_range(1, 1_000_000, 256)
-        max_tokens.set_value(
-            4096.0 if max_tokens_value is None else float(max_tokens_value)
+        max_tokens = widgets.spin_button(
+            1,
+            1_000_000,
+            256,
+            value=(
+                4096.0 if max_tokens_value is None else float(max_tokens_value)
+            ),
+            digits=0,
         )
         reasoning_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         reasoning_switch = widgets.switch(bool(agent.get("reasoning")))
@@ -1183,10 +1200,12 @@ class ModelsPage(Page):
         reasoning_row.append(widgets.label("启用思考 / reasoning"))
         budget_hint = widgets.muted("")
         timeout_value = agent.get("first_token_timeout_seconds")
-        timeout = Gtk.SpinButton.new_with_range(1, 1800, 1)
-        timeout.set_numeric(True)
-        timeout.set_value(
-            120.0 if timeout_value is None else float(timeout_value)
+        timeout = widgets.spin_button(
+            1,
+            1800,
+            1,
+            value=120.0 if timeout_value is None else float(timeout_value),
+            digits=0,
         )
         window.add_row("Provider", provider)
         window.add_row("模型", model_row)

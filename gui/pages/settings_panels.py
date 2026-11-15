@@ -99,14 +99,14 @@ def _spin(
     step: float = 1.0,
     digits: int = 0,
 ) -> Gtk.SpinButton:
-    control = Gtk.SpinButton.new_with_range(low, high, step)
-    control.set_digits(digits)
-    control.set_numeric(True)
-    control.set_halign(Gtk.Align.START)
     try:
-        control.set_value(float(_value(spec, low) or low))
+        initial = float(_value(spec, low) or low)
     except (TypeError, ValueError):
-        control.set_value(float(low))
+        initial = float(low)
+    control = widgets.spin_button(
+        low, high, step, value=initial, digits=digits
+    )
+    control.set_halign(Gtk.Align.START)
     return control
 
 

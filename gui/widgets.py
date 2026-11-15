@@ -507,6 +507,45 @@ def text_value(widget: Gtk.ScrolledWindow) -> str:
     return buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), True)
 
 
+def spin_button(
+    low: float,
+    high: float,
+    step: float,
+    *,
+    value: float | None = None,
+    digits: int = 0,
+    numeric: bool = True,
+) -> Gtk.SpinButton:
+    """Create a SpinButton that ignores the wheel until it has focus.
+
+    GTK 默认只要鼠标经过 SpinButton 就响应滚轮，用户滚动设置页时会悄悄
+    改掉请求超时、温度等数值。把滚动调整为“先点进输入框（获得焦点）”，
+    页面滚动就不会再被数值框劫持。
+    """
+    spin = Gtk.SpinButton.new_with_range(low, high, step)
+    spin.set_digits(int(digits))
+    spin.set_numeric(bool(numeric))
+    if value is not None:
+        spin.set_value(float(value))
+    _guard_spin_scroll(spin)
+    return spin
+
+
+def _guard_spin_scroll(spin: Gtk.SpinButton) -> None:
+    """Capture vertical wheel events before GtkSpinButton's own handler."""
+    controller = Gtk.EventControllerScroll.new(
+        Gtk.EventControllerScrollFlags.VERTICAL
+    )
+    controller.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+
+    def _scroll(_controller: Gtk.EventControllerScroll, _dx: float, _dy: float) -> bool:
+        # TRUE 阻止事件继续传给 SpinButton；聚焦后保留滚轮微调。
+        return not spin.has_focus()
+
+    controller.connect("scroll", _scroll)
+    spin.add_controller(controller)
+
+
 def dropdown(options: list[tuple[str, str]], selected: str = "") -> Gtk.DropDown:
     labels = Gtk.StringList.new([name for _value, name in options])
     widget = Gtk.DropDown(model=labels)
@@ -776,6 +815,7 @@ __all__ = [
     "run_async",
     "section_header",
     "short_time",
+    "spin_button",
     "status_dot",
     "switch",
     "text_value",

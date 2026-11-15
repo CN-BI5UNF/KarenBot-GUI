@@ -57,6 +57,7 @@ SIDEBAR_COLLAPSED_WIDTH = 64
 
 _CSS_PROVIDER: Gtk.CssProvider | None = None
 _EXTERNAL_CSS_PROVIDER: Gtk.CssProvider | None = None
+_BASE_CSS_PROVIDER: Gtk.CssProvider | None = None
 
 _LIGHT_PALETTE = """
 /* 与 webui/static/app.css 的暖米色 / 青瓷青设计令牌保持一致。 */
@@ -195,13 +196,13 @@ def _dark_preferred() -> bool:
 
 
 def load_css(dark: bool | None = None) -> None:
-    global _CSS_PROVIDER, _EXTERNAL_CSS_PROVIDER
+    global _CSS_PROVIDER, _EXTERNAL_CSS_PROVIDER, _BASE_CSS_PROVIDER
     if dark is None:
         dark = _dark_preferred()
     display = Gdk.Display.get_default()
     if display is None:
         return
-    for provider in (_CSS_PROVIDER, _EXTERNAL_CSS_PROVIDER):
+    for provider in (_CSS_PROVIDER, _EXTERNAL_CSS_PROVIDER, _BASE_CSS_PROVIDER):
         if provider is None:
             continue
         try:
@@ -210,6 +211,20 @@ def load_css(dark: bool | None = None) -> None:
             pass
     _CSS_PROVIDER = None
     _EXTERNAL_CSS_PROVIDER = None
+    _BASE_CSS_PROVIDER = None
+
+    scale = skin_theme.read_font_scale()
+    # 系统皮肤也要遵守字号设置；这里先放一条基础规则，内置样式随后覆盖。
+    base = Gtk.CssProvider()
+    try:
+        base.load_from_string(skin_theme.base_font_css(scale))
+    except Exception:  # noqa: BLE001
+        logger.warning("加载基础字体样式失败", exc_info=True)
+    else:
+        Gtk.StyleContext.add_provider_for_display(
+            display, base, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+        _BASE_CSS_PROVIDER = base
 
     skin = skin_theme.read_skin()
     if skin != skin_theme.SYSTEM_SKIN:
@@ -220,6 +235,7 @@ def load_css(dark: bool | None = None) -> None:
             logger.warning("读取 GUI 样式失败", exc_info=True)
             rules = ""
         if rules:
+            rules = skin_theme.scale_font_sizes(rules, scale)
             provider = Gtk.CssProvider()
             try:
                 provider.load_from_string(
@@ -265,6 +281,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._backend_generation = 0
         self._last_setup_hint = False
         self._setup_completed = False
+        self._setup_deferred = False
         self._status_failures = 0
         self._status_error_active = False
         self._status_error_before = ""
@@ -392,6 +409,11 @@ class MainWindow(Adw.ApplicationWindow):
             lambda *_args: self._update_fullscreen_button(),
         )
         header.pack_end(self.fullscreen_button)
+        self.setup_button = widgets.button("稍后配置")
+        self.setup_button.add_css_class("compact-button")
+        self.setup_button.set_visible(False)
+        self.setup_button.connect("clicked", lambda _b: self._on_setup_action())
+        header.pack_end(self.setup_button)
         right.append(header)
 
         self.stack = Gtk.Stack()
@@ -442,6 +464,10 @@ class MainWindow(Adw.ApplicationWindow):
         }
         button.set_icon_name(icons.get(theme, icons["auto"]))
         button.set_tooltip_text(labels.get(theme, labels["auto"]))
+
+    def reload_skin(self) -> None:
+        """页面拿到的 app 是 MainWindow；把皮肤刷新转给 Application。"""
+        self.app.reload_skin()
 
     def toggle_sidebar(self) -> None:
         self._apply_sidebar_state(not self._sidebar_collapsed, persist=True)
@@ -618,16 +644,26 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_backend_error(self, exc: BaseException) -> None:
         self._backend_restart_busy = False
         self.runtime_label.set_text("后端启动失败")
-        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        page.set_valign(Gtk.Align.CENTER)
-        page.set_halign(Gtk.Align.CENTER)
-        page.set_vexpand(True)
-        page.append(widgets.title("本地控制服务启动失败", level=1))
-        page.append(widgets.muted(str(exc)))
-        retry = widgets.button("重试启动", css="suggested-action")
-        retry.connect("clicked", lambda _b: self._retry_backend())
-        page.append(retry)
-        self.stack.add_named(page, "backend-error")
+        page = getattr(self, "_backend_error_page", None)
+        if page is None:
+            page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+            page.set_valign(Gtk.Align.CENTER)
+            page.set_halign(Gtk.Align.CENTER)
+            page.set_vexpand(True)
+            page.append(widgets.title("本地控制服务启动失败", level=1))
+            error_label = widgets.muted("")
+            error_label.set_wrap(True)
+            error_label.set_max_width_chars(80)
+            page.append(error_label)
+            retry = widgets.button("重试启动", css="suggested-action")
+            retry.connect("clicked", lambda _b: self._retry_backend())
+            page.append(retry)
+            self._backend_error_page = page
+            self._backend_error_label = error_label
+            # 重试失败会再次进入这里；复用同一个 GtkStack 子页，避免
+            # “duplicate child name in GtkStack: backend-error”。
+            self.stack.add_named(page, "backend-error")
+        self._backend_error_label.set_text(str(exc))
         self.stack.set_visible_child_name("backend-error")
         self.toast(f"本地控制服务启动失败：{exc}")
 
@@ -804,19 +840,21 @@ class MainWindow(Adw.ApplicationWindow):
             self._set_runtime_dot(None)
         self._data_dir = str(self.status.get("data_dir") or "")
         self._refresh_version_tooltip()
+        self._update_setup_button()
         if setup_required:
             self.restart_button.set_sensitive(False)
-            if not self._setup_completed:
+            if not self._setup_completed and not self._setup_deferred:
                 self.nav_list.set_sensitive(False)
                 self._last_setup_hint = True
                 if self.current_page_id != "setup":
                     self.show_page("setup")
                 return
             # 向导刚写完配置、状态尚未刷新为 setup_required=false 时，
-            # 不能让导航继续停留在禁用态。
+            # 不能让导航继续停留在禁用态；用户选择“稍后配置”时同理。
             self.nav_list.set_sensitive(True)
         else:
             self._setup_completed = False
+            self._setup_deferred = False
             self.nav_list.set_sensitive(True)
             self.restart_button.set_sensitive(True)
             if self._last_setup_hint:
@@ -1005,6 +1043,7 @@ class MainWindow(Adw.ApplicationWindow):
         if (
             bool(self.status.get("setup_required"))
             and not self._setup_completed
+            and not self._setup_deferred
             and page_id != "setup"
         ):
             # Ctrl+数字、侧栏、深链都走这里；首次配置完成前不能绕过向导。
@@ -1090,12 +1129,60 @@ class MainWindow(Adw.ApplicationWindow):
     def on_setup_finished(self) -> None:
         self._last_setup_hint = False
         self._setup_completed = True
+        self._setup_deferred = False
         self.nav_list.set_sensitive(True)
         self.restart_button.set_sensitive(True)
+        self._update_setup_button()
         if "overview" in self.pages:
             self.pages["overview"].loaded = False
         self.show_page("overview")
         self._poll_status()
+
+    def _update_setup_button(self) -> None:
+        button = getattr(self, "setup_button", None)
+        if button is None:
+            return
+        required = bool(self.status.get("setup_required"))
+        button.set_visible(required and self.api is not None)
+        button.set_label("继续配置" if self._setup_deferred else "稍后配置")
+
+    def _on_setup_action(self) -> None:
+        if self._setup_deferred:
+            self._setup_deferred = False
+            self._update_setup_button()
+            self.show_page("setup")
+            return
+        self.request_defer_setup()
+
+    def request_defer_setup(self) -> None:
+        if not self.status.get("setup_required"):
+            self.toast("当前已经完成配置，不需要跳过。")
+            return
+        if self._setup_deferred:
+            return
+        widgets.ConfirmDialog(
+            self,
+            heading="稍后配置？",
+            body=(
+                "不会写入配置，Runtime 也不会启动；聊天、人格和模型功能暂时不可用。"
+                "你仍可浏览控制台，之后点顶栏「继续配置」回到向导。"
+            ),
+            confirm_label="稍后配置",
+            on_confirm=self.defer_setup,
+        )
+
+    def defer_setup(self) -> None:
+        if not self.status.get("setup_required"):
+            return
+        self._setup_deferred = True
+        self._last_setup_hint = False
+        self.nav_list.set_sensitive(True)
+        self.restart_button.set_sensitive(False)
+        self._update_setup_button()
+        if "overview" in self.pages:
+            self.pages["overview"].loaded = False
+        self.show_page("overview")
+        self.toast("已跳过首次配置；Runtime 未启动，可随时点顶栏「继续配置」。")
 
     def toast(self, message: str, kind: str = "") -> None:
         widgets.toast(self, message, kind=kind)

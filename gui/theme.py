@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 from gi.repository import GLib
@@ -12,6 +13,11 @@ logger = logging.getLogger(__name__)
 KAREN_SKIN = "karen"
 SYSTEM_SKIN = "system"
 THEME_PREFIX = "theme:"
+
+FONT_SCALE_DEFAULT = 1.0
+FONT_SCALE_MIN = 0.8
+FONT_SCALE_MAX = 1.6
+_FONT_SIZE_PX = re.compile(r"(font-size\s*:\s*)([0-9]+(?:\.[0-9]+)?)px")
 
 
 def _config_dir() -> Path:
@@ -81,6 +87,56 @@ def write_skin(value: str) -> None:
         logger.warning("保存 GUI 皮肤选择失败", exc_info=True)
 
 
+def _font_scale_path() -> Path:
+    return _config_dir() / "font-scale"
+
+
+def read_font_scale() -> float:
+    try:
+        value = float(_font_scale_path().read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return FONT_SCALE_DEFAULT
+    return max(FONT_SCALE_MIN, min(FONT_SCALE_MAX, value))
+
+
+def write_font_scale(value: float) -> float:
+    try:
+        scale = float(value)
+    except (TypeError, ValueError):
+        scale = FONT_SCALE_DEFAULT
+    scale = round(max(FONT_SCALE_MIN, min(FONT_SCALE_MAX, scale)), 2)
+    path = _font_scale_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{scale:g}", encoding="utf-8")
+    except OSError:
+        logger.warning("保存 GUI 字体大小失败", exc_info=True)
+    return scale
+
+
+def scale_font_sizes(css: str, scale: float | None = None) -> str:
+    """Scale every absolute font-size in a CSS document.
+
+    The bundled style sheet uses px sizes for headings and labels; changing
+    only ``window`` would leave those fixed.  Scaling the declarations keeps
+    the original hierarchy while respecting the user's preference.
+    """
+    factor = read_font_scale() if scale is None else float(scale)
+    if abs(factor - 1.0) < 0.001:
+        return css
+
+    def _replace(match: re.Match[str]) -> str:
+        size = max(6.0, round(float(match.group(2)) * factor, 1))
+        return f"{match.group(1)}{size:g}px"
+
+    return _FONT_SIZE_PX.sub(_replace, css)
+
+
+def base_font_css(scale: float | None = None) -> str:
+    factor = read_font_scale() if scale is None else float(scale)
+    return f"window {{ font-size: {14 * factor:g}px; }}"
+
+
 def external_theme_css() -> str:
     skin = read_skin()
     if not skin.startswith(THEME_PREFIX):
@@ -98,13 +154,20 @@ def external_theme_css() -> str:
 
 
 __all__ = [
+    "FONT_SCALE_DEFAULT",
+    "FONT_SCALE_MAX",
+    "FONT_SCALE_MIN",
     "KAREN_SKIN",
     "SYSTEM_SKIN",
     "THEME_PREFIX",
+    "base_font_css",
     "discover_gtk4_themes",
     "external_theme_css",
+    "read_font_scale",
     "read_skin",
+    "scale_font_sizes",
     "skin_options",
     "theme_roots",
+    "write_font_scale",
     "write_skin",
 ]
