@@ -79,6 +79,7 @@ PROVIDER_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
 URL_RE = re.compile(r"^https?://[^\s]+$", re.IGNORECASE)
 HOST_RE = re.compile(r"^[A-Za-z0-9.-]+(?::[0-9]{1,5})?$")
+ADAPTER_HOST_RE = re.compile(r"^[A-Za-z0-9.:\[\]_-]+$")
 
 
 def _ascii_field_problem(value: str, field_name: str) -> str | None:
@@ -552,6 +553,8 @@ class SetupPage(Page):
     def _reset_defaults(self) -> None:
         if self._busy:
             return
+        self._path = "recommended"
+        self._custom_provider_draft = {}
         if self._options:
             self._render_options(self._options)
         else:
@@ -1825,10 +1828,22 @@ class SetupPage(Page):
             ),
             enabled_row,
             self._field("NapCat 连接模式", mode),
-            self._field("主机", host),
+            self._field(
+                "主机",
+                host,
+                "只填 IP 或域名，例如 127.0.0.1；不要带 ws:// 或中文。",
+            ),
             self._field("端口", port),
-            self._field("WebSocket 路径", path),
-            self._field("Access Token", token),
+            self._field(
+                "WebSocket 路径",
+                path,
+                "以 / 开头，只使用英文/数字/URL 符号。",
+            ),
+            self._field(
+                "Access Token",
+                token,
+                "可选；只能使用英文、数字和常见符号。",
+            ),
             manage_row,
             process_field,
             restart_row,
@@ -1836,7 +1851,33 @@ class SetupPage(Page):
             wl_qq_field,
             wl_group_field,
         )
-        self._validate_step = lambda: None
+        self._validate_step = self._validate_adapter
+
+    def _validate_adapter(self) -> str | None:
+        adapter = self._adapter
+        if not adapter.get("enabled", True):
+            return None
+        host = str(adapter.get("host") or "").strip()
+        if not host:
+            return "NapCat 主机不能为空。"
+        if not host.isascii() or not ADAPTER_HOST_RE.match(host):
+            return "NapCat 主机只能填写 IPv4/IPv6 地址或域名，不能包含中文或空格。"
+        path = str(adapter.get("path") or "/").strip()
+        if not path.startswith("/"):
+            return "WebSocket 路径必须以 / 开头。"
+        problem = _ascii_field_problem(path, "WebSocket 路径")
+        if problem:
+            return problem
+        problem = _ascii_field_problem(
+            str(adapter.get("access_token") or ""), "Access Token"
+        )
+        if problem:
+            return problem
+        if adapter.get("manage_process") and not str(
+            adapter.get("process_path") or ""
+        ).strip():
+            return "勾选“由 Karen 拉起 NapCat”后必须填写进程路径。"
+        return None
 
     # ------------------------------------------------------------------
     # Step: persona
@@ -2008,6 +2049,7 @@ class SetupPage(Page):
             self._validate_agents,
             self._validate_features,
             self._validate_embedding,
+            self._validate_adapter,
         ):
             problem = validator()
             if problem:
