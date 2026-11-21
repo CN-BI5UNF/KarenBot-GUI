@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.0.0-alpha — 2026-11-21
+
+首个 KarenBot 统一发行版。GUI、WebUI、后端版本均为 `2.0.0-alpha`；安装/更新入口为 `CN-BI5UNF/KarenBot` 主仓库。
+
+- GUI 作为 KarenBot 主仓库的 `modules/KarenBot-GUI` submodule 维护。
+- 更新页只读 KarenBot 统一发行版，后端与当前前端一起更新。
+- 从 0.1.x 升级必须先安装过渡版 `v0.1.1-alpha.2`；旧 1.0.x 绑定版本不再支持。
+
 ## v0.1.1-alpha.2 — 2026-11-21
 
 过渡版本：GUI 模块 `0.1.1-alpha.2`，应用代码 `1.0.1-alpha.2`。更新页已适配 KarenBot 统一发行版；请更新后端与本前端后，手动选择 `v2.0.0-alpha`。
