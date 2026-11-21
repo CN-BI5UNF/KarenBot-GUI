@@ -183,7 +183,8 @@ class UpdatesPage(Page):
         )
         self.distribution_card.append(
             widgets.muted(
-                "统一发行版会同时更新后端与当前前端；不能只更新其中一个组件。"
+                "可同时更新后端与当前前端，也可只更新其中一个组件；"
+                "单独更新后两端版本可能不一致。"
                 "Pre-release 不会自动提示，可在下方列表手动选择。"
             )
         )
@@ -583,6 +584,14 @@ class UpdatesPage(Page):
                 widgets.label("KarenBot 统一发行版", css="section-title")
             )
             for item in distribution_updates:
+                selected = item.get("selected_components") or []
+                if selected:
+                    self.check_card.append(
+                        widgets.property_row(
+                            "本次更新",
+                            "、".join(str(name) for name in selected),
+                        )
+                    )
                 components = item.get("components") or {}
                 for component, meta in components.items():
                     if not isinstance(meta, dict):
@@ -907,26 +916,95 @@ class UpdatesPage(Page):
             text.set_margin_top(6)
             expander.set_child(text)
             card.append(expander)
-        if release.get("is_current"):
+        components = release.get("components") or {}
+        distribution = bool(release.get("distribution"))
+        if release.get("is_current") and not distribution:
             card.append(widgets.badge("正在使用", css="badge"))
             return card
-        action = widgets.button(
-            "不可自动应用" if blocked else _action_label(release),
-            css="suggested-action" if not blocked else "",
-        )
-        action.set_sensitive(not blocked and not self._applying)
-        if blocked:
-            action.set_tooltip_text(
-                str(compat.get("message") or "目标版本与当前数据不兼容")
-            )
-        action.connect(
-            "clicked",
-            lambda _b, target=release: self._begin_apply(target),
-        )
-        if not blocked:
-            self._release_buttons.append(action)
+        if release.get("is_current"):
+            card.append(widgets.badge("正在使用", css="badge"))
+        component_keys = list(components.keys())
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        row.append(action)
+        if distribution and component_keys:
+            frontend_key = next(
+                (key for key in component_keys if key != "backend"), ""
+            )
+            reinstall = bool(release.get("is_current"))
+
+            def add_action(
+                keys: tuple[str, ...] | None,
+                text: str,
+                *,
+                suggested: bool = False,
+            ) -> None:
+                action = widgets.button(
+                    "不可自动应用" if blocked else text,
+                    css="suggested-action" if suggested and not blocked else "",
+                )
+                action.set_sensitive(not blocked and not self._applying)
+                if blocked:
+                    action.set_tooltip_text(
+                        str(
+                            compat.get("message")
+                            or "目标版本与当前数据不兼容"
+                        )
+                    )
+                action.connect(
+                    "clicked",
+                    lambda _b, target=release, selected=keys: (
+                        self._begin_apply(target, selected)
+                    ),
+                )
+                if not blocked:
+                    self._release_buttons.append(action)
+                row.append(action)
+
+            add_action(
+                None,
+                "重新安装全部" if reinstall else _action_label(release),
+                suggested=True,
+            )
+            if "backend" in component_keys:
+                add_action(
+                    ("backend",),
+                    "重新安装后端" if reinstall else "仅更新后端",
+                )
+            if frontend_key:
+                label = (
+                    "GUI 前端"
+                    if frontend_key == "gui"
+                    else "WebUI 前端"
+                    if frontend_key == "webui"
+                    else frontend_key
+                )
+                add_action(
+                    (frontend_key,),
+                    (
+                        f"重新安装{label}"
+                        if reinstall
+                        else f"仅更新{label}"
+                    ),
+                )
+        else:
+            action = widgets.button(
+                "不可自动应用" if blocked else _action_label(release),
+                css="suggested-action" if not blocked else "",
+            )
+            action.set_sensitive(not blocked and not self._applying)
+            if blocked:
+                action.set_tooltip_text(
+                    str(
+                        compat.get("message")
+                        or "目标版本与当前数据不兼容"
+                    )
+                )
+            action.connect(
+                "clicked",
+                lambda _b, target=release: self._begin_apply(target),
+            )
+            if not blocked:
+                self._release_buttons.append(action)
+            row.append(action)
         card.append(row)
         return card
 
@@ -939,7 +1017,11 @@ class UpdatesPage(Page):
         if self._check_apply_button is not None:
             self._check_apply_button.set_sensitive(not busy)
 
-    def _begin_apply(self, release: dict[str, Any]) -> None:
+    def _begin_apply(
+        self,
+        release: dict[str, Any],
+        components: tuple[str, ...] | None = None,
+    ) -> None:
         if self.api is None or self._applying or self._check_busy:
             return
         compat = release.get("compat") or {}
@@ -956,8 +1038,11 @@ class UpdatesPage(Page):
         self.status_label.set_text(f"正在检查目标版本 {tag}…")
 
         def _do() -> dict[str, Any]:
+            payload: dict[str, Any] = {"target_tag": tag}
+            if components:
+                payload["components"] = list(components)
             return self.api.post(
-                "/api/update/check", {"target_tag": tag}, timeout=330
+                "/api/update/check", payload, timeout=330
             )
 
         def _done(checked: dict[str, Any]) -> None:
