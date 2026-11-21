@@ -299,9 +299,6 @@ class SetupPage(Page):
             "port": int(adapter.get("port") or 3000),
             "path": str(adapter.get("path") or "/"),
             "access_token": "",
-            "manage_process": False,
-            "process_path": "",
-            "auto_restart": True,
             "whitelist": {
                 "mode": str(adapter.get("whitelist_mode") or "verify"),
                 "qq_ids": [],
@@ -1719,7 +1716,9 @@ class SetupPage(Page):
         )
         token = Gtk.Entry()
         token.set_visibility(False)
-        token.set_placeholder_text("NapCat Access Token（可选）")
+        token.set_placeholder_text(
+            "与 NapCat 网络配置中的 Token 保持一致（可选）"
+        )
         token.set_text(str(adapter.get("access_token") or ""))
         token.connect(
             "changed",
@@ -1727,35 +1726,6 @@ class SetupPage(Page):
                 "access_token", entry.get_text().strip()
             ),
         )
-        manage = widgets.switch(bool(adapter.get("manage_process")))
-        manage.connect(
-            "notify::active",
-            lambda widget, *_args: adapter.__setitem__(
-                "manage_process", bool(widget.get_active())
-            ),
-        )
-        manage_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        manage_row.append(manage)
-        manage_row.append(widgets.label("由 Karen 拉起 NapCat"))
-        process_path = Gtk.Entry()
-        process_path.set_placeholder_text("NapCat 可执行文件或启动脚本")
-        process_path.set_text(str(adapter.get("process_path") or ""))
-        process_path.connect(
-            "changed",
-            lambda entry: adapter.__setitem__(
-                "process_path", entry.get_text().strip()
-            ),
-        )
-        auto_restart = widgets.switch(bool(adapter.get("auto_restart", True)))
-        auto_restart.connect(
-            "notify::active",
-            lambda widget, *_args: adapter.__setitem__(
-                "auto_restart", bool(widget.get_active())
-            ),
-        )
-        restart_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        restart_row.append(auto_restart)
-        restart_row.append(widgets.label("连接断开时自动重启"))
         whitelist = adapter.setdefault(
             "whitelist", {"mode": "verify", "qq_ids": [], "group_ids": []}
         )
@@ -1798,7 +1768,6 @@ class SetupPage(Page):
                 ),
             ),
         )
-        process_field = self._field("NapCat 进程路径", process_path)
         wl_mode_field = self._field("入站策略", wl_mode)
         wl_qq_field = self._field(
             "白名单 QQ",
@@ -1812,14 +1781,10 @@ class SetupPage(Page):
         )
 
         def _sync_adapter_visibility(*_args: Any) -> None:
-            managing = bool(manage.get_active())
-            process_field.set_visible(managing)
-            restart_row.set_visible(managing)
             whitelisted = widgets.dropdown_value(wl_mode) == "whitelist"
             wl_qq_field.set_visible(whitelisted)
             wl_group_field.set_visible(whitelisted)
 
-        manage.connect("notify::active", _sync_adapter_visibility)
         wl_mode.connect("notify::selected", _sync_adapter_visibility)
         _sync_adapter_visibility()
         self._add(
@@ -1840,13 +1805,13 @@ class SetupPage(Page):
                 "以 / 开头，只使用英文/数字/URL 符号。",
             ),
             self._field(
-                "Access Token",
+                "Access Token（鉴权令牌）",
                 token,
-                "可选；只能使用英文、数字和常见符号。",
+                "可选。填写 NapCat 网络配置里设置的鉴权 Token；NapCat 没有设置时留空。\n"
+                "填写后会保存到加密密钥库并自动绑定到渠道，配置完成即可使用，"
+                "无需再到设置页填写。两边都设置但 Token 不一致时，连接会失败"
+                "（通常表现为 401/403）。",
             ),
-            manage_row,
-            process_field,
-            restart_row,
             wl_mode_field,
             wl_qq_field,
             wl_group_field,
@@ -1869,14 +1834,10 @@ class SetupPage(Page):
         if problem:
             return problem
         problem = _ascii_field_problem(
-            str(adapter.get("access_token") or ""), "Access Token"
+            str(adapter.get("access_token") or ""), "Access Token（鉴权令牌）"
         )
         if problem:
             return problem
-        if adapter.get("manage_process") and not str(
-            adapter.get("process_path") or ""
-        ).strip():
-            return "勾选“由 Karen 拉起 NapCat”后必须填写进程路径。"
         return None
 
     # ------------------------------------------------------------------
@@ -2250,9 +2211,6 @@ class SetupPage(Page):
                 "port": int(adapter.get("port") or 3000),
                 "path": str(adapter.get("path") or "/"),
                 "access_token": str(adapter.get("access_token") or ""),
-                "manage_process": bool(adapter.get("manage_process")),
-                "process_path": str(adapter.get("process_path") or ""),
-                "auto_restart": bool(adapter.get("auto_restart", True)),
                 "whitelist": {
                     "mode": str(
                         (adapter.get("whitelist") or {}).get("mode") or "verify"

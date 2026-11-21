@@ -10,12 +10,14 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Gdk", "4.0")
-from gi.repository import Gdk, GLib, GObject, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, GLib, GObject, Gtk  # noqa: E402
 
 from .. import theme as skin_theme  # noqa: E402
 from .. import widgets  # noqa: E402
 from .base import Page  # noqa: E402
+from .programs_panel import ProgramsSettingsPanel  # noqa: E402
 from .settings_panels import (  # noqa: E402
+    AdapterSettingsPanel,
     BackupSettingsPanel,
     SearchSettingsPanel,
     TokenBudgetSettingsPanel,
@@ -24,6 +26,8 @@ from .settings_panels import (  # noqa: E402
 )
 
 _SPECIAL_PATHS = {
+    # 容器网络统一由主界面「容器 → 沙箱联网」控制，设置页不再重复提供。
+    "features.container.network",
     "features.vision.main_model_images",
     "features.vision.enabled",
     "features.vision.provider",
@@ -58,6 +62,11 @@ class SettingsPage(Page):
     page_icon = "emblem-system-symbolic"
 
     def build(self) -> None:
+        # 设置页打开时侧栏隐藏，内容区铺满窗口；取消 Page 默认的 1100px 限宽。
+        clamp = self.get_child()
+        if isinstance(clamp, Adw.Clamp):
+            clamp.set_maximum_size(100000)
+            clamp.set_tightening_threshold(100000)
         # The settings page owns two independent scroll areas (group nav and
         # group body), so the outer page scroller must not steal the wheel.
         self.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.NEVER)
@@ -81,53 +90,6 @@ class SettingsPage(Page):
         self.body.append(self.restart_hint)
         self._skin_updating = False
         self._font_scale_source = 0
-        self.appearance_card = widgets.card(spacing=8)
-        self.appearance_card.append(
-            widgets.section_header(
-                "外观主题",
-                "Karen 暖色最接近 Linux 目标机；选择外部主题时会叠加其 "
-                "gtk-4.0/gtk.css，可能与自带样式冲突。",
-            )
-        )
-        skin_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.skin_dropdown = widgets.dropdown(
-            skin_theme.skin_options(), skin_theme.read_skin()
-        )
-        self.skin_dropdown.set_hexpand(True)
-        self.skin_dropdown.connect("notify::selected", self._on_skin_changed)
-        skin_row.append(self.skin_dropdown)
-        refresh_skins = widgets.button("刷新主题列表")
-        refresh_skins.connect("clicked", lambda _b: self._refresh_skin_options())
-        skin_row.append(refresh_skins)
-        self.appearance_card.append(skin_row)
-
-        font_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        font_row.append(widgets.label("字体大小", css="field-label"))
-        current_scale = skin_theme.read_font_scale()
-        self.font_scale_spin = widgets.spin_button(
-            80,
-            160,
-            5,
-            value=round(current_scale * 100),
-            digits=0,
-        )
-        self.font_scale_spin.set_tooltip_text(
-            "80%–160%；只影响界面文字，不改动系统字体。"
-        )
-        self.font_scale_spin.connect(
-            "value-changed", self._on_font_scale_changed
-        )
-        font_row.append(self.font_scale_spin)
-        font_row.append(widgets.muted("%"))
-        reset_font = widgets.button("恢复 100%")
-        reset_font.connect(
-            "clicked",
-            lambda _b: self.font_scale_spin.set_value(100),
-        )
-        font_row.append(reset_font)
-        font_row.append(widgets.muted("修改后立即生效"))
-        self.appearance_card.append(font_row)
-        self.body.append(self.appearance_card)
         # 分组导航与字段区可拖动分隔条调整占比；默认只占 156px，
         # 给右侧正文留更多宽度（WebUI 的设置导航也是窄栏）。
         split = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
@@ -216,10 +178,18 @@ class SettingsPage(Page):
         self._show_loading()
         self.refresh()
 
+    def _append_appearance_row(self) -> None:
+        row = Gtk.ListBoxRow()
+        row.group_key = "__appearance__"  # type: ignore[attr-defined]
+        row.add_css_class("nav-row")
+        row.set_child(widgets.label("外观"))
+        self.group_list.append(row)
+
     def _error(self, exc: BaseException) -> None:
         self._refresh_busy = False
         widgets.clear(self.group_list)
         widgets.clear(self.group_stack)
+        self._append_appearance_row()
         paths_row = Gtk.ListBoxRow()
         paths_row.group_key = "__paths__"  # type: ignore[attr-defined]
         paths_row.add_css_class("nav-row")
@@ -263,6 +233,7 @@ class SettingsPage(Page):
             row.add_css_class("nav-row")
             row.set_child(widgets.label(str(group.get("title") or group.get("key") or "")))
             self.group_list.append(row)
+        self._append_appearance_row()
         paths_row = Gtk.ListBoxRow()
         paths_row.group_key = "__paths__"  # type: ignore[attr-defined]
         paths_row.add_css_class("nav-row")
@@ -350,6 +321,10 @@ class SettingsPage(Page):
             page = self._paths_page()
             if page.get_parent() is not self.group_stack:
                 self.group_stack.add_named(page, "__paths__")
+        elif key == "__appearance__":
+            page = self._appearance_page()
+            if page.get_parent() is not self.group_stack:
+                self.group_stack.add_named(page, "__appearance__")
         else:
             page = self._group_pages.get(key)
             if page is None:
@@ -364,6 +339,25 @@ class SettingsPage(Page):
             on_show = getattr(panel, "on_show", None)
             if callable(on_show):
                 on_show()
+
+    def focus_content(self) -> None:
+        """Clicking the right pane focuses the visible group scroller.
+
+        This keeps the group ListBox focused only while the user is actually
+        interacting with it; once they click the form area, Up/Down scrolls
+        the form like the mouse wheel instead of moving the group selection.
+        """
+        page = self.group_stack.get_visible_child()
+        if page is None:
+            return
+        if page.get_focusable():
+            page.grab_focus()
+            return
+        target = widgets.first_focusable(page, inputs_only=True)
+        if target is None:
+            target = widgets.first_focusable(page)
+        if target is not None:
+            target.grab_focus()
 
     def _on_skin_changed(self, *_args: Any) -> None:
         if self._skin_updating:
@@ -413,10 +407,14 @@ class SettingsPage(Page):
             )
         )
         key = str(group.get("key") or "")
+        adapter_group = key in {"adapter", "adapter_advanced"}
+        special_group = adapter_group or key == "programs"
         fields = [
             spec
             for spec in (group.get("fields") or [])
-            if not spec.get("hidden") and str(spec.get("path") or "") not in _SPECIAL_PATHS
+            if not special_group
+            and not spec.get("hidden")
+            and str(spec.get("path") or "") not in _SPECIAL_PATHS
         ]
         if fields:
             card = widgets.card(spacing=4, padding=14)
@@ -425,9 +423,9 @@ class SettingsPage(Page):
                     card.append(widgets.separator())
                 card.append(self._field_row(spec))
             box.append(card)
-        elif group.get("fields"):
+        elif group.get("fields") and not special_group:
             box.append(self.empty("这个分页的选项由下方专用面板设置。"))
-        else:
+        elif not special_group:
             box.append(
                 self.empty(
                     "这个分页没有可视化字段；路径、密钥与运行时操作见「路径与诊断」。"
@@ -435,7 +433,13 @@ class SettingsPage(Page):
             )
 
         panels: list[Any] = []
-        if key == "features":
+        if adapter_group:
+            panel = AdapterSettingsPanel(
+                self, group, advanced_only=key == "adapter_advanced"
+            )
+            box.append(panel)
+            panels.append(panel)
+        elif key == "features":
             vision = VisionSettingsPanel(self, group)
             search = SearchSettingsPanel(self, group)
             box.append(vision)
@@ -453,8 +457,13 @@ class SettingsPage(Page):
             budget = TokenBudgetSettingsPanel(self)
             box.append(budget)
             panels.append(budget)
+        elif key == "programs":
+            programs = ProgramsSettingsPanel(self, group)
+            box.append(programs)
+            panels.append(programs)
         self._group_panels[key] = panels
         scroller.set_child(box)
+        widgets.enable_scroll_focus(scroller)
         return scroller
 
     def spec_for(self, path: str) -> dict[str, Any]:
@@ -1010,6 +1019,87 @@ class SettingsPage(Page):
         widgets.run_async(_do, on_success=_done, on_error=lambda exc: self.toast(f"重启失败：{exc}"))
 
     # ------------------------------------------------------------------
+    # Appearance
+    # ------------------------------------------------------------------
+    def _appearance_page(self) -> Gtk.Widget:
+        """Dedicated, compact appearance page instead of a card above all tabs."""
+        page = self._group_pages.get("__appearance__")
+        if page is not None:
+            return page
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_vexpand(True)
+        scroller.set_propagate_natural_height(False)
+        scroller.set_min_content_height(420)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        box.set_margin_end(4)
+        box.set_margin_bottom(18)
+        box.append(
+            widgets.section_header(
+                "外观主题",
+                "Karen 暖色最接近 Linux 目标机；选择外部主题时会叠加其 "
+                "gtk-4.0/gtk.css，可能与自带样式冲突。",
+            )
+        )
+        card = widgets.card(spacing=8, padding=14)
+        theme_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        theme_label = widgets.label("主题", css="field-label")
+        theme_label.set_size_request(64, -1)
+        theme_row.append(theme_label)
+        self.skin_dropdown = widgets.dropdown(
+            skin_theme.skin_options(), skin_theme.read_skin()
+        )
+        self.skin_dropdown.set_hexpand(True)
+        self.skin_dropdown.connect("notify::selected", self._on_skin_changed)
+        theme_row.append(self.skin_dropdown)
+        refresh_skins = widgets.icon_button(
+            "view-refresh-symbolic", "刷新主题列表", css="flat"
+        )
+        refresh_skins.connect("clicked", lambda _b: self._refresh_skin_options())
+        theme_row.append(refresh_skins)
+        card.append(theme_row)
+
+        font_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        font_label = widgets.label("字体大小", css="field-label")
+        font_label.set_size_request(64, -1)
+        font_row.append(font_label)
+        current_scale = skin_theme.read_font_scale()
+        self.font_scale_spin = widgets.spin_button(
+            80,
+            160,
+            5,
+            value=round(current_scale * 100),
+            digits=0,
+        )
+        self.font_scale_spin.set_tooltip_text(
+            "80%–160%；只影响界面文字，不改动系统字体。"
+        )
+        self.font_scale_spin.connect(
+            "value-changed", self._on_font_scale_changed
+        )
+        font_row.append(self.font_scale_spin)
+        font_row.append(widgets.muted("%"))
+        reset_font = widgets.button("恢复 100%", css="compact-button")
+        reset_font.connect(
+            "clicked",
+            lambda _b: self.font_scale_spin.set_value(100),
+        )
+        font_row.append(reset_font)
+        font_row.append(
+            widgets.label("修改后立即生效", css="field-help")
+        )
+        card.append(font_row)
+
+        box.append(card)
+        clamp = Adw.Clamp()
+        clamp.set_maximum_size(820)
+        clamp.set_tightening_threshold(640)
+        clamp.set_child(box)
+        scroller.set_child(clamp)
+        widgets.enable_scroll_focus(scroller)
+        self._group_pages["__appearance__"] = scroller
+        return scroller
+
+    # ------------------------------------------------------------------
     # Paths and diagnostics
     # ------------------------------------------------------------------
     def _paths_page(self) -> Gtk.Widget:
@@ -1071,6 +1161,7 @@ class SettingsPage(Page):
         controls.append(row)
         box.append(controls)
         scroller.set_child(box)
+        widgets.enable_scroll_focus(scroller)
         self._group_pages["__paths__"] = scroller
         return scroller
 
@@ -1129,9 +1220,11 @@ class SettingsPage(Page):
     # Navigation
     # ------------------------------------------------------------------
     def select_group(self, key: str) -> None:
-        if key == "paths":
+        if key in {"paths", "路径与诊断"}:
             key = "__paths__"
-        if not self._groups and key != "__paths__":
+        elif key in {"appearance", "外观", "外观主题"}:
+            key = "__appearance__"
+        if not self._groups and key not in {"__paths__", "__appearance__"}:
             self._pending_section = key
             return
         row = self._row_for_group(key)

@@ -1,6 +1,6 @@
 # KarenBot-GUI
 
-KarenBot 的**原生 GTK4 / libadwaita 桌面控制台**模块。仓库已公开，当前版本 **v0.1.1-alpha.1**。
+KarenBot 的**原生 GTK4 / libadwaita 桌面控制台**模块。仓库已公开，当前过渡版本 **v0.1.1-alpha.2**；v2 统一发行版为 **v2.0.0-alpha**。
 
 > 这是模块源码仓库，不是完整的独立 KarenBot 应用。运行前需要 KarenBot 宿主和兼容的
 > `KarenBot-backend`（v0.1.1-alpha.1）。
@@ -30,17 +30,17 @@ KarenBot RuntimeHost / core.Runtime
 - WebUI 对齐样式：`style.css`
 - 应用 ID 隔离：`identity.py`
 - 前端插件清单：`plugin.json` + `plugin.py`，由 `main.py --frontend gui` 统一启动
-- 更新页：后端更新与 GUI 前端更新分成独立区块
+- 更新页：优先显示 KarenBot 统一发行版，同时更新后端与当前前端
 - 启动器渲染回退、字体与主题管理
 
 ## 兼容性
 
 | 项目 | 版本 |
 |---|---|
-| 本模块 release | `v0.1.1-alpha.1`（预发布） |
-| 配套后端 | `KarenBot-backend` `v0.1.1-alpha.1` |
-| KarenBot 宿主 | `1.0.1-alpha.1` 拆分版本及后续兼容版本 |
-| 配套 WebUI | `KarenBot-WebUI` `v0.1.1-alpha.1` |
+| 本模块过渡 release | `v0.1.1-alpha.2`（稳定过渡版） |
+| 配套后端过渡版 | `KarenBot-backend` `v0.1.11-alpha.1` |
+| v2 统一发行版 | `v2.0.0-alpha`（后端/GUI/WebUI 同步） |
+| KarenBot 宿主 | `1.0.1-alpha.2` 拆分版本及后续兼容版本 |
 
 ## 系统要求
 

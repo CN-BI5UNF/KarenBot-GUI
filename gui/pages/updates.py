@@ -174,8 +174,25 @@ class UpdatesPage(Page):
         self.component_sections: dict[str, dict[str, Any]] = {}
         self._frontend_key = "gui"
         self._module_mode = False
+        self._distribution_mode = False
         self._build_component_section("backend", "后端更新")
         self._build_component_section("frontend", "前端更新")
+        self.distribution_card = widgets.card(spacing=5)
+        self.distribution_card.append(
+            widgets.label("KarenBot 发行版", css="section-title")
+        )
+        self.distribution_card.append(
+            widgets.muted(
+                "统一发行版会同时更新后端与当前前端；不能只更新其中一个组件。"
+                "Pre-release 不会自动提示，可在下方列表手动选择。"
+            )
+        )
+        self.distribution_releases_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=8
+        )
+        self.distribution_card.append(self.distribution_releases_box)
+        self.distribution_card.set_visible(False)
+        self.body.append(self.distribution_card)
         self.legacy_card = widgets.card(spacing=5)
         self.legacy_card.append(
             widgets.label("远端版本", css="section-title")
@@ -248,16 +265,22 @@ class UpdatesPage(Page):
         self.info_card.append(widgets.label("当前版本", css="section-title"))
         if status.get("mode") == "module":
             self._module_mode = True
+            self._distribution_mode = bool(status.get("distribution"))
             self.legacy_card.set_visible(False)
             self._frontend_key = str(status.get("frontend") or "gui")
             for section in self.component_sections.values():
-                section["card"].set_visible(True)
+                section["card"].set_visible(not self._distribution_mode)
+            self.distribution_card.set_visible(self._distribution_mode)
             self.info_card.append(
                 widgets.property_row(
                     "前端类型",
                     str(status.get("frontend_label") or self._frontend_key),
                 )
             )
+            if self._distribution_mode:
+                self.info_card.append(
+                    widgets.property_row("更新模式", "KarenBot 统一发行版")
+                )
             self._render_component_info(status)
             self.info_card.append(
                 widgets.property_row(
@@ -320,6 +343,8 @@ class UpdatesPage(Page):
                 self._load_releases(force=False)
             return
         self._module_mode = False
+        self._distribution_mode = False
+        self.distribution_card.set_visible(False)
         self.legacy_card.set_visible(True)
         for section in self.component_sections.values():
             section["card"].set_visible(False)
@@ -548,38 +573,69 @@ class UpdatesPage(Page):
         self.check_card.append(
             widgets.property_row("目标", target_name)
         )
-        updates = [item for item in result.get("updates") or [] if isinstance(item, dict)]
-        grouped: dict[str, list[dict[str, Any]]] = {}
-        for item in updates:
-            grouped.setdefault(str(item.get("component") or "other"), []).append(item)
-        for key, title in (
-            ("backend", "后端更新"),
-            (self._frontend_key, "前端更新"),
-        ):
-            items = grouped.pop(key, [])
-            if not items:
-                continue
+        distribution_updates = [
+            item
+            for item in result.get("distribution_updates") or []
+            if isinstance(item, dict)
+        ]
+        if distribution_updates:
             self.check_card.append(
-                widgets.label(title, css="section-title")
+                widgets.label("KarenBot 统一发行版", css="section-title")
             )
-            for item in items:
-                self.check_card.append(
-                    widgets.property_row(
-                        _release_tag(item) or "版本",
-                        ("Pre-release，极不稳定" if item.get("prerelease") else "稳定版"),
+            for item in distribution_updates:
+                components = item.get("components") or {}
+                for component, meta in components.items():
+                    if not isinstance(meta, dict):
+                        continue
+                    self.check_card.append(
+                        widgets.property_row(
+                            str(component),
+                            str(meta.get("version") or meta.get("tag") or "—"),
+                        )
                     )
-                )
-        for key, items in grouped.items():
-            self.check_card.append(
-                widgets.label(f"其它组件（{key}）", css="section-title")
-            )
-            for item in items:
+        else:
+            updates = [
+                item
+                for item in result.get("updates") or []
+                if isinstance(item, dict)
+            ]
+            grouped: dict[str, list[dict[str, Any]]] = {}
+            for item in updates:
+                grouped.setdefault(
+                    str(item.get("component") or "other"), []
+                ).append(item)
+            for key, title in (
+                ("backend", "后端更新"),
+                (self._frontend_key, "前端更新"),
+            ):
+                items = grouped.pop(key, [])
+                if not items:
+                    continue
                 self.check_card.append(
-                    widgets.property_row(
-                        _release_tag(item) or "版本",
-                        _component_text(item) or key,
-                    )
+                    widgets.label(title, css="section-title")
                 )
+                for item in items:
+                    self.check_card.append(
+                        widgets.property_row(
+                            _release_tag(item) or "版本",
+                            (
+                                "Pre-release，极不稳定"
+                                if item.get("prerelease")
+                                else "稳定版"
+                            ),
+                        )
+                    )
+            for key, items in grouped.items():
+                self.check_card.append(
+                    widgets.label(f"其它组件（{key}）", css="section-title")
+                )
+                for item in items:
+                    self.check_card.append(
+                        widgets.property_row(
+                            _release_tag(item) or "版本",
+                            _component_text(item) or key,
+                        )
+                    )
         commit = str(
             result.get("target_commit_short")
             or result.get("target_commit")
@@ -669,6 +725,10 @@ class UpdatesPage(Page):
             for section in self.component_sections.values():
                 widgets.clear(section["releases"])
                 section["releases"].append(self.busy("正在读取远端版本…"))
+            widgets.clear(self.distribution_releases_box)
+            self.distribution_releases_box.append(
+                self.busy("正在读取 KarenBot 发行版…")
+            )
             widgets.clear(self.legacy_releases_box)
             self.legacy_releases_box.append(self.busy("正在读取远端版本…"))
 
@@ -697,6 +757,10 @@ class UpdatesPage(Page):
                     "clicked", lambda _b: self._load_releases(force=False)
                 )
                 section["releases"].append(retry)
+            widgets.clear(self.distribution_releases_box)
+            self.distribution_releases_box.append(
+                widgets.muted(f"加载 KarenBot 发行版失败：{exc}")
+            )
             widgets.clear(self.legacy_releases_box)
             self.legacy_releases_box.append(
                 widgets.muted(f"加载远端版本失败：{exc}")
@@ -707,10 +771,33 @@ class UpdatesPage(Page):
     def _render_releases(self, data: dict[str, Any]) -> None:
         for section in self.component_sections.values():
             widgets.clear(section["releases"])
+        widgets.clear(self.distribution_releases_box)
         widgets.clear(self.legacy_releases_box)
         self._release_buttons = []
         errors = data.get("errors") or {}
         releases = data.get("releases") or []
+        if self._module_mode and self._distribution_mode:
+            distribution_releases = data.get("distribution_releases") or []
+            if errors:
+                self.distribution_releases_box.append(
+                    widgets.label(
+                        "部分发行版读取失败："
+                        + "；".join(
+                            f"{key}: {value}" for key, value in errors.items()
+                        ),
+                        css="danger-text",
+                        wrap=True,
+                    )
+                )
+            if not distribution_releases:
+                self.distribution_releases_box.append(
+                    widgets.muted("远端还没有可用的 KarenBot 统一发行版。")
+                )
+            for release in distribution_releases:
+                self.distribution_releases_box.append(
+                    self._release_card(release)
+                )
+            return
         if not self._module_mode:
             if errors:
                 self.legacy_releases_box.append(

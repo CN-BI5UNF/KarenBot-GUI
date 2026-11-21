@@ -28,7 +28,7 @@ def _access_status_text(
         "whitelist": "仅白名单内可触发回复",
     }.get(mode, mode)
     black_state = (
-        f"黑名单生效中（{black_qq} 个 QQ、{black_group} 个群）"
+        f"黑名单生效中（{black_qq} 个用户、{black_group} 个群/频道）"
         if black_enabled
         else f"黑名单已关闭（保留 {black_qq + black_group} 项，不拦截）"
     )
@@ -51,7 +51,10 @@ class AccessListsPage(Page):
     refresh_on_activate = True
     page_id = "access"
     page_title = "黑白名单"
-    page_subtitle = "统一管理入站策略、白名单和黑名单。黑名单优先于白名单与管理员审核；保存后立即生效。"
+    page_subtitle = (
+        "统一管理入站策略、白名单和黑名单。ID 按字符串保存，Telegram 群/频道 ID "
+        "可以填负数。黑名单优先于白名单与管理员审核；保存后立即生效。"
+    )
     page_icon = "system-users-symbolic"
 
     def build(self) -> None:
@@ -79,7 +82,8 @@ class AccessListsPage(Page):
         self.wl_card.append(
             widgets.section_header(
                 "白名单",
-                "限制哪些 QQ 号或群可以触发回复；仅在 mode=whitelist 时严格生效。",
+                "限制哪些用户或群/频道可以触发回复；仅在 mode=whitelist 时严格生效。"
+                "QQ 填数字，Telegram 群/频道填负数 ID。",
             )
         )
         self.wl_mode = widgets.dropdown(
@@ -93,13 +97,13 @@ class AccessListsPage(Page):
         self.wl_mode.connect("notify::selected", lambda *_: self._mark_dirty())
         self.wl_card.append(self._field("入站策略", self.wl_mode))
         self.wl_qq = widgets.ChipList(
-            "白名单 QQ 号",
-            "输入 QQ 号后回车，可一次粘贴多个",
+            "白名单用户 ID",
+            "输入 QQ 号 / Telegram 用户 ID 后回车，可一次粘贴多个",
             on_changed=lambda _v: self._mark_dirty(),
         )
         self.wl_group = widgets.ChipList(
-            "白名单群号",
-            "输入群号后回车，可一次粘贴多个",
+            "白名单群/频道 ID",
+            "输入群号 / 频道 ID 后回车，Telegram 群 ID 可为负数",
             on_changed=lambda _v: self._mark_dirty(),
         )
         self.wl_card.append(self.wl_qq)
@@ -126,13 +130,13 @@ class AccessListsPage(Page):
         enabled_row.append(widgets.label("启用黑名单（关闭时名单保留但不拦截）"))
         self.bl_card.append(enabled_row)
         self.bl_qq = widgets.ChipList(
-            "拉黑的 QQ 号",
-            "输入 QQ 号后回车，可一次粘贴多个",
+            "拉黑的用户 ID",
+            "输入 QQ 号 / Telegram 用户 ID 后回车，可一次粘贴多个",
             on_changed=lambda _v: self._mark_dirty(),
         )
         self.bl_group = widgets.ChipList(
-            "拉黑的群",
-            "输入群号后回车，可一次粘贴多个",
+            "拉黑的群/频道",
+            "输入群号 / 频道 ID 后回车，Telegram 群 ID 可为负数",
             on_changed=lambda _v: self._mark_dirty(),
         )
         self.bl_card.append(self.bl_qq)
@@ -262,7 +266,7 @@ class AccessListsPage(Page):
             widgets.ConfirmDialog(
                 self.app.window,
                 heading="白名单为空，确定保存？",
-                body="当前入站策略是 whitelist，且白名单里没有任何 QQ 或群。"
+                body="当前入站策略是 whitelist，且白名单里没有任何用户或群/频道。"
                 "保存后所有入站消息都会被拦截。",
                 confirm_label="仍然保存",
                 destructive=True,

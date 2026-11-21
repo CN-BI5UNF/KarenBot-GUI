@@ -12,7 +12,10 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import GLib, Gtk  # noqa: E402
 
-from .. import widgets  # noqa: E402
+from .. import (  # noqa: E402
+    adapter_spec,
+    widgets,
+)
 from .base import Page  # noqa: E402
 
 REFRESH_SECONDS = 2
@@ -101,7 +104,7 @@ class OverviewPage(Page):
     page_id = "overview"
     page_title = "总览"
     page_subtitle = "运行状态、模型健康与用量。数据每 2 秒自动刷新。"
-    page_icon = "speedometer-symbolic"
+    page_icon = "view-app-grid-symbolic"
 
     def build(self) -> None:
         self._disposed = False
@@ -296,6 +299,8 @@ class OverviewPage(Page):
         state = str(status.get("state") or "unknown")
         connected = bool(status.get("adapter_connected"))
         adapter = status.get("adapter") or {}
+        if not isinstance(adapter, dict):
+            adapter = {}
         self.adapter_card.append(widgets.label("渠道状态", css="stat-label"))
         if state == "running":
             text, tone = (
@@ -312,15 +317,20 @@ class OverviewPage(Page):
             )
         self.adapter_card.append(widgets.badge(text, css=tone))
         if adapter:
-            path = str(adapter.get("path") or "")
-            address = (
-                f"{adapter.get('mode', '')} · "
-                f"{adapter.get('host', '')}:{adapter.get('port', '')}"
+            summary = adapter_spec.adapter_summary(adapter)
+            address = adapter_spec.adapter_address(adapter)
+            if summary:
+                self.adapter_card.append(widgets.muted(summary))
+            detail = " · ".join(
+                part
+                for part in (
+                    adapter_spec.adapter_source(adapter),
+                    address,
+                )
+                if part
             )
-            if path and path != "/":
-                address += path
-            name = str(adapter.get("name") or "default")
-            self.adapter_card.append(widgets.muted(f"{name} · {address}"))
+            if detail:
+                self.adapter_card.append(widgets.muted(detail))
         else:
             self.adapter_card.append(widgets.muted("未配置渠道"))
         self.adapter_card.append(

@@ -32,6 +32,11 @@ class Page(Gtk.ScrolledWindow):
         self.body.set_margin_bottom(40)
         self.body.set_margin_start(32)
         self.body.set_margin_end(32)
+        # 点击页面空白/卡片等非控件区域时，把键盘焦点从左侧列表移到正文。
+        # 使用冒泡阶段：按钮、输入框、列表行会先消费自己的点击，不受影响。
+        self._content_click = Gtk.GestureClick()
+        self._content_click.connect("pressed", self._on_content_pressed)
+        self.body.add_controller(self._content_click)
         # WebUI 内容区最大宽度 1100px，窗口拉宽时不把表单摊成整屏。
         clamp = Adw.Clamp()
         clamp.set_maximum_size(1100)
@@ -39,6 +44,8 @@ class Page(Gtk.ScrolledWindow):
         clamp.set_child(self.body)
         self.set_child(clamp)
         self.build()
+        # 点击右侧内容后把焦点从侧栏列表移到页面，↑/↓ 才能像滚轮一样滚动。
+        widgets.enable_scroll_focus(self)
 
     # ------------------------------------------------------------------
     # Subclass API
@@ -66,6 +73,29 @@ class Page(Gtk.ScrolledWindow):
 
     def refresh(self) -> None:
         pass
+
+    def focus_content(self) -> None:
+        """Move keyboard focus from the nav list into the page scroller.
+
+        Called when the user clicks a non-interactive part of the right-hand
+        area.  Focusing the scroller (rather than the first form control)
+        makes Up/Down behave like the mouse wheel, matching the user's
+        expectation.  Clicking an actual control still keeps its own focus.
+        """
+        self.grab_focus()
+
+    def _on_content_pressed(
+        self,
+        gesture: Gtk.GestureClick,
+        _n_press: int,
+        x: float,
+        y: float,
+    ) -> None:
+        widget = gesture.get_widget()
+        picked = widget.pick(x, y, Gtk.PickFlags.DEFAULT) if widget is not None else None
+        if widgets.is_interactive_target(picked):
+            return
+        self.focus_content()
 
     def refresh_requested(self) -> None:
         """Header refresh button hook; pages may override for a full reload."""

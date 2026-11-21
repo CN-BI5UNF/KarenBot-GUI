@@ -6,6 +6,8 @@ import argparse
 import importlib
 import logging
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -16,8 +18,11 @@ gi.require_version("Adw", "1")
 gi.require_version("Gdk", "4.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
+from . import (  # noqa: E402
+    adapter_spec,
+    widgets,
+)
 from . import theme as skin_theme  # noqa: E402
-from . import widgets  # noqa: E402
 from .api import ApiClient  # noqa: E402
 from .identity import application_id  # noqa: E402
 from .local_server import LocalControlServer  # noqa: E402
@@ -28,7 +33,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # WebUI 的导航顺序与标题。第四列保留给旧的元组解包代码，不再显示分组标题。
 NAV_ITEMS = [
-    ("overview", "总览", "speedometer-symbolic", "", "overview", "OverviewPage"),
+    ("overview", "总览", "view-app-grid-symbolic", "", "overview", "OverviewPage"),
     ("chats", "对话", "mail-unread-symbolic", "", "chats", "ChatsPage"),
     ("memory", "记忆", "user-bookmarks-symbolic", "", "memory", "MemoryPage"),
     ("mind", "人格后台", "emblem-favorite-symbolic", "", "mind", "MindPage"),
@@ -42,14 +47,33 @@ NAV_ITEMS = [
     ("storage", "存储与数据", "drive-harddisk-symbolic", "", "storage", "StoragePage"),
     ("access", "黑白名单", "system-users-symbolic", "", "access", "AccessListsPage"),
     ("triggers", "群聊触发", "preferences-system-notifications-symbolic", "", "triggers", "TriggersPage"),
-    ("settings", "设置", "emblem-system-symbolic", "", "settings", "SettingsPage"),
 ]
 
+# 设置不再占用侧栏导航，改为左下角的纯齿轮按钮；仍保留页面描述供
+# show_page("settings") 与顶部窗口标题使用。
 # WebUI 通过总览页的更新提示和设置页打开更新面板，导航栏里没有单独的“更新”。
 # 原生 GUI 保留这个页面，但不占用侧栏位置。
 HIDDEN_PAGES = [
     ("updates", "更新", "software-update-available-symbolic", "", "updates", "UpdatesPage"),
+    ("settings", "设置", "emblem-system-symbolic", "", "settings", "SettingsPage"),
 ]
+
+# 部分桌面图标主题（如 Flat-Remix）没有 Adwaita 的 chat-message-new-symbolic。
+# 按顺序选择第一个当前主题存在的图标，避免显示 image-missing 占位图。
+NAV_ICON_FALLBACKS: dict[str, tuple[str, ...]] = {
+    "overview": (
+        "view-app-grid-symbolic",
+        "view-grid-symbolic",
+        "applications-system-symbolic",
+    ),
+    "slang": (
+        "chat-message-new-symbolic",
+        # Flat-Remix 的 dialog-messages 是坏图标，改用文字/便签类图标。
+        "accessories-text-editor-symbolic",
+        "insert-text-symbolic",
+        "mail-message-new-symbolic",
+    ),
+}
 
 SIDEBAR_WIDTH = 200
 SIDEBAR_COLLAPSED_WIDTH = 64
@@ -195,6 +219,15 @@ def _dark_preferred() -> bool:
         return False
 
 
+def _load_provider_css(provider: Gtk.CssProvider, css: str) -> None:
+    """Load CSS on both GTK >= 4.12 (load_from_string) and older 4.x."""
+    loader = getattr(provider, "load_from_string", None)
+    if callable(loader):
+        loader(css)
+    else:
+        provider.load_from_data(css.encode("utf-8"))
+
+
 def load_css(dark: bool | None = None) -> None:
     global _CSS_PROVIDER, _EXTERNAL_CSS_PROVIDER, _BASE_CSS_PROVIDER
     if dark is None:
@@ -217,7 +250,7 @@ def load_css(dark: bool | None = None) -> None:
     # 系统皮肤也要遵守字号设置；这里先放一条基础规则，内置样式随后覆盖。
     base = Gtk.CssProvider()
     try:
-        base.load_from_string(skin_theme.base_font_css(scale))
+        _load_provider_css(base, skin_theme.base_font_css(scale))
     except Exception:  # noqa: BLE001
         logger.warning("加载基础字体样式失败", exc_info=True)
     else:
@@ -238,8 +271,9 @@ def load_css(dark: bool | None = None) -> None:
             rules = skin_theme.scale_font_sizes(rules, scale)
             provider = Gtk.CssProvider()
             try:
-                provider.load_from_string(
-                    (_DARK_PALETTE if dark else _LIGHT_PALETTE) + "\n" + rules
+                _load_provider_css(
+                    provider,
+                    (_DARK_PALETTE if dark else _LIGHT_PALETTE) + "\n" + rules,
                 )
             except Exception:  # noqa: BLE001
                 logger.warning("加载 GUI 样式失败", exc_info=True)
@@ -253,7 +287,7 @@ def load_css(dark: bool | None = None) -> None:
     if external:
         provider = Gtk.CssProvider()
         try:
-            provider.load_from_string(external)
+            _load_provider_css(provider, external)
         except Exception:  # noqa: BLE001
             logger.warning("加载外部 GTK4 主题失败", exc_info=True)
         else:
@@ -286,6 +320,9 @@ class MainWindow(Adw.ApplicationWindow):
         self._status_error_active = False
         self._status_error_before = ""
         self._last_status_notice: tuple[Any, ...] | None = None
+        self._program_failure_seen: dict[str, int] = {}
+        self._program_failure_pending: dict[str, tuple[int, str, str]] = {}
+        self._program_failure_dialog: Adw.MessageDialog | None = None
         self._version_ready = False
         self._version_tooltip = ""
         self._data_dir = ""
@@ -294,6 +331,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._unsaved_dialog: Adw.MessageDialog | None = None
         self._runtime_restart_busy = False
         self._force_close = False
+        self._settings_fullscreen = False
+        self._settings_previous_page = ""
         widgets.install_callback_pump()
         self._build_shell()
         self._show_loading("正在启动本地控制服务…（首次启动约需 20 秒）")
@@ -339,7 +378,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.brand_text.set_hexpand(True)
         self.brand.append(self.brand_text)
         self.sidebar_toggle = widgets.icon_button(
-            "sidebar-show-symbolic", "折叠侧栏", css="flat sidebar-toggle"
+            "go-previous-symbolic", "折叠侧栏", css="flat sidebar-toggle"
         )
         self.sidebar_toggle.connect("clicked", lambda _b: self.toggle_sidebar())
         self.brand.append(self.sidebar_toggle)
@@ -359,18 +398,32 @@ class MainWindow(Adw.ApplicationWindow):
         nav_scroller.add_css_class("sidebar-scroll")
         self.sidebar.append(nav_scroller)
 
-        self.sidebar_foot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        self.sidebar_foot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.sidebar_foot.add_css_class("sidebar-foot")
+        self.version_label = widgets.label("开发版", css="app-version")
+        self.version_label.set_tooltip_text("正在读取版本…")
+        self.sidebar_foot.append(self.version_label)
+        # 左下角只保留齿轮图标；设置页仍由 Gtk.Stack 承载，点击后切换过去。
+        self.sidebar_foot_row = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=8
+        )
+        self.footer_settings_button = widgets.icon_button(
+            "emblem-system-symbolic", "设置", css="flat sidebar-settings"
+        )
+        self.footer_settings_button.set_halign(Gtk.Align.START)
+        self.footer_settings_button.connect(
+            "clicked", lambda _b: self.show_page("settings")
+        )
+        self.sidebar_foot_row.append(self.footer_settings_button)
         self.runtime_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.runtime_box.set_hexpand(True)
         self.runtime_dot = widgets.status_dot(None)
         self.runtime_label = widgets.label("连接中…", css="conn-text")
         self.runtime_label.set_hexpand(True)
         self.runtime_box.append(self.runtime_dot)
         self.runtime_box.append(self.runtime_label)
-        self.sidebar_foot.append(self.runtime_box)
-        self.version_label = widgets.label("开发版", css="app-version")
-        self.version_label.set_tooltip_text("正在读取版本…")
-        self.sidebar_foot.append(self.version_label)
+        self.sidebar_foot_row.append(self.runtime_box)
+        self.sidebar_foot.append(self.sidebar_foot_row)
         self.sidebar.append(self.sidebar_foot)
         self._apply_sidebar_state(self._sidebar_collapsed, persist=False)
         root.set_start_child(self.sidebar)
@@ -382,6 +435,16 @@ class MainWindow(Adw.ApplicationWindow):
         header.set_show_start_title_buttons(False)
         # WebUI 顶栏没有居中窗口标题；用空 title widget 覆盖 Adw 默认绑定。
         header.set_title_widget(Gtk.Box())
+        # 设置页铺满窗口时，左上角保留返回按钮；普通页面隐藏。
+        self.back_button = widgets.button(
+            "返回",
+            icon="go-previous-symbolic",
+            css="flat compact-button topbar-back",
+        )
+        self.back_button.set_tooltip_text("返回（Alt+← / Ctrl+,）")
+        self.back_button.set_visible(False)
+        self.back_button.connect("clicked", lambda _b: self._leave_settings())
+        header.pack_start(self.back_button)
         self.adapter_badge = widgets.label(
             "启动中", css="badge badge-idle topbar-badge"
         )
@@ -487,15 +550,44 @@ class MainWindow(Adw.ApplicationWindow):
         if brand is not None:
             brand.set_halign(Gtk.Align.CENTER if collapsed else Gtk.Align.FILL)
         self.brand_text.set_visible(not collapsed)
+        self.sidebar_toggle.set_icon_name(
+            "go-next-symbolic" if collapsed else "go-previous-symbolic"
+        )
         self.sidebar_toggle.set_tooltip_text("展开侧栏" if collapsed else "折叠侧栏")
         self.version_label.set_visible(not collapsed)
         self.runtime_label.set_visible(not collapsed)
+        foot_row = getattr(self, "sidebar_foot_row", None)
+        if foot_row is not None:
+            foot_row.set_halign(
+                Gtk.Align.CENTER if collapsed else Gtk.Align.FILL
+            )
         for label in getattr(self, "_nav_labels", []):
             label.set_visible(not collapsed)
         for content in getattr(self, "_nav_contents", []):
             content.set_halign(Gtk.Align.CENTER if collapsed else Gtk.Align.FILL)
         if persist:
             _write_sidebar_collapsed(collapsed)
+
+    def _set_settings_fullscreen(self, active: bool) -> None:
+        """Hide the sidebar while settings is open; the top bar stays."""
+        active = bool(active)
+        if active == self._settings_fullscreen:
+            return
+        self._settings_fullscreen = active
+        if hasattr(self, "back_button"):
+            self.back_button.set_visible(active)
+        if active:
+            self.sidebar.set_visible(False)
+            self.shell_paned.set_position(0)
+        else:
+            self.sidebar.set_visible(True)
+            self._apply_sidebar_state(self._sidebar_collapsed, persist=False)
+
+    def _leave_settings(self) -> None:
+        target = self._settings_previous_page or "overview"
+        if target in ("", "settings"):
+            target = "overview"
+        self.show_page(target)
 
     def _toggle_fullscreen(self) -> None:
         if self.is_fullscreen():
@@ -562,6 +654,16 @@ class MainWindow(Adw.ApplicationWindow):
         if keyval == Gdk.KEY_F11:
             self._toggle_fullscreen()
             return True
+        if keyval == Gdk.KEY_Escape and self.current_page_id == "settings":
+            self._leave_settings()
+            return True
+        if (
+            keyval == Gdk.KEY_Left
+            and (state & Gdk.ModifierType.ALT_MASK)
+            and self.current_page_id == "settings"
+        ):
+            self._leave_settings()
+            return True
         if not (state & Gdk.ModifierType.CONTROL_MASK):
             return False
         if keyval == Gdk.KEY_r:
@@ -569,6 +671,12 @@ class MainWindow(Adw.ApplicationWindow):
             return True
         if keyval == Gdk.KEY_q:
             self.close()
+            return True
+        if keyval == Gdk.KEY_comma:
+            if self.current_page_id == "settings":
+                self._leave_settings()
+            else:
+                self.show_page("settings")
             return True
         if Gdk.KEY_1 <= keyval <= Gdk.KEY_9:
             index = keyval - Gdk.KEY_1
@@ -586,9 +694,11 @@ class MainWindow(Adw.ApplicationWindow):
             content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
             content.add_css_class("nav-content")
             content.set_halign(Gtk.Align.FILL)
-            icon_widget = Gtk.Image.new_from_icon_name(icon)
-            icon_widget.set_pixel_size(16)
-            icon_widget.add_css_class("nav-icon")
+            icon_widget = widgets.icon_image(
+                NAV_ICON_FALLBACKS.get(page_id, (icon,)),
+                pixel_size=16,
+                css="nav-icon",
+            )
             content.append(icon_widget)
             nav_label = widgets.label(title_text, css="nav-label")
             content.append(nav_label)
@@ -599,6 +709,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._nav_contents.append(content)
 
     def _show_loading(self, message: str) -> None:
+        self._set_settings_fullscreen(False)
         page = getattr(self, "_loading_page", None)
         if page is None:
             page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
@@ -643,6 +754,7 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_backend_error(self, exc: BaseException) -> None:
         self._backend_restart_busy = False
+        self._set_settings_fullscreen(False)
         self.runtime_label.set_text("后端启动失败")
         page = getattr(self, "_backend_error_page", None)
         if page is None:
@@ -672,12 +784,28 @@ class MainWindow(Adw.ApplicationWindow):
         self._status_failures = 0
         self._status_error_active = False
         self._version_ready = False
-        if self.backend is not None:
-            self.backend.stop()
+        old_backend = self.backend
         self.backend = None
         self.api = None
         self._show_loading("正在重试本地控制服务…")
-        self._start_backend()
+        if old_backend is None:
+            self._start_backend()
+            return
+
+        # stop() can take seconds while the Runtime tears down adapters; keep
+        # the GTK main loop responsive instead of joining it here.
+        def _stop() -> bool:
+            old_backend.stop()
+            return True
+
+        def _stopped(_result: bool) -> None:
+            self._start_backend()
+
+        widgets.run_async(
+            _stop,
+            on_success=_stopped,
+            on_error=lambda _exc: self._start_backend(),
+        )
 
     def restart_backend(self) -> None:
         """Restart the GUI-owned backend so changed Python code is reloaded.
@@ -736,6 +864,11 @@ class MainWindow(Adw.ApplicationWindow):
         self._last_runtime_state = ""
         self._status_poll_busy = False
         self._last_status_state = ""
+        self._program_failure_seen.clear()
+        self._program_failure_pending.clear()
+        if self._program_failure_dialog is not None:
+            self._program_failure_dialog.close()
+            self._program_failure_dialog = None
 
     def _first_status_poll(self) -> bool:
         self._poll_status()
@@ -800,11 +933,15 @@ class MainWindow(Adw.ApplicationWindow):
                 self.toast(f"Runtime 启动失败：{notice[0]}")
             for warning in notice[1]:
                 self.toast(f"警告：{warning}")
+        if state == "running" and not setup_required:
+            self._maybe_show_program_failures(self.status)
         if state == "running" and not self._version_ready:
             self._load_version_info()
         persona = str(self.status.get("persona") or self.status.get("persona_id") or "—")
         connected = bool(self.status.get("adapter_connected"))
         adapter = self.status.get("adapter") or {}
+        if not isinstance(adapter, dict):
+            adapter = {}
 
         if state != "running":
             failed = state == "error"
@@ -815,14 +952,26 @@ class MainWindow(Adw.ApplicationWindow):
             )
         elif not adapter:
             self._set_badge(self.adapter_badge, "未配置渠道", "badge-warn")
-        elif connected:
-            self._set_badge(
-                self.adapter_badge,
-                f"已就位 · {adapter.get('mode', '')}://{adapter.get('host', '')}:{adapter.get('port', '')}",
-                "badge-ok",
-            )
+            self.adapter_badge.set_tooltip_text("")
         else:
-            self._set_badge(self.adapter_badge, "渠道未连接", "badge-idle")
+            # 新后端只保证 type/transport/dialect；Telegram 没有 host/port。
+            summary = adapter_spec.adapter_summary(adapter)
+            address = adapter_spec.adapter_address(adapter)
+            if connected:
+                self._set_badge(
+                    self.adapter_badge,
+                    f"已就位 · {summary}" if summary else "已就位",
+                    "badge-ok",
+                )
+            else:
+                self._set_badge(
+                    self.adapter_badge,
+                    f"渠道未连接 · {summary}" if summary else "渠道未连接",
+                    "badge-idle",
+                )
+            self.adapter_badge.set_tooltip_text(
+                "\n".join(part for part in (summary, address) if part)
+            )
         self.persona_label.set_text(f"当前人格：{persona}")
 
         if state == "running":
@@ -871,6 +1020,73 @@ class MainWindow(Adw.ApplicationWindow):
             if page is not None and page.loaded:
                 page.apply_status(self.status)
 
+    def _maybe_show_program_failures(self, status: dict[str, Any]) -> None:
+        """Aggregate new external-program failures into one dialog per episode."""
+        fresh: dict[str, tuple[int, str, str]] = {}
+        for item in status.get("programs") or []:
+            if not isinstance(item, dict):
+                continue
+            state = str(item.get("state") or "")
+            if state != "failed":
+                continue
+            try:
+                seq = int(item.get("failure_seq") or 0)
+            except (TypeError, ValueError):
+                continue
+            program_id = str(item.get("id") or "")
+            if not program_id or seq <= 0:
+                continue
+            if seq <= self._program_failure_seen.get(program_id, 0):
+                continue
+            fresh[program_id] = (
+                seq,
+                str(item.get("name") or program_id),
+                str(item.get("error") or "启动失败"),
+            )
+        if not fresh:
+            return
+        if self._program_failure_dialog is not None:
+            # 已有弹窗时不叠加；先挂起，关闭后再提醒一次。
+            self._program_failure_pending.update(fresh)
+            return
+        self._show_program_failure_dialog(fresh)
+
+    def _show_program_failure_dialog(
+        self, failures: dict[str, tuple[int, str, str]]
+    ) -> None:
+        if not failures:
+            return
+        for program_id, (seq, _name, _error) in failures.items():
+            self._program_failure_seen[program_id] = seq
+        lines = [
+            f"• {name}：{error}"
+            for _pid, (_seq, name, error) in list(failures.items())[:6]
+        ]
+        if len(failures) > 6:
+            lines.append(f"…另有 {len(failures) - 6} 个程序失败")
+        dialog = Adw.MessageDialog.new(
+            self,
+            "外部程序启动失败",
+            "\n".join(lines) + "\n\n可在 设置 → 外部程序 查看详情或重试。",
+        )
+        dialog.add_response("ok", "知道了")
+        dialog.set_default_response("ok")
+        dialog.set_close_response("ok")
+        self._program_failure_dialog = dialog
+
+        def _closed(*_args: Any) -> None:
+            self._program_failure_dialog = None
+            dialog.close()
+            if self._program_failure_pending:
+                pending = self._program_failure_pending
+                self._program_failure_pending = {}
+                GLib.timeout_add(
+                    200, lambda: self._show_program_failure_dialog(pending)
+                )
+
+        dialog.connect("response", _closed)
+        dialog.present()
+
     def _on_status_error(
         self, exc: BaseException, generation: int
     ) -> None:
@@ -888,6 +1104,7 @@ class MainWindow(Adw.ApplicationWindow):
         if self._status_error_active:
             return
         self._status_error_active = True
+        self._set_settings_fullscreen(False)
         self._status_error_before = self.current_page_id or "overview"
         page = getattr(self, "_status_error_page", None)
         if page is None:
@@ -970,6 +1187,52 @@ class MainWindow(Adw.ApplicationWindow):
     # ------------------------------------------------------------------
     # Navigation
     # ------------------------------------------------------------------
+    @staticmethod
+    def _is_interactive_target(widget: Gtk.Widget | None) -> bool:
+        """Whether a click landed on a control that should keep its own focus."""
+        node = widget
+        while node is not None:
+            if isinstance(
+                node,
+                (
+                    Gtk.Entry,
+                    Gtk.SpinButton,
+                    Gtk.Button,
+                    Gtk.Switch,
+                    Gtk.DropDown,
+                    Gtk.TextView,
+                    Gtk.ListBox,
+                    Gtk.ListBoxRow,
+                ),
+            ):
+                return True
+            node = node.get_parent()
+        return False
+
+    def _on_content_clicked(
+        self,
+        gesture: Gtk.GestureClick,
+        _n_press: int,
+        x: float,
+        y: float,
+    ) -> None:
+        widget = gesture.get_widget()
+        if widget is None:
+            return
+        if self._is_interactive_target(widget.pick(x, y, Gtk.PickFlags.DEFAULT)):
+            return
+        page = self.pages.get(self.current_page_id)
+        focus_content = getattr(page, "focus_content", None)
+        if callable(focus_content):
+            focus_content()
+            return
+        visible = self.stack.get_visible_child()
+        target = widgets.first_focusable(visible, inputs_only=True)
+        if target is None:
+            target = widgets.first_focusable(visible)
+        if target is not None:
+            target.grab_focus()
+
     def _on_nav_selected(self, _list: Gtk.ListBox, row: Gtk.ListBoxRow | None) -> None:
         if row is None or self._nav_guard:
             return
@@ -990,13 +1253,24 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _restore_nav_selection(self) -> None:
         row = self.nav_rows.get(self.current_page_id)
-        if row is None:
-            return
         self._nav_guard = True
         try:
-            self.nav_list.select_row(row)
+            if row is None:
+                # 设置页没有侧栏行；清掉残留高亮，避免看起来仍停在上一页。
+                self.nav_list.unselect_all()
+            else:
+                self.nav_list.select_row(row)
         finally:
             self._nav_guard = False
+
+    def _set_settings_button_active(self, active: bool) -> None:
+        button = getattr(self, "footer_settings_button", None)
+        if button is None:
+            return
+        if active:
+            button.add_css_class("active")
+        else:
+            button.remove_css_class("active")
 
     def _discard_current_unsaved(self) -> None:
         page = self.pages.get(self.current_page_id)
@@ -1073,11 +1347,22 @@ class MainWindow(Adw.ApplicationWindow):
             return
         if page is None:
             return
+        if page_id == "settings" and self.current_page_id not in ("", "settings"):
+            self._settings_previous_page = self.current_page_id
         self.current_page_id = page_id
         self.stack.set_visible_child(page)
+        self._set_settings_fullscreen(page_id == "settings")
         row = self.nav_rows.get(page_id)
-        if row is not None and self.nav_list.get_selected_row() is not row:
-            self.nav_list.select_row(row)
+        if row is not None:
+            if self.nav_list.get_selected_row() is not row:
+                self.nav_list.select_row(row)
+        else:
+            self._nav_guard = True
+            try:
+                self.nav_list.unselect_all()
+            finally:
+                self._nav_guard = False
+        self._set_settings_button_active(page_id == "settings")
         self.set_title(f"{page.page_title or 'Karen'} · KarenBot")
         page.activate()
         if section:
@@ -1208,7 +1493,8 @@ class MainWindow(Adw.ApplicationWindow):
 
     def close_request(self) -> bool:
         if self.backend is not None:
-            self.backend.stop()
+            # Never join the Runtime on the GTK thread (see _on_close_request).
+            self.backend.stop(wait=False)
         return False
 
 
@@ -1236,6 +1522,7 @@ class KarenApplication(Adw.Application):
             chosen = _read_theme_preference()
         self.theme = chosen
         self.window: MainWindow | None = None
+        self._shutting_down = False
         self.connect("activate", self._on_activate)
         self.connect("shutdown", self._on_shutdown)
 
@@ -1270,15 +1557,83 @@ class KarenApplication(Adw.Application):
         self.window.present()
 
     def _on_close_request(self, window: Gtk.Window) -> bool:
+        if self._shutting_down:
+            return True
         if self.window is not None and not self.window.confirm_close():
             return True
-        if self.window is not None and self.window.backend is not None:
-            self.window.backend.stop()
-        return False
+        self._request_shutdown()
+        # 先扣住关闭请求，等后台线程把 Runtime 停干净（或超时）再销毁窗口。
+        return True
+
+    def _request_shutdown(self) -> None:
+        """Stop the embedded Runtime without blocking the GTK main thread.
+
+        ``LocalControlServer.stop()`` joins the backend thread.  Adapter
+        reconnect loops and httpx teardown can exceed the join timeout; doing
+        that on the GTK thread made Windows report the window as "not
+        responding" and kill the process (AppHangB1 / 0xCFFFFFFF).
+        """
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        window = self.window
+        backend = window.backend if window is not None else None
+        if window is not None:
+            window.set_sensitive(False)
+            try:
+                window.set_title("KarenBot（正在退出…）")
+            except Exception:  # noqa: BLE001
+                pass
+        done = threading.Event()
+
+        def _stop() -> None:
+            try:
+                if backend is not None:
+                    backend.stop(timeout=10.0)
+            except BaseException:  # noqa: BLE001 - never leave "done" unset
+                logger.exception("关闭本地后端失败")
+            finally:
+                done.set()
+
+        threading.Thread(
+            target=_stop,
+            name="karen-gui-shutdown",
+            daemon=True,
+        ).start()
+        deadline = time.monotonic() + 12.0
+
+        def _poll() -> bool:
+            if done.is_set():
+                self._finish_shutdown()
+                return False
+            if time.monotonic() >= deadline:
+                logger.warning("本地后端未在 12s 内退出，强制关闭窗口")
+                self._finish_shutdown()
+                return False
+            return True
+
+        GLib.timeout_add(100, _poll)
+
+    def _finish_shutdown(self) -> None:
+        window = self.window
+        self.window = None
+        if window is not None:
+            window.destroy()
+        self.quit()
 
     def _on_shutdown(self, _app: Gio.Application) -> None:
-        if self.window is not None and self.window.backend is not None:
-            self.window.backend.stop()
+        if self.window is None:
+            return
+        backend = self.window.backend
+        if backend is None:
+            return
+        if self._shutting_down:
+            # 关闭请求已经由后台线程 stop()；这里只补一次信号，不再 join。
+            backend.stop(wait=False)
+        else:
+            # 外部触发的退出（系统注销等）：窗口已经销毁，join 不会让系统
+            # 判定“无响应”，但仍给 Runtime 一个有限的收尾时间。
+            backend.stop(timeout=5.0)
 
 
 def main(argv: list[str] | None = None) -> int:

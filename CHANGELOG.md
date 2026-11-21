@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.1.1-alpha.2 — 2026-11-21
+
+过渡版本：GUI 模块 `0.1.1-alpha.2`，应用代码 `1.0.1-alpha.2`。更新页已适配 KarenBot 统一发行版；请更新后端与本前端后，手动选择 `v2.0.0-alpha`。
+
+- 更新页在 `distribution=true` 时显示单一「KarenBot 发行版」列表；任何版本都会同时更新后端与当前前端，旧后端自动回退双组件列表。
+- 修复 pythonw 下启动器 `sys.stderr is None` 崩溃、子进程输出重定向与失败弹窗；关闭时后台停止 Runtime，避免 GTK 主线程卡死。
+- 设置页新增「外部程序」：随 KarenBot 启动多个自定义程序，支持端口探测、自动重启、环境变量/工作目录和「随 KarenBot 关闭」；保存后热应用，启动失败按 `failure_seq` 只弹一次聚合提醒。
+- 移除旧 NapCat 专用 `manage_process` 设置，旧配置由后端自动迁移到外部程序列表。
+
 ## v0.1.1-alpha.1 — 2026-11-15
 
 - 与 `KarenBot-backend`、`KarenBot-WebUI` 的 v0.1.1-alpha.1 配套。

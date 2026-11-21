@@ -15,7 +15,8 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, GLib, Gtk, Pango  # noqa: E402
+gi.require_version("Gdk", "4.0")
+from gi.repository import Adw, Gdk, GLib, Gtk, Pango  # noqa: E402
 
 _EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="karen-gui-http")
 
@@ -185,6 +186,187 @@ def icon_button(icon: str, tooltip: str = "", *, css: str = "flat") -> Gtk.Butto
     if tooltip:
         widget.set_tooltip_text(tooltip)
     return widget
+
+
+def icon_image(
+    names: str | tuple[str, ...],
+    *,
+    pixel_size: int = 16,
+    css: str = "",
+) -> Gtk.Image:
+    """Create an icon image with a theme-aware fallback list.
+
+    Some desktops (e.g. Flat-Remix) do not ship every Adwaita symbolic icon.
+    Passing several names avoids a broken image placeholder in that case.
+    """
+    candidates = (names,) if isinstance(names, str) else tuple(names)
+    chosen = candidates[0] if candidates else "image-missing"
+    display = Gdk.Display.get_default()
+    if display is not None and candidates:
+        theme = Gtk.IconTheme.get_for_display(display)
+        for name in candidates:
+            if theme.has_icon(name):
+                chosen = name
+                break
+    widget = Gtk.Image.new_from_icon_name(chosen)
+    widget.set_pixel_size(int(pixel_size))
+    add_css(widget, css)
+    return widget
+
+
+def _contains_widget(parent: Gtk.Widget, child: Gtk.Widget | None) -> bool:
+    node = child
+    while node is not None:
+        if node is parent:
+            return True
+        node = node.get_parent()
+    return False
+
+
+def _focus_widget(widget: Gtk.Widget) -> Gtk.Widget | None:
+    root = widget.get_root()
+    getter = getattr(root, "get_focus", None)
+    return getter() if callable(getter) else None
+
+
+def enable_scroll_focus(scroller: Gtk.ScrolledWindow, *, step: int = 48) -> None:
+    """Let a click move keyboard focus from a sidebar ListBox into page content.
+
+    Clicking a non-focusable card/label keeps focus on the navigation list, so
+    Up/Down keeps moving the sidebar instead of scrolling the right-hand page.
+    This helper focuses the page scroller on such clicks and lets Up/Down,
+    PageUp/PageDown and Home/End scroll it while the scroller itself has focus.
+    Clicks that land on a real control (entry, dropdown, button, ...) leave
+    focus with that control.
+    """
+    scroller.set_focusable(True)
+
+    click = Gtk.GestureClick()
+
+    def _on_released(
+        _gesture: Gtk.GestureClick, _n_press: int, _x: float, _y: float
+    ) -> None:
+        focus = _focus_widget(scroller)
+        if focus is not None and _contains_widget(scroller, focus):
+            return
+        scroller.grab_focus()
+
+    click.connect("released", _on_released)
+    scroller.add_controller(click)
+
+    keys = Gtk.EventControllerKey()
+
+    def _on_key(
+        _controller: Gtk.EventControllerKey,
+        keyval: int,
+        _keycode: int,
+        state: Gdk.ModifierType,
+    ) -> bool:
+        if state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.ALT_MASK):
+            return False
+        if _focus_widget(scroller) is not scroller:
+            return False
+        adjustment = scroller.get_vadjustment()
+        if adjustment is None:
+            return False
+        # 与鼠标滚轮保持同一档位，避免 ↑/↓ 比滚轮快或慢。
+        wheel = adjustment.get_step_increment() or step
+        page = adjustment.get_page_increment() or (wheel * 5)
+        if keyval == Gdk.KEY_Up:
+            delta = -wheel
+        elif keyval == Gdk.KEY_Down:
+            delta = wheel
+        elif keyval == Gdk.KEY_Page_Up:
+            delta = -page
+        elif keyval == Gdk.KEY_Page_Down:
+            delta = page
+        elif keyval == Gdk.KEY_Home:
+            delta = adjustment.get_lower() - adjustment.get_value()
+        elif keyval == Gdk.KEY_End:
+            delta = (
+                adjustment.get_upper()
+                - adjustment.get_page_size()
+                - adjustment.get_value()
+            )
+        else:
+            return False
+        if not delta:
+            return False
+        lower = adjustment.get_lower()
+        upper = max(lower, adjustment.get_upper() - adjustment.get_page_size())
+        adjustment.set_value(
+            min(max(adjustment.get_value() + delta, lower), upper)
+        )
+        return True
+
+    keys.connect("key-pressed", _on_key)
+    scroller.add_controller(keys)
+
+
+_INPUT_WIDGETS = (
+    Gtk.Entry,
+    Gtk.SpinButton,
+    Gtk.Switch,
+    Gtk.DropDown,
+    Gtk.TextView,
+    Gtk.CheckButton,
+)
+_ANY_FOCUS_WIDGETS = _INPUT_WIDGETS + (Gtk.Button, Gtk.ListBoxRow)
+
+
+def is_interactive_target(widget: Gtk.Widget | None) -> bool:
+    """Whether a click landed on a control that should keep its own focus."""
+    node = widget
+    while node is not None:
+        if isinstance(
+            node,
+            (
+                Gtk.Entry,
+                Gtk.SpinButton,
+                Gtk.Button,
+                Gtk.Switch,
+                Gtk.DropDown,
+                Gtk.TextView,
+                Gtk.ListBox,
+                Gtk.ListBoxRow,
+            ),
+        ):
+            return True
+        node = node.get_parent()
+    return False
+
+
+def first_focusable(
+    widget: Gtk.Widget | None,
+    *,
+    inputs_only: bool = False,
+) -> Gtk.Widget | None:
+    """Return the first mapped, focusable control in *widget*.
+
+    ``inputs_only`` skips buttons/list rows and looks for actual editable
+    controls first, so clicking a card background focuses the form (not the
+    page's refresh button).
+    """
+    if widget is None:
+        return None
+    allowed = _INPUT_WIDGETS if inputs_only else _ANY_FOCUS_WIDGETS
+
+    def _walk(node: Gtk.Widget) -> Gtk.Widget | None:
+        if not node.get_visible() or not node.get_sensitive():
+            return None
+        if not node.get_mapped():
+            return None
+        if isinstance(node, allowed) and node.get_focusable():
+            return node
+        child = node.get_first_child()
+        while child is not None:
+            found = _walk(child)
+            if found is not None:
+                return found
+            child = child.get_next_sibling()
+        return None
+
+    return _walk(widget)
 
 
 def badge(text: str, *, css: str = "badge") -> Gtk.Label:
@@ -682,18 +864,31 @@ def save_path_picker(
     return result.get("path", "")
 
 
+def _id_sort_key(value: str) -> tuple[int, int, str]:
+    """Sort numeric IDs numerically and non-numeric IDs after them."""
+    try:
+        return (0, int(value), "")
+    except (TypeError, ValueError):
+        return (1, 0, str(value))
+
+
 class ChipList(Gtk.Box):
-    """Numeric ID editor with removable chips (WebUI whitelist/blacklist)."""
+    """String ID editor with removable chips (whitelist/blacklist).
+
+    IDs are kept as strings because the backend normalises QQ numbers,
+    Telegram negative group IDs and future non-numeric platform IDs the same
+    way.  ``0`` is invalid and silently dropped.
+    """
 
     def __init__(
         self,
         title: str,
         placeholder: str,
         *,
-        on_changed: Callable[[list[int]], None] | None = None,
+        on_changed: Callable[[list[str]], None] | None = None,
     ) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=5)
-        self._values: list[int] = []
+        self._values: list[str] = []
         self._on_changed = on_changed
         self.append(label(title, css="field-label"))
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -709,45 +904,50 @@ class ChipList(Gtk.Box):
         self.chip_host = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self.append(self.chip_host)
 
-    def get_values(self) -> list[int]:
+    def get_values(self) -> list[str]:
         return list(self._values)
 
     def set_values(self, values: Any, *, notify: bool = False) -> None:
-        parsed: set[int] = set()
-        for raw in values or []:
-            try:
-                value = int(raw)
-            except (TypeError, ValueError):
-                continue
-            if value > 0:
-                parsed.add(value)
-        self._values = sorted(parsed)
+        parsed = self._normalize(values)
+        self._values = parsed
         self._render()
         if notify and self._on_changed is not None:
             self._on_changed(self.get_values())
 
     @staticmethod
-    def _parse(text: str) -> list[int]:
-        result: set[int] = set()
-        for chunk in str(text or "").replace("，", ",").replace("、", ",").replace(";", ",").replace("；", ",").split():
-            for piece in chunk.split(","):
-                piece = piece.strip()
-                if not piece:
-                    continue
-                try:
-                    value = int(piece)
-                except ValueError:
-                    continue
-                if value > 0:
-                    result.add(value)
-        return sorted(result)
+    def _normalize(values: Any) -> list[str]:
+        result: set[str] = set()
+        for raw in values or []:
+            text = str(raw).strip()
+            if not text or text == "0":
+                continue
+            result.add(text)
+        return sorted(result, key=_id_sort_key)
+
+    @staticmethod
+    def _parse(text: str) -> list[str]:
+        result: set[str] = set()
+        normalized = (
+            str(text or "")
+            .replace("，", ",")
+            .replace("、", ",")
+            .replace(";", ",")
+            .replace("；", ",")
+            .replace("\n", ",")
+        )
+        for piece in normalized.split(","):
+            piece = piece.strip()
+            if not piece or piece == "0":
+                continue
+            result.add(piece)
+        return sorted(result, key=_id_sort_key)
 
     def _add_from_entry(self) -> None:
         values = self._parse(self.entry.get_text())
         if not values:
             return
         self.entry.set_text("")
-        merged = sorted(set(self._values) | set(values))
+        merged = sorted(set(self._values) | set(values), key=_id_sort_key)
         if merged == self._values:
             return
         self._values = merged
@@ -755,7 +955,7 @@ class ChipList(Gtk.Box):
         if self._on_changed is not None:
             self._on_changed(self.get_values())
 
-    def _remove(self, value: int) -> None:
+    def _remove(self, value: str) -> None:
         if value not in self._values:
             return
         self._values = [item for item in self._values if item != value]
@@ -803,9 +1003,12 @@ __all__ = [
     "format_bytes",
     "format_timestamp",
     "escape_markup",
+    "first_focusable",
     "flow_row",
     "format_uptime",
     "icon_button",
+    "icon_image",
+    "is_interactive_target",
     "label",
     "muted",
     "path_picker",

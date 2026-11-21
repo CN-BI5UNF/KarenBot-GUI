@@ -11,7 +11,10 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import GLib, Gtk  # noqa: E402
 
-from .. import widgets  # noqa: E402
+from .. import (  # noqa: E402
+    adapter_spec,
+    widgets,
+)
 from ..api import q  # noqa: E402
 
 
@@ -1910,3 +1913,963 @@ def _num(value: Any) -> str:
         return f"{int(value):,}"
     except (TypeError, ValueError):
         return str(value or 0)
+
+
+# ============================================================
+# 渠道 / 协议设置（/api/adapters/*）
+# ============================================================
+
+
+def _api_status(exc: BaseException | None) -> int:
+    try:
+        return int(getattr(exc, "status", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _api_message(exc: BaseException | None) -> str:
+    if exc is None:
+        return ""
+    return str(exc) or type(exc).__name__
+
+
+_SECRET_FIELD_PATTERNS = {
+    "access_token_id": ("token", "access"),
+    "bot_token_id": ("token", "telegram", "bot"),
+    "webhook_secret_id": ("webhook", "secret"),
+    "webhook_secret_token_id": ("webhook", "secret", "token"),
+}
+
+
+def _is_provider_secret_id(secret_id: str) -> bool:
+    """Provider/vision/weather/TTS API keys are not channel credentials."""
+    low = secret_id.lower()
+    return low.endswith("_key") or "_api_key" in low or "provider" in low
+
+
+_FIELD_DETAIL_HELP = {
+    "access_token_id": (
+        "配置步骤：\n"
+        "① 在 NapCat 的网络配置中设置或查看 WebSocket / HTTP 的 Token。\n"
+        "② 回到这里填写一个引用 ID（例如 napcat_default_token）。\n"
+        "③ 在下方“新的密钥值”粘贴同一个 Token，点击“保存密钥”。\n"
+        "④ 最后点击“保存渠道配置”。\n"
+        "如果 NapCat 没有设置 Token，这里保持未设置即可；两边都设置但 Token 不一致时，"
+        "渠道会连接失败（通常表现为 401/403）。ws_server 监听非回环地址时，"
+        "后端会强制要求配置 Token。\n"
+        "真实 Token 只保存在加密的 secrets.enc，不会写入 config.yaml。"
+    ),
+}
+
+
+class AdapterSettingsPanel(Gtk.Box):
+    """协议卡片 + JSON Schema 动态表单 + 完整适配器保存。
+
+    新后端（``/api/adapters/*``）可用时使用动态表单；旧后端返回 404 时
+    自动回退到 ``/api/settings`` 的声明式字段。这样 GUI 可以同时兼容
+    v0.1.3 和 v0.1.11 的控制面。
+    """
+
+    _MODEL_NAMES = {
+        "napcat": "NapCatAdapterConfig",
+        "onebot11": "OneBot11AdapterConfig",
+        "telegram": "TelegramAdapterConfig",
+    }
+
+    def __init__(
+        self,
+        page: Any,
+        group: dict[str, Any],
+        *,
+        advanced_only: bool = False,
+    ) -> None:
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self.page = page
+        self.group = group
+        self.advanced_only = bool(advanced_only)
+        self.dirty = False
+        self._loaded = False
+        self._legacy = False
+        self._loading = False
+        self._saving = False
+        self._status_refreshing = False
+        self._protocols: list[dict[str, Any]] = []
+        self._schema_defs: dict[str, Any] = {}
+        self._adapters: dict[str, Any] = {}
+        self._secret_ids: list[str] = []
+        self._status_payload: dict[str, Any] = {}
+        self._status_error: BaseException | None = None
+        self._adapter_name = "default"
+        self._selected_type = ""
+        self._baseline_type = ""
+        self._values: dict[str, Any] = {}
+        self._controls: dict[str, Gtk.Widget] = {}
+        self._dirty_badge: Gtk.Widget | None = None
+        self._save_button: Gtk.Widget | None = None
+        self._form_status: Gtk.Label | None = None
+        self._status_body: Gtk.Box | None = None
+        self.content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self.append(self.content)
+        self._show_loading()
+        self._load()
+
+    @property
+    def api(self) -> Any:
+        return self.page.api
+
+    # ------------------------------------------------------------------
+    # Loading / fallback
+    # ------------------------------------------------------------------
+    def _show_loading(self) -> None:
+        widgets.clear(self.content)
+        self.content.append(self.page.busy("正在读取渠道配置…"))
+
+    def _load(self) -> None:
+        if self._loading or self.api is None:
+            return
+        self._loading = True
+        self._show_loading()
+
+        def _fetch() -> dict[str, Any]:
+            api = self.api
+            data: dict[str, Any] = {}
+            for key, path in (
+                ("protocols", "/api/adapters/protocols"),
+                ("config", "/api/adapters/config"),
+                ("status", "/api/adapters/status"),
+            ):
+                try:
+                    data[key] = api.get(path, timeout=30)
+                except BaseException as exc:  # noqa: BLE001
+                    data[f"{key}_error"] = exc
+            try:
+                settings = api.get("/api/settings", timeout=30)
+                data["secrets"] = list(settings.get("secrets_index") or [])
+            except BaseException:  # noqa: BLE001
+                data["secrets"] = []
+            return data
+
+        widgets.run_async(
+            _fetch, on_success=self._on_loaded, on_error=self._on_load_failed
+        )
+
+    def _on_load_failed(self, exc: BaseException) -> None:
+        self._loading = False
+        self._render_error(exc)
+
+    def _on_loaded(self, data: dict[str, Any]) -> None:
+        self._loading = False
+        protocols_error = data.get("protocols_error")
+        config_error = data.get("config_error")
+        # 旧后端没有 /api/adapters/*：回退到声明式字段表。
+        if _api_status(protocols_error) in (404, 405) or _api_status(
+            config_error
+        ) in (404, 405):
+            self._render_legacy()
+            return
+        if protocols_error is not None:
+            self._render_error(protocols_error)
+            return
+        if config_error is not None:
+            self._render_error(config_error)
+            return
+
+        protocols_payload = data.get("protocols") or {}
+        config_payload = data.get("config") or {}
+        protocols = protocols_payload.get("protocols") if isinstance(
+            protocols_payload, dict
+        ) else None
+        if not isinstance(protocols, list) or not protocols:
+            self._render_legacy()
+            return
+        if not isinstance(config_payload, dict) or "adapters" not in config_payload:
+            self._render_legacy()
+            return
+
+        self._protocols = [item for item in protocols if isinstance(item, dict)]
+        schema = protocols_payload.get("config_schema") or {}
+        self._schema_defs = (
+            dict(schema.get("$defs") or {}) if isinstance(schema, dict) else {}
+        )
+        adapters = config_payload.get("adapters") or {}
+        self._adapters = adapters if isinstance(adapters, dict) else {}
+        if "default" in self._adapters:
+            self._adapter_name = "default"
+        elif self._adapters:
+            self._adapter_name = str(next(iter(self._adapters)))
+        baseline = self._adapter_for_current()
+        self._baseline_type = str(baseline.get("type") or "napcat")
+        if not self._selected_type:
+            self._selected_type = self._baseline_type
+        status_payload = data.get("status")
+        self._status_payload = status_payload if isinstance(status_payload, dict) else {}
+        self._status_error = data.get("status_error")
+        self._secret_ids = sorted(
+            str(item) for item in (data.get("secrets") or []) if str(item).strip()
+        )
+        self._loaded = True
+        self._legacy = False
+        self._render_full()
+
+    def _adapter_for_current(self) -> dict[str, Any]:
+        value = self._adapters.get(self._adapter_name) or {}
+        return value if isinstance(value, dict) else {}
+
+    def _render_legacy(self) -> None:
+        """旧后端兼容：沿用 /api/settings 的字段编辑器。"""
+        self._loaded = True
+        self._legacy = True
+        self._selected_type = ""
+        self._baseline_type = ""
+        widgets.clear(self.content)
+        note = widgets.card(spacing=4, padding=10)
+        note.append(
+            widgets.muted(
+                "当前后端未提供 /api/adapters 协议接口，已回退到旧版字段编辑器。"
+            )
+        )
+        self.content.append(note)
+        card = widgets.card(spacing=4, padding=14)
+        fields = [
+            spec
+            for spec in (self.group.get("fields") or [])
+            if not spec.get("hidden")
+        ]
+        if not fields:
+            card.append(self.page.empty("这个渠道分页没有可编辑字段。"))
+        else:
+            for index, spec in enumerate(fields):
+                if index:
+                    card.append(widgets.separator())
+                card.append(self.page._field_row(spec))
+        self.content.append(card)
+
+    def _render_error(self, exc: BaseException) -> None:
+        self._loaded = False
+        widgets.clear(self.content)
+        card = widgets.card(spacing=10)
+        card.append(widgets.label("渠道设置暂时不可用", css="section-title"))
+        card.append(
+            widgets.muted(
+                "无法读取协议目录或适配器配置。Runtime 未就绪时会返回 503；"
+                "旧后端没有 /api/adapters 时会自动回退。"
+            )
+        )
+        card.append(
+            widgets.label(
+                _api_message(exc), css="danger-text", wrap=True, selectable=True
+            )
+        )
+        retry = widgets.button("重试读取渠道配置", css="suggested-action")
+        retry.connect("clicked", lambda _b: self._load())
+        card.append(retry)
+        self.content.append(card)
+
+    # ------------------------------------------------------------------
+    # Full adapter editor
+    # ------------------------------------------------------------------
+    def _render_full(self) -> None:
+        widgets.clear(self.content)
+        self._values = {}
+        self._controls = {}
+        self._dirty_badge = None
+        self._save_button = None
+        self._form_status = None
+        self._render_status_card()
+        if self.advanced_only:
+            self._render_advanced_notice()
+        else:
+            self._render_protocol_cards()
+            self._render_form()
+
+    def _render_status_card(self) -> None:
+        card = widgets.card(spacing=6)
+        self._status_body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        card.append(self._status_body)
+        self.content.append(card)
+        self._render_status_body()
+
+    def _render_status_body(self) -> None:
+        body = self._status_body
+        if body is None:
+            return
+        widgets.clear(body)
+        status = self._status_payload if isinstance(self._status_payload, dict) else {}
+        adapter = status.get("adapter")
+        if not isinstance(adapter, dict):
+            adapter = None
+        configs = status.get("config") or {}
+        config: dict[str, Any] = {}
+        if adapter:
+            name = str(adapter.get("name") or self._adapter_name)
+            config = configs.get(name) if isinstance(configs, dict) else {}
+            if not isinstance(config, dict):
+                config = {}
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        head.append(widgets.label("渠道运行状态", css="section-title"))
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        head.append(spacer)
+        if not adapter:
+            head.append(widgets.badge("无运行渠道", css="badge badge-idle"))
+        elif bool(adapter.get("connected")):
+            head.append(widgets.badge("已连接", css="badge badge-ok"))
+        else:
+            head.append(widgets.badge("未连接", css="badge badge-idle"))
+        refresh = widgets.icon_button(
+            "view-refresh-symbolic", "刷新渠道状态", css="flat"
+        )
+        refresh.connect("clicked", lambda _b: self._refresh_status())
+        head.append(refresh)
+        body.append(head)
+
+        if adapter:
+            summary = adapter_spec.adapter_summary(config)
+            dialect = str(adapter.get("dialect_display_name") or "")
+            if dialect and dialect in summary:
+                dialect = ""
+            detail = " · ".join(
+                part
+                for part in (
+                    adapter_spec.adapter_source(adapter, config),
+                    summary,
+                    dialect,
+                )
+                if part
+            )
+            if detail:
+                body.append(widgets.muted(detail))
+            address = adapter_spec.adapter_address(config)
+            if address:
+                body.append(widgets.muted(f"地址：{address}"))
+            capabilities = adapter.get("capabilities")
+            body.append(
+                widgets.muted(
+                    "能力：" + adapter_spec.capability_summary(capabilities)
+                )
+            )
+        elif self._status_error is not None:
+            body.append(
+                widgets.label(
+                    f"状态读取失败：{_api_message(self._status_error)}",
+                    css="danger-text",
+                    wrap=True,
+                )
+            )
+        else:
+            body.append(
+                widgets.muted(
+                    "当前没有运行中的适配器（全部 enabled: false 或 Runtime 未启动）。"
+                )
+            )
+
+    def _refresh_status(self) -> None:
+        if self.api is None or self._status_refreshing or self._legacy:
+            return
+        self._status_refreshing = True
+        api = self.api
+
+        def _fetch() -> dict[str, Any]:
+            return api.get("/api/adapters/status", timeout=30)
+
+        def _done(payload: dict[str, Any]) -> None:
+            self._status_refreshing = False
+            self._status_error = None
+            if isinstance(payload, dict):
+                self._status_payload = payload
+                self._render_status_body()
+
+        def _failed(exc: BaseException) -> None:
+            self._status_refreshing = False
+            self._status_error = exc
+            self._render_status_body()
+            self.page.toast(f"刷新渠道状态失败：{exc}")
+
+        widgets.run_async(_fetch, on_success=_done, on_error=_failed)
+
+    def _render_advanced_notice(self) -> None:
+        card = widgets.card(spacing=8)
+        card.append(
+            widgets.muted(
+                "接入方式、Webhook、重连与协议端托管等高级参数已合并到「渠道」页面，"
+                "由后端 config_schema 动态生成，避免和完整适配器保存互相覆盖。"
+            )
+        )
+        button = widgets.button("打开渠道设置", css="suggested-action")
+        button.connect("clicked", lambda _b: self.page.select_group("adapter"))
+        card.append(button)
+        self.content.append(card)
+
+    def _render_protocol_cards(self) -> None:
+        card = widgets.card(spacing=10)
+        card.append(
+            widgets.section_header(
+                "渠道协议",
+                "选择协议后，下方表单会从后端 config_schema 自动生成。"
+                "保存会整份替换 default 适配器并触发热重载。",
+            )
+        )
+        flow = Gtk.FlowBox()
+        flow.set_selection_mode(Gtk.SelectionMode.NONE)
+        flow.set_homogeneous(True)
+        flow.set_max_children_per_line(3)
+        flow.set_min_children_per_line(1)
+        flow.set_column_spacing(8)
+        flow.set_row_spacing(8)
+        for protocol in self._protocols:
+            flow.append(self._protocol_button(protocol))
+        card.append(flow)
+        self.content.append(card)
+
+    def _protocol_button(self, protocol: dict[str, Any]) -> Gtk.Button:
+        protocol_id = str(protocol.get("id") or "")
+        status = str(protocol.get("status") or "")
+        button = Gtk.Button()
+        button.add_css_class("protocol-card")
+        # 固定卡片宽度，避免长 summary 把 FlowBox 撑成一列全宽。
+        button.set_size_request(238, -1)
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        title = widgets.label(
+            adapter_spec.protocol_label(protocol), css="card-title"
+        )
+        title.set_hexpand(True)
+        head.append(title)
+        head.append(
+            widgets.badge(
+                adapter_spec.status_label(status),
+                css=(
+                    "badge badge-green"
+                    if status == "stable"
+                    else "badge badge-orange"
+                    if status == "beta"
+                    else "badge badge-idle"
+                ),
+            )
+        )
+        body.append(head)
+        summary = adapter_spec.short_description(
+            str(protocol.get("summary") or ""), limit=120
+        )
+        if summary:
+            summary_label = widgets.label(summary, css="card-sub", wrap=True)
+            summary_label.set_max_width_chars(30)
+            summary_label.set_width_chars(26)
+            body.append(summary_label)
+        transports = "、".join(
+            adapter_spec.transport_label(str(value))
+            for value in (protocol.get("transports") or [])
+        )
+        if transports:
+            body.append(
+                widgets.label(f"接入方式：{transports}", css="field-help", wrap=True)
+            )
+        if status == "planned":
+            body.append(widgets.label("该协议尚未实现，暂不可保存。", css="field-help"))
+            button.set_sensitive(False)
+        button.set_child(body)
+        button.set_tooltip_text(str(protocol.get("summary") or ""))
+        if protocol_id == self._selected_type:
+            button.add_css_class("selected")
+        if status != "planned":
+            button.connect(
+                "clicked",
+                lambda _b, selected=protocol_id: self._select_protocol(selected),
+            )
+        return button
+
+    def _select_protocol(self, protocol_id: str) -> None:
+        if not protocol_id or protocol_id == self._selected_type:
+            return
+        self._selected_type = protocol_id
+        self._render_full()
+        self._set_dirty(protocol_id != self._baseline_type)
+
+    def _selected_protocol(self) -> dict[str, Any]:
+        for protocol in self._protocols:
+            if str(protocol.get("id") or "") == self._selected_type:
+                return protocol
+        return self._protocols[0] if self._protocols else {}
+
+    def _schema_properties(self) -> dict[str, Any]:
+        protocol = self._selected_protocol()
+        model_name = str(protocol.get("config_model") or "")
+        if not model_name:
+            model_name = self._MODEL_NAMES.get(self._selected_type, "")
+        definition = self._schema_defs.get(model_name) or {}
+        properties = definition.get("properties") or {}
+        return properties if isinstance(properties, dict) else {}
+
+    def _render_form(self) -> None:
+        values_source = self._adapter_for_current()
+        if str(values_source.get("type") or "") != self._selected_type:
+            values_source = {}
+        properties = self._schema_properties()
+        core_fields, advanced_fields = adapter_spec.field_groups(
+            self._selected_type
+        )
+        card = widgets.card(spacing=10)
+        card.append(
+            widgets.section_header(
+                "连接配置",
+                "字段来自后端 config_schema；密钥字段只保存引用 ID，真实值在密钥库。",
+            )
+        )
+        form = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self._loading = True
+        try:
+            for name in core_fields:
+                prop = properties.get(name)
+                if isinstance(prop, dict):
+                    self._append_field(form, name, prop, values_source)
+        finally:
+            self._loading = False
+        card.append(form)
+
+        advanced_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        advanced_box.set_margin_top(8)
+        has_advanced = False
+        self._loading = True
+        try:
+            for name in advanced_fields:
+                prop = properties.get(name)
+                if isinstance(prop, dict):
+                    has_advanced = True
+                    self._append_field(advanced_box, name, prop, values_source)
+        finally:
+            self._loading = False
+        if has_advanced:
+            expander = Gtk.Expander(label="高级与 Webhook 设置")
+            expander.set_child(advanced_box)
+            card.append(expander)
+
+        footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self._dirty_badge = widgets.badge(
+            "未保存", css="badge badge-orange"
+        )
+        self._dirty_badge.set_visible(False)
+        footer.append(self._dirty_badge)
+        self._form_status = widgets.muted("")
+        self._form_status.set_hexpand(True)
+        self._form_status.set_wrap(True)
+        footer.append(self._form_status)
+        self._save_button = widgets.button(
+            "保存渠道配置", css="suggested-action"
+        )
+        self._save_button.set_sensitive(False)
+        self._save_button.connect("clicked", lambda _b: self._save())
+        footer.append(self._save_button)
+        card.append(footer)
+        self.content.append(card)
+
+    def _append_field(
+        self,
+        parent: Gtk.Box,
+        name: str,
+        prop: dict[str, Any],
+        source: dict[str, Any],
+    ) -> None:
+        value = source.get(name, adapter_spec.default_value(prop))
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.append(
+            widgets.label(adapter_spec.field_label(name, prop), css="field-label")
+        )
+        help_text = adapter_spec.short_description(
+            str(prop.get("description") or "")
+        )
+        if name == "access_token_id":
+            # 这个字段最容易把 Token 本身和引用 ID 搞混，单独给详细说明。
+            help_text = (
+                "NapCat / OneBot 协议端的鉴权令牌；这里填密钥库中的引用 ID，"
+                "不是 Token 本身。"
+            )
+        elif name in adapter_spec.SECRET_FIELDS:
+            help_text = (help_text + " " if help_text else "") + (
+                "只填密钥库中的引用 ID；下方可直接保存新密钥。"
+            )
+        if name == "allowed_updates":
+            help_text = (help_text + " " if help_text else "") + (
+                "留空表示使用推荐事件集合；多个值用逗号分隔。"
+            )
+        if help_text:
+            box.append(widgets.muted(help_text))
+
+        control, getter = self._build_control(name, prop, value)
+        self._values[name] = getter
+        self._controls[name] = control
+        box.append(control)
+        detail_text = _FIELD_DETAIL_HELP.get(name)
+        if detail_text:
+            detail = widgets.label(
+                detail_text, css="card-sub", wrap=True, selectable=True
+            )
+            detail.set_margin_top(4)
+            box.append(detail)
+        parent.append(box)
+
+    def _build_control(
+        self, name: str, prop: dict[str, Any], value: Any
+    ) -> tuple[Gtk.Widget, Any]:
+        schema_kind = adapter_spec.schema_type(prop)
+        if name in adapter_spec.SECRET_FIELDS:
+            return self._build_secret_control(name, value)
+        if schema_kind == "boolean":
+            control = widgets.switch(bool(value))
+            control.connect("notify::active", self._mark_dirty)
+
+            def _get_bool() -> Any:
+                return adapter_spec.coerce_value(prop, control.get_active())
+
+            return control, _get_bool
+        if "enum" in prop:
+            labels = adapter_spec.enum_labels(name, prop)
+            options = [
+                (str(option), labels.get(str(option), str(option)))
+                for option in prop.get("enum") or []
+            ]
+            initial = str(value) if value is not None else str(
+                adapter_spec.default_value(prop)
+            )
+            control = widgets.dropdown(options, initial)
+            control.connect("notify::selected", self._mark_dirty)
+
+            def _get_enum() -> Any:
+                return adapter_spec.coerce_value(
+                    prop, widgets.dropdown_value(control)
+                )
+
+            return control, _get_enum
+        if schema_kind == "array":
+            entry = Gtk.Entry()
+            entry.set_hexpand(True)
+            entry.set_text(", ".join(str(item) for item in (value or [])))
+            if name == "allowed_updates":
+                entry.set_placeholder_text("例如 message, edited_message")
+            else:
+                entry.set_placeholder_text("逗号分隔")
+            entry.connect("changed", self._mark_dirty)
+
+            def _get_array() -> Any:
+                return adapter_spec.coerce_value(prop, entry.get_text())
+
+            return entry, _get_array
+
+        entry = Gtk.Entry()
+        entry.set_hexpand(True)
+        if value is None:
+            entry.set_text("")
+        else:
+            entry.set_text(str(value))
+        if schema_kind in {"integer", "number"}:
+            entry.set_placeholder_text(
+                "数字" if schema_kind == "integer" else "数字（可含小数）"
+            )
+        elif adapter_spec.allows_null(prop):
+            entry.set_placeholder_text("留空表示不设置")
+        entry.connect("changed", self._mark_dirty)
+
+        def _get_scalar() -> Any:
+            return adapter_spec.coerce_value(prop, entry.get_text())
+
+        return entry, _get_scalar
+
+    def _build_secret_control(
+        self, name: str, value: Any
+    ) -> tuple[Gtk.Widget, Any]:
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        key_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        key_entry = Gtk.Entry()
+        key_entry.set_hexpand(True)
+        key_entry.set_text("" if value is None else str(value))
+        placeholders = {
+            "access_token_id": "密钥引用 ID，例如 napcat_default_token",
+            "bot_token_id": "密钥引用 ID，例如 telegram_main_token",
+            "webhook_secret_id": "密钥引用 ID，例如 onebot11_webhook_secret",
+            "webhook_secret_token_id": (
+                "密钥引用 ID，例如 telegram_webhook_secret"
+            ),
+        }
+        key_entry.set_placeholder_text(
+            placeholders.get(name, "密钥引用 ID")
+        )
+        key_entry.connect("changed", self._mark_dirty)
+        key_row.append(key_entry)
+        key_row.append(self._secret_menu(key_entry, name))
+        box.append(key_row)
+        box.key_entry = key_entry  # type: ignore[attr-defined]
+
+        value_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        value_entry = Gtk.Entry()
+        value_entry.set_hexpand(True)
+        value_entry.set_visibility(False)
+        value_entry.set_placeholder_text("新的密钥值（只写入密钥库）")
+        save = widgets.button("保存密钥", css="compact-button")
+        save.connect(
+            "clicked",
+            lambda _b, e=key_entry, v=value_entry: self._save_secret(e, v),
+        )
+        value_row.append(value_entry)
+        value_row.append(save)
+        box.append(value_row)
+
+        def _get_secret() -> Any:
+            return adapter_spec.coerce_value(
+                {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                key_entry.get_text(),
+            )
+
+        return box, _get_secret
+
+    def _secret_candidates(self, field_name: str, current: str) -> list[str]:
+        """Only offer credentials that plausibly belong to this channel.
+
+        The backend's ``secrets_index`` also contains provider API keys
+        (``deepseek_main_key``), vision keys, TTS keys, etc. Showing those in
+        an Access Token dropdown makes users think the channel is asking for
+        an LLM key, so filter to references used by adapters plus token-ish
+        names for the current field.
+        """
+        references: set[str] = set()
+        for config in self._adapters.values():
+            if not isinstance(config, dict):
+                continue
+            value = config.get(field_name)
+            if value:
+                references.add(str(value))
+        patterns = _SECRET_FIELD_PATTERNS.get(
+            field_name, ("token", "secret", "access")
+        )
+        result: list[str] = []
+        for secret_id in self._secret_ids:
+            low = secret_id.lower()
+            matched = secret_id in references or any(
+                pattern in low for pattern in patterns
+            )
+            if not matched:
+                continue
+            if _is_provider_secret_id(secret_id) and secret_id not in references:
+                continue
+            result.append(secret_id)
+        if current and current not in result:
+            result.append(current)
+        return sorted(result)
+
+    def _secret_menu(
+        self, key_entry: Gtk.Entry, field_name: str
+    ) -> Gtk.MenuButton:
+        menu = Gtk.MenuButton()
+        menu.set_icon_name("pan-down-symbolic")
+        menu.set_tooltip_text("选择已保存的渠道密钥 ID")
+        menu.add_css_class("flat")
+        popover = Gtk.Popover()
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        inner.set_size_request(260, -1)
+        inner.set_margin_top(6)
+        inner.set_margin_bottom(6)
+        inner.set_margin_start(6)
+        inner.set_margin_end(6)
+        candidates = self._secret_candidates(
+            field_name, key_entry.get_text().strip()
+        )
+        if candidates:
+            hint = widgets.muted("只显示渠道相关密钥")
+            hint.set_margin_bottom(2)
+            inner.append(hint)
+            for secret_id in candidates:
+                item = Gtk.Button(label=secret_id)
+                item.add_css_class("flat")
+                item.set_halign(Gtk.Align.FILL)
+
+                def _pick(
+                    _button: Gtk.Button,
+                    selected: str = secret_id,
+                ) -> None:
+                    key_entry.set_text(selected)
+                    popover.popdown()
+
+                item.connect("clicked", _pick)
+                inner.append(item)
+        else:
+            inner.append(
+                widgets.muted("没有匹配的渠道密钥；可直接输入引用 ID 新建。")
+            )
+        clear = Gtk.Button(label="（未设置）")
+        clear.add_css_class("flat")
+        clear.set_halign(Gtk.Align.FILL)
+
+        def _clear(_button: Gtk.Button) -> None:
+            key_entry.set_text("")
+            popover.popdown()
+
+        clear.connect("clicked", _clear)
+        inner.append(clear)
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_max_content_height(240)
+        scroller.set_propagate_natural_height(True)
+        scroller.set_child(inner)
+        popover.set_child(scroller)
+        menu.set_popover(popover)
+        return menu
+
+    def _save_secret(self, key_entry: Gtk.Entry, value_entry: Gtk.Entry) -> None:
+        if self.api is None:
+            return
+        key_id = key_entry.get_text().strip()
+        value = value_entry.get_text()
+        if not key_id:
+            self.page.toast("请先填写或选择密钥引用 ID")
+            key_entry.grab_focus()
+            return
+        if not value:
+            self.page.toast("请输入要保存的密钥值")
+            value_entry.grab_focus()
+            return
+
+        def _do() -> dict[str, Any]:
+            return self.api.put(
+                "/api/settings/secrets",
+                {"key_id": key_id, "value": value},
+                timeout=30,
+            )
+
+        def _done(result: dict[str, Any]) -> None:
+            value_entry.set_text("")
+            if key_id not in self._secret_ids:
+                self._secret_ids.append(key_id)
+                self._secret_ids.sort()
+            self.page.toast(
+                str(result.get("message") or "密钥已保存")
+                + "；如引用 ID 有变化，请点击「保存渠道配置」。"
+            )
+            if result.get("needs_restart"):
+                self.page.mark_restart()
+
+        def _failed(exc: BaseException) -> None:
+            self._show_form_error(f"保存密钥失败：{exc}")
+
+        widgets.run_async(_do, on_success=_done, on_error=_failed)
+
+    # ------------------------------------------------------------------
+    # Save
+    # ------------------------------------------------------------------
+    def _mark_dirty(self, *_args: Any) -> None:
+        if self._loading or self._saving:
+            return
+        if not self.dirty:
+            self._set_dirty(True)
+
+    def _set_dirty(self, dirty: bool) -> None:
+        self.dirty = bool(dirty)
+        if self._dirty_badge is not None:
+            self._dirty_badge.set_visible(self.dirty)
+        if self._save_button is not None:
+            self._save_button.set_sensitive(
+                self.dirty and self._loaded and not self._saving
+            )
+        if self._form_status is not None:
+            self._form_status.remove_css_class("danger-text")
+            if self.dirty and self._selected_type != self._baseline_type:
+                self._form_status.set_text(
+                    "将切换渠道协议；保存会整份替换当前适配器配置。"
+                )
+            elif self.dirty:
+                self._form_status.set_text("有尚未保存的渠道配置修改。")
+            else:
+                self._form_status.set_text("")
+
+    def _show_form_error(self, message: str) -> None:
+        if self._form_status is not None:
+            self._form_status.set_text(message)
+            self._form_status.add_css_class("danger-text")
+        self.page.toast(message)
+
+    def _save(self) -> None:
+        if (
+            self.api is None
+            or self._saving
+            or not self._loaded
+            or self._legacy
+            or self.advanced_only
+            or not self._values
+        ):
+            return
+        values: dict[str, Any] = {}
+        for name, getter in self._values.items():
+            try:
+                values[name] = getter()
+            except (TypeError, ValueError) as exc:
+                self._show_form_error(
+                    f"{adapter_spec.field_label(name)}：{exc}"
+                )
+                return
+        baseline = self._adapter_for_current()
+        payload = adapter_spec.build_adapter_payload(
+            self._selected_type, baseline, values
+        )
+        if self._selected_type != self._baseline_type:
+            widgets.ConfirmDialog(
+                self.page.app.window,
+                heading="切换渠道协议并保存？",
+                body=(
+                    f"当前协议是「{adapter_spec.type_label(self._baseline_type)}」，"
+                    f"将切换为「{adapter_spec.type_label(self._selected_type)}」。"
+                    "保存会整份替换 default 适配器配置并尝试热重载，"
+                    "不适用于新协议的字段会被丢弃。"
+                ),
+                confirm_label="切换并保存",
+                destructive=True,
+                on_confirm=lambda: self._commit(payload),
+            )
+            return
+        self._commit(payload)
+
+    def _commit(self, payload: dict[str, Any]) -> None:
+        if self.api is None or self._saving or self._legacy:
+            return
+        self._saving = True
+        self._set_dirty(self.dirty)
+        name = self._adapter_name
+
+        def _do() -> dict[str, Any]:
+            return self.api.put(
+                f"/api/adapters/{q(name)}", payload, timeout=60
+            )
+
+        def _done(result: dict[str, Any]) -> None:
+            self._saving = False
+            adapter = result.get("adapter") if isinstance(result, dict) else None
+            if not isinstance(adapter, dict):
+                adapter = dict(payload)
+            self._adapters[name] = adapter
+            self._baseline_type = str(adapter.get("type") or self._selected_type)
+            self._selected_type = self._baseline_type
+            message = str(
+                result.get("message") if isinstance(result, dict) else ""
+            ) or "渠道配置已保存"
+            errors = []
+            reload_info = result.get("reload") if isinstance(result, dict) else None
+            if isinstance(reload_info, dict):
+                errors = [str(item) for item in reload_info.get("errors") or []]
+            self._render_full()
+            self._set_dirty(False)
+            self.page.toast(message)
+            if isinstance(result, dict) and result.get("needs_restart"):
+                self.page.mark_restart()
+            for error in errors:
+                self.page.toast(f"热重载：{error}")
+            self._refresh_status()
+
+        def _failed(exc: BaseException) -> None:
+            self._saving = False
+            self._set_dirty(True)
+            self._show_form_error(f"保存失败：{exc}")
+
+        widgets.run_async(_do, on_success=_done, on_error=_failed)
+
+    # ------------------------------------------------------------------
+    # Page hooks
+    # ------------------------------------------------------------------
+    def on_show(self) -> None:
+        if self._loaded and not self.dirty and self._status_body is not None:
+            self._refresh_status()

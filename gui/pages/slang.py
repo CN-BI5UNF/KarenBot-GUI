@@ -22,7 +22,7 @@ class SlangPage(Page):
     page_id = "slang"
     page_title = "群聊黑话"
     page_subtitle = "知识库按群隔离、同群所有人格共享；候选词条需要人工补充释义并确认，只有已确认词条能被模型查询。"
-    page_icon = "chat-message-new-symbolic"
+    page_icon = "accessories-text-editor-symbolic"
 
     def build(self) -> None:
         self._search_timer = 0

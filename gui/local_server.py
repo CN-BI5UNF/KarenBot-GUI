@@ -16,10 +16,16 @@ import os
 import secrets
 import socket
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
-from .paths import default_data_root
+from .paths import (
+    ENV_DATA_DIR,
+    ENV_RUNTIME_DATA_DIR,
+    adopt_legacy_data_root,
+    default_data_root,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +49,18 @@ class LocalControlServer:
         # builds (no ``.git``) use the per-user data root, which is outside the
         # source tree so the in-app updater is not permanently blocked by its
         # ``data_dir_inside_project`` guard.  ``--data-dir`` still wins.
+        explicit_root = data_root is not None
         self.data_root = (
             Path(data_root).expanduser()
             if data_root
             else default_data_root(self.project_root)
+        )
+        # 只有安装器写入的 KAREN_DATA_ROOT 才需要接管旧平台目录；--data-dir
+        # 和 KAREN_GUI_DATA_DIR 是用户明确指定的隔离根，不能混入旧数据。
+        self._adopt_legacy = (
+            not explicit_root
+            and bool(os.environ.get(ENV_RUNTIME_DATA_DIR, "").strip())
+            and not os.environ.get(ENV_DATA_DIR, "").strip()
         )
         self.host = host
         self.port = 0
@@ -60,6 +74,7 @@ class LocalControlServer:
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
         self._stopped = threading.Event()
+        self._cancelled = threading.Event()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -68,6 +83,17 @@ class LocalControlServer:
         if self._thread is not None:
             return self.base_url
         if self.data_root is not None:
+            # 早于 KAREN_DATA_ROOT 支持的 GUI 把数据留在平台数据目录；
+            # 首次使用外部数据根时复制过去，避免升级后显示成全新安装。
+            if self._adopt_legacy:
+                adopted = adopt_legacy_data_root(
+                    self.project_root, self.data_root
+                )
+                if adopted != self.data_root:
+                    logger.warning(
+                        "数据目录迁移失败，继续使用旧数据目录: %s", adopted
+                    )
+                    self.data_root = adopted
             self.data_root.mkdir(parents=True, exist_ok=True)
             os.environ["KAREN_DATA_ROOT"] = str(self.data_root)
         self.port = _free_port(self.host)
@@ -78,13 +104,28 @@ class LocalControlServer:
             daemon=True,
         )
         self._thread.start()
-        if not self._ready.wait(max(0.5, float(wait_seconds))):
-            raise BackendError("本地控制服务启动超时")
+        deadline = time.monotonic() + max(0.5, float(wait_seconds))
+        while not self._ready.wait(0.1):
+            if self._cancelled.is_set():
+                raise BackendError("本地控制服务启动已取消")
+            if time.monotonic() >= deadline:
+                raise BackendError("本地控制服务启动超时")
+        if self._cancelled.is_set():
+            raise BackendError("本地控制服务启动已取消")
         if self.last_error:
             raise BackendError(self.last_error)
         return self.base_url
 
-    def stop(self, *, timeout: float = 15.0) -> None:
+    def stop(self, *, timeout: float = 15.0, wait: bool = True) -> None:
+        """Signal the control server to exit and optionally join its thread.
+
+        ``wait=False`` is used from the GTK main thread: joining a Runtime that
+        is still tearing down adapters/httpx can take longer than the windowing
+        system tolerates, which makes Windows report the GUI as "not
+        responding".  Callers that need a graceful shutdown pass ``wait=True``
+        and do it from a worker thread.
+        """
+        self._cancelled.set()
         server = self.server
         loop = self.loop
         if server is not None and loop is not None and not loop.is_closed():
@@ -93,8 +134,11 @@ class LocalControlServer:
             except RuntimeError:
                 pass
         thread = self._thread
-        if thread is not None:
-            thread.join(max(1.0, float(timeout)))
+        if thread is None:
+            return
+        if not wait or thread is threading.current_thread():
+            return
+        thread.join(max(1.0, float(timeout)))
         self._thread = None
 
     def _thread_main(self) -> None:
@@ -177,6 +221,8 @@ class LocalControlServer:
             logger.warning("GUI 首次运行兼容状态写入失败", exc_info=True)
 
     async def _serve(self) -> None:
+        if self._cancelled.is_set():
+            return
         import uvicorn
 
         from backend.app import create_control_app
@@ -185,6 +231,8 @@ class LocalControlServer:
 
         from . import __version__
 
+        if self._cancelled.is_set():
+            return
         runtime_host = RuntimeHost(self.project_root)
         self.auth_token = secrets.token_urlsafe(32)
         try:
@@ -198,6 +246,7 @@ class LocalControlServer:
             )
         except Exception:  # noqa: BLE001
             logger.warning("GUI 文件日志初始化失败，继续使用控制台日志", exc_info=True)
+        logger.info("GUI 数据目录：%s", self.data_root)
         if self._is_fresh_root(runtime_host):
             fresh_host = runtime_host
             configured_start = runtime_host.start
@@ -249,6 +298,8 @@ class LocalControlServer:
         server = uvicorn.Server(config)
         self.server = server
         app.state.server = server
+        if self._cancelled.is_set():
+            server.should_exit = True
         serve_task = asyncio.create_task(server.serve(), name="gui-uvicorn")
         try:
             while not server.started:

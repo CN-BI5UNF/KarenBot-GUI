@@ -28,7 +28,7 @@ class ChatsPage(Page):
     page_id = "chats"
     page_title = "对话"
     page_subtitle = "与 QQ 完全一致的收发记录。底部输入框可在不接 NapCat 的情况下直接试跑人格。"
-    page_icon = "chat-bubbles-symbolic"
+    page_icon = "mail-unread-symbolic"
 
     def build(self) -> None:
         # 对话页是固定布局：会话/记录区吃满剩余高度，底部试跑框始终可见。

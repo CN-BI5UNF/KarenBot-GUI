@@ -111,6 +111,25 @@ window {
   font-size: 12px;
 }
 
+/* 左下角纯图标设置入口：展开/折叠都保持同样的点击区。 */
+button.sidebar-settings {
+  min-width: 34px;
+  min-height: 34px;
+  padding: 0;
+  border-radius: 8px;
+  color: @karen_text_secondary;
+}
+
+button.sidebar-settings:hover {
+  background-color: @karen_hover;
+  color: @karen_fg;
+}
+
+button.sidebar-settings.active {
+  background-color: @karen_accent_soft;
+  color: @karen_accent_fg;
+}
+
 .runtime-pill {
   border-radius: 4px;
   padding: 2px 8px;
@@ -144,6 +163,10 @@ headerbar.app-topbar windowcontrols button {
 
 .topbar-badge {
   margin-right: 4px;
+}
+
+button.topbar-back {
+  margin-right: 6px;
 }
 
 .persona-label {
@@ -606,6 +629,30 @@ button.choice-card:hover {
 button.choice-card:checked {
   border-color: @karen_accent_bg;
   background-color: @karen_accent_soft;
+}
+
+/* 渠道协议卡片：选中态用青瓷色描边，planned 保持低饱和。 */
+button.protocol-card {
+  min-height: 108px;
+  padding: 12px;
+  border: 1px solid @karen_border;
+  border-radius: 8px;
+  background-color: @karen_card_bg;
+  color: @karen_fg;
+}
+
+button.protocol-card:hover {
+  background-color: @karen_hover;
+}
+
+button.protocol-card.selected {
+  border-color: @karen_accent_bg;
+  background-color: @karen_accent_soft;
+}
+
+button.protocol-card:disabled {
+  color: @karen_text_disabled;
+  background-color: @karen_bg;
 }
 
 .conversation-row {

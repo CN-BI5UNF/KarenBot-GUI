@@ -98,7 +98,7 @@ class ContainerPage(Page):
             widgets.label(
                 "仅向 KarenBot 的 LLM 提供 Pi / DSH / Claude Code 的工具语义，"
                 "不启动它们的 TUI/GUI/WebUI。容器可安装多个模式，但同一时间"
-                "只能激活一个；本机固定使用 Claude Code。",
+                "只能激活一个。",
                 css="card-sub",
                 wrap=True,
             )
@@ -119,7 +119,7 @@ class ContainerPage(Page):
         self.agent_note.set_margin_top(10)
         self.agent_card.append(self.agent_note)
         host_title = widgets.label(
-            "本机 Claude Code 执行方式", css="section-title"
+            "本机 Agent 限制", css="section-title"
         )
         host_title.set_margin_top(14)
         self.agent_card.append(host_title)
@@ -524,13 +524,13 @@ class ContainerPage(Page):
         mode = str(host.get("execution_mode") or "sandbox")
         self.host_mode = widgets.dropdown(
             [
-                ("sandbox", "沙箱联网（bubblewrap，推荐）"),
+                ("sandbox", "沙箱内运行（bubblewrap，推荐）"),
                 ("host", "直接控制整台电脑（高风险）"),
             ],
             mode,
         )
         mode_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        mode_box.append(widgets.label("命令执行", css="field-label"))
+        mode_box.append(widgets.label("Agent 工作方式", css="field-label"))
         mode_box.append(self.host_mode)
         self.host_controls.append(mode_box)
         network_box = Gtk.Box(
@@ -626,7 +626,7 @@ class ContainerPage(Page):
 
         def _done(_result: Any) -> None:
             self._host_saving = False
-            self.toast("本机 Claude Code 执行方式已保存")
+            self.toast("本机 Agent 限制已保存")
             self.refresh()
 
         def _failed(exc: BaseException) -> None:

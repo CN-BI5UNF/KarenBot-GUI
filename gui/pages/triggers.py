@@ -18,7 +18,10 @@ class TriggersPage(Page):
     refresh_on_activate = True
     page_id = "triggers"
     page_title = "群聊触发"
-    page_subtitle = "指定哪些群只在被 @ 时响应，并设置 @ 后继续接收普通消息的条数或时长。"
+    page_subtitle = (
+        "指定哪些群只在被 @ 时响应，并设置 @ 后继续接收普通消息的条数或时长。"
+        "QQ 群填正数，Telegram 群/频道填负数 ID。"
+    )
     page_icon = "preferences-system-notifications-symbolic"
 
     def build(self) -> None:
@@ -146,8 +149,8 @@ class TriggersPage(Page):
         card = widgets.card()
         head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         group_entry = Gtk.Entry()
-        group_entry.set_placeholder_text("群号")
-        group_entry.set_width_chars(16)
+        group_entry.set_placeholder_text("群号 / 频道 ID（可为负数）")
+        group_entry.set_width_chars(22)
         group_entry.set_text(str(rule.get("group_id") or ""))
         group_entry.set_sensitive(not bool(rule.get("group_id")))
         group_entry.connect("changed", lambda *_: self._mark_dirty())
@@ -167,7 +170,7 @@ class TriggersPage(Page):
         cache_spin.set_tooltip_text("0 表示不缓存被过滤消息")
         for spin in (max_spin, window_spin, cache_spin):
             spin.connect("value-changed", lambda *_: self._mark_dirty())
-        head.append(widgets.label("群号", css="field-label"))
+        head.append(widgets.label("群 / 频道 ID", css="field-label"))
         head.append(group_entry)
         head.append(widgets.label("条数", css="field-label"))
         head.append(max_spin)
@@ -267,15 +270,15 @@ class TriggersPage(Page):
             try:
                 group_id = int(raw or 0)
             except ValueError:
-                self.toast("群号必须是数字；空行请移除后再保存")
+                self.toast("群/频道 ID 必须是数字；空行请移除后再保存")
                 entry.grab_focus()
                 return
-            if group_id <= 0:
-                self.toast("群号必须是正整数；空行请移除后再保存")
+            if group_id == 0:
+                self.toast("群/频道 ID 不能为 0；空行请移除后再保存")
                 entry.grab_focus()
                 return
             if group_id in seen:
-                self.toast(f"群 {group_id} 已经在触发名单中")
+                self.toast(f"群/频道 {group_id} 已经在触发名单中")
                 entry.grab_focus()
                 return
             seen.add(group_id)
