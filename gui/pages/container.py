@@ -36,6 +36,8 @@ class ContainerPage(Page):
         self._agent_busy = False
         self._reset_busy = False
         self._host_saving = False
+        self._tool_profile_saving = False
+        self._tool_profile_spec: dict[str, Any] | None = None
         self._agent_action_buttons: list[Gtk.Button] = []
         self._agents_seq = 0
         self._last_error: dict[str, Any] | None = None
@@ -112,12 +114,22 @@ class ContainerPage(Page):
         self.agent_card.append(self.agent_table_host)
         self.agent_note = widgets.muted(
             "安装只写入 /workspace/.karen-agents，不会重建容器或删除 "
-            "/workspace 文件。原生工具不需要外部 CLI 或额外依赖。建议在 "
-            "设置 → 软件行为 → 工具 schema 档位 选择 agent。",
+            "/workspace 文件。原生工具不需要外部 CLI 或额外依赖。",
             wrap=True,
         )
         self.agent_note.set_margin_top(10)
         self.agent_card.append(self.agent_note)
+        tool_title = widgets.label("工具档位", css="section-title")
+        tool_title.set_margin_top(14)
+        self.agent_card.append(tool_title)
+        self.tool_profile_controls = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=12
+        )
+        self.agent_card.append(self.tool_profile_controls)
+        self.tool_profile_detail = widgets.muted(
+            "正在读取工具档位…", wrap=True
+        )
+        self.agent_card.append(self.tool_profile_detail)
         host_title = widgets.label(
             "本机 Agent 限制", css="section-title"
         )
@@ -150,6 +162,7 @@ class ContainerPage(Page):
         # Agent 模式接口依赖容器探测，可能比状态/存储慢；先并行发起，
         # 状态返回后立刻绘制上半页，不等待 Agent 表。
         self._refresh_agents()
+        self._refresh_tool_profile()
 
         def _fetch() -> dict[str, Any]:
             from concurrent.futures import ThreadPoolExecutor
@@ -205,6 +218,124 @@ class ContainerPage(Page):
             self._render_agents({"error": str(exc)})
 
         widgets.run_async(_fetch, on_success=_done, on_error=_failed)
+
+    def _refresh_tool_profile(self) -> None:
+        if self.api is None:
+            return
+
+        def _fetch() -> dict[str, Any]:
+            return self.api.get("/api/settings", timeout=60)
+
+        def _done(payload: dict[str, Any]) -> None:
+            spec = None
+            for group in payload.get("groups") or []:
+                for item in group.get("fields") or []:
+                    if item.get("path") == "behavior.tool_schema_profile":
+                        spec = item
+                        break
+                if spec is not None:
+                    break
+            self._render_tool_profile(spec)
+
+        def _failed(exc: BaseException) -> None:
+            self._render_tool_profile(None, str(exc))
+
+        widgets.run_async(_fetch, on_success=_done, on_error=_failed)
+
+    def _render_tool_profile(
+        self,
+        spec: dict[str, Any] | None,
+        error: str = "",
+    ) -> None:
+        widgets.clear(self.tool_profile_controls)
+        self._tool_profile_spec = spec
+        if not spec:
+            self.tool_profile_detail.set_text(
+                f"读取工具档位失败：{error}"
+                if error
+                else "工具档位暂不可用；请确认后端已更新。"
+            )
+            return
+        options = [
+            (str(value), str(label))
+            for value, label in (spec.get("options") or [])
+        ]
+        if not options:
+            self.tool_profile_detail.set_text("工具档位没有可选项。")
+            return
+        current = str(spec.get("value") or spec.get("default") or "compact")
+        self.tool_profile_dropdown = widgets.dropdown(options, current)
+        self.tool_profile_dropdown.connect(
+            "notify::selected", lambda *_: self._update_tool_profile_detail()
+        )
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.append(
+            widgets.label(
+                str(spec.get("label") or "工具 schema 档位"),
+                css="field-label",
+            )
+        )
+        box.append(self.tool_profile_dropdown)
+        self.tool_profile_controls.append(box)
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        self.tool_profile_controls.append(spacer)
+        self.tool_profile_save_button = widgets.button("保存工具档位")
+        self.tool_profile_save_button.connect(
+            "clicked", lambda _b: self._save_tool_profile()
+        )
+        self.tool_profile_controls.append(self.tool_profile_save_button)
+        self._update_tool_profile_detail()
+
+    def _update_tool_profile_detail(self) -> None:
+        spec = self._tool_profile_spec or {}
+        dropdown = getattr(self, "tool_profile_dropdown", None)
+        if dropdown is None:
+            return
+        value = widgets.dropdown_value(dropdown)
+        help_map = spec.get("option_help") or {}
+        text = str(help_map.get(value) or spec.get("help") or "")
+        self.tool_profile_detail.set_text(text)
+
+    def _save_tool_profile(self) -> None:
+        if self.api is None or self._tool_profile_saving:
+            return
+        dropdown = getattr(self, "tool_profile_dropdown", None)
+        if dropdown is None:
+            return
+        value = widgets.dropdown_value(dropdown)
+        if not value:
+            return
+        self._tool_profile_saving = True
+        button = getattr(self, "tool_profile_save_button", None)
+        if button is not None:
+            button.set_sensitive(False)
+
+        def _do() -> dict[str, Any]:
+            return self.api.patch(
+                "/api/settings",
+                {"path": "behavior.tool_schema_profile", "value": value},
+                timeout=60,
+            )
+
+        def _done(result: dict[str, Any]) -> None:
+            self._tool_profile_saving = False
+            if button is not None:
+                button.set_sensitive(True)
+            saved = str(result.get("value") or value)
+            spec = self._tool_profile_spec or {}
+            spec["value"] = saved
+            self._update_tool_profile_detail()
+            suffix = "，需要重启 Runtime" if result.get("needs_restart") else "，已立即生效"
+            self.toast(f"工具档位已保存为 {saved}{suffix}")
+
+        def _failed(exc: BaseException) -> None:
+            self._tool_profile_saving = False
+            if button is not None:
+                button.set_sensitive(True)
+            self.toast(f"保存工具档位失败：{exc}")
+
+        widgets.run_async(_do, on_success=_done, on_error=_failed)
 
     def _error(self, exc: BaseException) -> None:
         widgets.clear(self.summary_row)
