@@ -90,6 +90,7 @@ class SettingsPage(Page):
         self.body.append(self.restart_hint)
         self._skin_updating = False
         self._font_scale_source = 0
+        self._disposed = False
         # 分组导航与字段区可拖动分隔条调整占比；默认只占 156px，
         # 给右侧正文留更多宽度（WebUI 的设置导航也是窄栏）。
         split = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
@@ -379,8 +380,16 @@ class SettingsPage(Page):
 
     def _apply_font_scale(self) -> bool:
         self._font_scale_source = 0
+        if self._disposed:
+            return False
         self.app.reload_skin()
         return False
+
+    def dispose(self) -> None:
+        self._disposed = True
+        if self._font_scale_source:
+            GLib.source_remove(self._font_scale_source)
+            self._font_scale_source = 0
 
     def _refresh_skin_options(self) -> None:
         current = skin_theme.read_skin()

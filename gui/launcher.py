@@ -17,13 +17,16 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from xml.sax.saxutils import escape as xml_escape
 
 _STAGE_ENV = "KAREN_GUI_RENDER_STAGE"
 _USER_RENDERER_ENV = "KAREN_GUI_RENDERER"
+_LAUNCHER_PID_ENV = "KAREN_GUI_LAUNCHER_PID"
 _CHILD_FLAG = "--karen-gui-child"
 _MAX_STAGE = 2
 _EARLY_EXIT_SECONDS = 20.0
 _CHILD_LOG_NAME = "gui-child.log"
+RESTART_EXIT_CODE = 75
 
 
 def _project_root() -> Path:
@@ -134,21 +137,36 @@ def report_fatal(title: str, message: str) -> None:
 
 
 def _fontconfig_file() -> Path | None:
-    data_home = Path(
-        os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")
-    )
+    if os.name == "nt":
+        data_home = Path(
+            os.environ.get("LOCALAPPDATA")
+            or os.environ.get("APPDATA")
+            or (Path.home() / "AppData" / "Roaming")
+        )
+    else:
+        data_home = Path(
+            os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")
+        )
     root = data_home / "KarenBot" / "fonts"
     path = root / "fonts.conf"
     try:
         root.mkdir(parents=True, exist_ok=True)
-        (root / "cache").mkdir(parents=True, exist_ok=True)
+        cache = root / "cache"
+        cache.mkdir(parents=True, exist_ok=True)
+        if os.name == "nt":
+            windows_root = Path(os.environ.get("WINDIR") or r"C:\Windows")
+            font_dirs = f"  <dir>{xml_escape((windows_root / 'Fonts').as_posix())}</dir>\n"
+        else:
+            font_dirs = (
+                '  <include ignore_missing="yes">/etc/fonts/fonts.conf</include>\n'
+            )
         content = (
             '<?xml version="1.0"?>\n'
             '<!DOCTYPE fontconfig SYSTEM "fonts.dtd">\n'
             "<fontconfig>\n"
-            '  <include ignore_missing="yes">/etc/fonts/fonts.conf</include>\n'
-            f"  <dir>{root}</dir>\n"
-            f"  <cachedir>{root / 'cache'}</cachedir>\n"
+            f"{font_dirs}"
+            f"  <dir>{xml_escape(root.as_posix())}</dir>\n"
+            f"  <cachedir>{xml_escape(cache.as_posix())}</cachedir>\n"
             "</fontconfig>\n"
         )
         if not path.is_file() or path.read_text(encoding="utf-8") != content:
@@ -187,6 +205,21 @@ def _child_command(args: list[str]) -> list[str]:
     return [sys.executable, "-m", "gui._run", *args]
 
 
+def finish_restart(raw: list[str]) -> int:
+    """Let the supervising launcher restart us, or launch it for a direct entry."""
+    if os.environ.get(_LAUNCHER_PID_ENV) == str(os.getppid()):
+        return RESTART_EXIT_CODE
+    args = [value for value in raw[1:] if value != _CHILD_FLAG]
+    if getattr(sys, "frozen", False):
+        command = [sys.executable, *args]
+    else:
+        command = [sys.executable, "-m", "gui", *args]
+    env = dict(os.environ)
+    env.pop(_LAUNCHER_PID_ENV, None)
+    subprocess.Popen(command, env=env, cwd=str(_project_root()))
+    return 0
+
+
 def _run_child(
     stage: int,
     args: list[str],
@@ -194,6 +227,7 @@ def _run_child(
     windowed: bool = False,
 ) -> tuple[int, float]:
     env = _stage_environment(stage, os.environ)
+    env[_LAUNCHER_PID_ENV] = str(os.getpid())
     command = _child_command(args)
     started = time.monotonic()
     _log(f"启动 GUI stage={stage} command={' '.join(command)}")
@@ -251,6 +285,22 @@ def _requested_mode(args: list[str]) -> str:
     return "auto"
 
 
+def _strip_renderer_args(args: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    skip_value = False
+    for value in args:
+        if skip_value:
+            skip_value = False
+            continue
+        if value == "--renderer":
+            skip_value = True
+            continue
+        if value.startswith("--renderer="):
+            continue
+        cleaned.append(value)
+    return cleaned
+
+
 def _failure_message(code: int) -> str:
     try:
         launcher_log = str(_log_path())
@@ -269,19 +319,29 @@ def _failure_message(code: int) -> str:
 
 def _run(raw: list[str], *, windowed: bool) -> int:
     if _CHILD_FLAG in raw:
-        raw = [item for item in raw if item != _CHILD_FLAG]
+        raw = _strip_renderer_args([item for item in raw if item != _CHILD_FLAG])
+        sys.argv[:] = raw
         from .app import main as app_main
 
         return app_main(raw)
 
     args = list(raw[1:])
     mode = _requested_mode(args)
+    child_args = _strip_renderer_args(args)
     if mode == "gl":
-        return _run_child(0, args, windowed=windowed)[0]
+        while True:
+            code, _elapsed = _run_child(0, child_args, windowed=windowed)
+            if code == RESTART_EXIT_CODE:
+                _log("GUI 请求重启，启动新子进程")
+                continue
+            return code
     start_stage = 1 if mode == "cairo" else 0
     stage = start_stage
     while stage <= _MAX_STAGE:
-        code, elapsed = _run_child(stage, args, windowed=windowed)
+        code, elapsed = _run_child(stage, child_args, windowed=windowed)
+        if code == RESTART_EXIT_CODE:
+            _log("GUI 请求重启，启动新子进程")
+            continue
         if code == 0:
             return 0
         if stage >= _MAX_STAGE:

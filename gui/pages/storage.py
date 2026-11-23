@@ -65,6 +65,7 @@ class StoragePage(Page):
         self._job_poll_source = 0
         self._job_poll_id = ""
         self._job_poll_attempts = 0
+        self._disposed = False
         self.status_label = widgets.muted("")
         self.body.append(self.status_label)
 
@@ -211,7 +212,7 @@ class StoragePage(Page):
 
         def _do() -> dict[str, Any]:
             return self.api.post(
-                f"/api/admin/jobs/{job_id}/cancel",
+                f"/api/admin/jobs/{_quote(job_id)}/cancel",
                 {},
                 headers=ADMIN_HEADERS,
                 timeout=30,
@@ -550,6 +551,8 @@ class StoragePage(Page):
         widgets.run_async(_do, on_success=_done, on_error=lambda exc: self.toast(f"清理失败：{exc}"))
 
     def _start_job_poll(self, job_id: str) -> None:
+        if self._disposed:
+            return
         self._job_poll_id = job_id
         self._job_poll_attempts = 0
         if self._job_poll_source:
@@ -558,7 +561,7 @@ class StoragePage(Page):
 
     def _poll_job(self) -> bool:
         self._job_poll_source = 0
-        if self.api is None or not self._job_poll_id:
+        if self._disposed or self.api is None or not self._job_poll_id:
             return False
         job_id = self._job_poll_id
 
@@ -568,6 +571,8 @@ class StoragePage(Page):
             )
 
         def _done(job: dict[str, Any]) -> None:
+            if self._disposed:
+                return
             self._jobs = [
                 item for item in self._jobs if item.get("job_id") != job_id
             ]
@@ -602,6 +607,8 @@ class StoragePage(Page):
                 self.refresh()
 
         def _failed(exc: BaseException) -> None:
+            if self._disposed:
+                return
             self._job_poll_attempts += 1
             self.status_label.set_text(
                 f"读取清理任务失败：{exc}；正在重试（第 {self._job_poll_attempts} 次）"
@@ -614,6 +621,14 @@ class StoragePage(Page):
 
         widgets.run_async(_do, on_success=_done, on_error=_failed)
         return False
+
+    def dispose(self) -> None:
+        self._disposed = True
+        self._job_poll_id = ""
+        self._job_poll_attempts = 0
+        if self._job_poll_source:
+            GLib.source_remove(self._job_poll_source)
+            self._job_poll_source = 0
 
     def _cancel(self, job: dict[str, Any]) -> None:
         if self.api is None:

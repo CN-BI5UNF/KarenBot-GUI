@@ -25,11 +25,36 @@ from . import (  # noqa: E402
 from . import theme as skin_theme  # noqa: E402
 from .api import ApiClient  # noqa: E402
 from .identity import application_id  # noqa: E402
+from .launcher import finish_restart  # noqa: E402
 from .local_server import LocalControlServer  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+class _PageLoadError(Gtk.Box):
+    page_title = "页面加载失败"
+
+    def __init__(self, message: str) -> None:
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self.set_margin_top(24)
+        self.set_margin_start(24)
+        self.set_margin_end(24)
+        self.append(widgets.title(self.page_title))
+        self.append(widgets.muted(message))
+
+    def activate(self) -> None:
+        pass
+
+    def refresh(self) -> None:
+        pass
+
+    def dispose(self) -> None:
+        pass
+
+    def is_dirty(self) -> bool:
+        return False
 
 # WebUI 的导航顺序与标题。第四列保留给旧的元组解包代码，不再显示分组标题。
 NAV_ITEMS = [
@@ -808,13 +833,7 @@ class MainWindow(Adw.ApplicationWindow):
         )
 
     def restart_backend(self) -> None:
-        """Restart the GUI-owned backend so changed Python code is reloaded.
-
-        This is intentionally different from ``POST /api/system/restart``:
-        that only rebuilds Runtime objects in the old interpreter.  The GUI
-        runs its control server in-process, so a full backend restart must
-        stop the LocalControlServer thread and start a fresh one.
-        """
+        """Stop the local server and request a fresh GUI process from the launcher."""
         if self._backend_restart_busy:
             return
         self._backend_restart_busy = True
@@ -831,8 +850,8 @@ class MainWindow(Adw.ApplicationWindow):
 
         def _stopped(_result: bool) -> None:
             self.backend = None
-            self._reset_pages_after_backend_restart()
-            self._start_backend()
+            self.api = None
+            self.app.request_restart()
 
         def _failed(exc: BaseException) -> None:
             self._backend_restart_busy = False
@@ -1391,9 +1410,7 @@ class MainWindow(Adw.ApplicationWindow):
             page = page_cls(self)
         except Exception as exc:  # noqa: BLE001
             logger.exception("加载页面失败：%s", page_id)
-            page = widgets.card()
-            page.append(widgets.title("页面加载失败"))
-            page.append(widgets.muted(str(exc)))
+            page = _PageLoadError(str(exc))
         self.pages[page_id] = page
         self.stack.add_named(page, page_id)
         return page
@@ -1523,8 +1540,13 @@ class KarenApplication(Adw.Application):
         self.theme = chosen
         self.window: MainWindow | None = None
         self._shutting_down = False
+        self._restart_requested = False
         self.connect("activate", self._on_activate)
         self.connect("shutdown", self._on_shutdown)
+
+    def request_restart(self) -> None:
+        self._restart_requested = True
+        self.quit()
 
     def set_theme(self, theme: str) -> None:
         value = theme if theme in _COLOR_SCHEMES else "auto"
@@ -1672,7 +1694,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     data_root = Path(args.data_dir).expanduser() if args.data_dir else None
     app = KarenApplication(data_root=data_root, theme=args.theme)
-    return app.run([raw[0], *remaining] if raw else ["karen-gui", *remaining])
+    status = app.run([raw[0], *remaining] if raw else ["karen-gui", *remaining])
+    return finish_restart(raw) if app._restart_requested else status
 
 
 __all__ = ["KarenApplication", "MainWindow", "main"]

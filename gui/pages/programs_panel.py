@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import uuid
 from typing import Any
+from urllib.parse import quote
 
 import gi
 
@@ -570,7 +571,7 @@ class ProgramsSettingsPanel(Gtk.Box):
 
         widgets.run_async(
             lambda: self.api.post(
-                f"/api/settings/programs/{program_id}/{action}",
+                f"/api/settings/programs/{quote(str(program_id), safe='')}/{action}",
                 {},
                 timeout=30,
             ),

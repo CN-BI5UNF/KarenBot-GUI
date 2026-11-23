@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from typing import Any
+from urllib.parse import quote
 
 import gi
 
@@ -301,7 +302,9 @@ class MindPage(Page):
         host.append(self.busy("正在读取…"))
 
         def _fetch() -> dict[str, Any]:
-            return self.api.get(f"/api/mind/tab/{key}?limit=60", timeout=30)
+            return self.api.get(
+                f"/api/mind/tab/{quote(key, safe='')}?limit=60", timeout=30
+            )
 
         def _done(data: dict[str, Any]) -> None:
             self._tab_busy.discard(key)
