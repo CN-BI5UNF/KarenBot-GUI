@@ -455,6 +455,23 @@ class SetupBehaviorTests(unittest.TestCase):
 
 
 class BackupPanelContractTests(unittest.TestCase):
+    def test_backup_poll_refreshes_live_category_progress(self):
+        job = {
+            "id": "backup-1", "state": "running", "total_bytes": 2048, "processed_bytes": 1024,
+            "component_progress": {"workspace": {"estimated_bytes": 2048, "processed_bytes": 1024}},
+        }
+        panel = SimpleNamespace(
+            page=SimpleNamespace(api=Mock()), _disposed=False, _active_job="backup-1",
+            get_mapped=lambda: True, status_label=Control(), _render_jobs=Mock(),
+            _schedule_poll=Mock(), refresh=Mock(),
+        )
+        panel.page.api.get.return_value = job
+        with patch.object(settings_panels.widgets, "run_async",
+                          lambda fn, on_success, on_error: on_success(fn())):
+            settings_panels.BackupSettingsPanel._poll(panel)
+        panel._render_jobs.assert_called_once_with([job])
+        panel._schedule_poll.assert_called_once()
+
     def test_restore_poll_uses_restore_route_and_real_progress_contract(self):
         for state in ("running", "done", "failed"):
             with self.subTest(state=state):
@@ -465,6 +482,7 @@ class BackupPanelContractTests(unittest.TestCase):
                     _restore_poll_source=1,
                     get_mapped=lambda: True,
                     status_label=Control(),
+                    restore_status=Control(),
                     _restore_label=Control(),
                     _restore_progress_host=Control(),
                     _restore_button=Control(),
@@ -501,6 +519,8 @@ class BackupPanelContractTests(unittest.TestCase):
                 else:
                     self.assertEqual(panel._restore_job, "")
                     self.assertIn("rollback.zip", panel.status_label.text)
+                    self.assertIn("rollback.zip", panel.restore_status.text)
+                    self.assertIn("1.0 KiB", panel.restore_status.text)
                     panel._stop_restore_poll.assert_called_once()
                     panel.refresh.assert_called_once()
 

@@ -1330,6 +1330,10 @@ class BackupSettingsPanel(Gtk.Box):
             )
 
     def _render(self, data: dict[str, Any]) -> None:
+        active_restore = data.get("active_restore")
+        if isinstance(active_restore, dict) and active_restore.get("state") not in BACKUP_TERMINAL_STATES:
+            self._restore_job = str(active_restore.get("id") or self._restore_job)
+            self._schedule_restore_poll()
         widgets.clear(self.summary_box)
         directory = str(data.get("directory") or "—")
         self.summary_box.append(widgets.property_row("备份目录", directory, wrap=True))
@@ -1410,6 +1414,7 @@ class BackupSettingsPanel(Gtk.Box):
         self._render_files(files)
 
     def _render_jobs(self, jobs: list[dict[str, Any]]) -> None:
+        self._last_backup_jobs = list(jobs)
         widgets.clear(self.jobs_box)
         if not jobs:
             self.jobs_box.append(self.page.empty("还没有备份任务。"))
@@ -1439,6 +1444,13 @@ class BackupSettingsPanel(Gtk.Box):
                 )
             )
             breakdown = list(job.get("components") or [])
+            if not breakdown:
+                labels = {item["id"]: item.get("label", item["id"]) for item in self.components}
+                breakdown = [
+                    {"id": key, "label": labels.get(key, key), **value}
+                    for key, value in (job.get("component_progress") or {}).items()
+                    if isinstance(value, dict)
+                ]
             if breakdown:
                 card.append(
                     widgets.table(
@@ -1986,6 +1998,9 @@ class BackupSettingsPanel(Gtk.Box):
             total = widgets.format_bytes(job.get("total_bytes"))
             current = str(job.get("current") or job.get("stage") or "")
             self.status_label.set_text(f"备份中：{processed} / {total}" + (f" · {current}" if current else ""))
+            self._render_jobs([job] + [
+                old for old in getattr(self, "_last_backup_jobs", []) if old.get("id") != job_id
+            ])
             if state in BACKUP_TERMINAL_STATES:
                 self.refresh()
             else:
@@ -2060,7 +2075,9 @@ class BackupSettingsPanel(Gtk.Box):
                                         item.get("bytes") if isinstance(item, dict) else 0
                                     ),
                                     widgets.format_bytes(
-                                        preview_items.get(component_id, {}).get("archive_bytes")
+                                        preview_items.get(component_id, {}).get(
+                                            "archive_bytes", item.get("archive_bytes") if isinstance(item, dict) else 0
+                                        )
                                     ),
                                 ]
                                 for component_id, item in progress.items()
@@ -2093,6 +2110,13 @@ class BackupSettingsPanel(Gtk.Box):
                 if warnings:
                     result += " 警告：" + "；".join(warnings)
                 self.status_label.set_text(result)
+                persistent_status = getattr(self, "restore_status", None)
+                if persistent_status is not None:
+                    sizes = [
+                        f"{key} {widgets.format_bytes(value.get('bytes'))}"
+                        for key, value in progress.items() if isinstance(value, dict)
+                    ]
+                    persistent_status.set_text(result + (" · " + "；".join(sizes) if sizes else ""))
                 if label is not None:
                     label.set_text(result)
                 restore_button = getattr(self, "_restore_button", None)
