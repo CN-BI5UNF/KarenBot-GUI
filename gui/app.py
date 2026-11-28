@@ -1291,11 +1291,12 @@ class MainWindow(Adw.ApplicationWindow):
         else:
             button.remove_css_class("active")
 
-    def _discard_current_unsaved(self) -> None:
+    def _discard_current_unsaved(self) -> bool:
         page = self.pages.get(self.current_page_id)
         discard = getattr(page, "discard_unsaved_changes", None)
         if callable(discard):
-            discard()
+            return discard() is not False
+        return True
 
     def _confirm_unsaved(
         self,
@@ -1306,6 +1307,10 @@ class MainWindow(Adw.ApplicationWindow):
     ) -> None:
         if self._unsaved_dialog is not None:
             self._unsaved_dialog.present()
+            return
+        page = self.pages.get(self.current_page_id)
+        can_discard = getattr(page, "can_discard_unsaved_changes", None)
+        if callable(can_discard) and not can_discard():
             return
         dialog = Adw.MessageDialog.new(self, heading, body)
         dialog.add_response("cancel", "取消")
@@ -1320,7 +1325,8 @@ class MainWindow(Adw.ApplicationWindow):
             widget.close()
             if response != "discard":
                 return
-            self._discard_current_unsaved()
+            if not self._discard_current_unsaved():
+                return
             on_discard()
 
         dialog.connect("response", _response)
@@ -1392,7 +1398,11 @@ class MainWindow(Adw.ApplicationWindow):
     def refresh_current(self) -> None:
         page = self.pages.get(self.current_page_id)
         if page is not None:
-            page.refresh()
+            request = getattr(page, "refresh_requested", None)
+            if callable(request):
+                request()
+            else:
+                page.refresh()
 
     def _ensure_page(self, page_id: str) -> Any:
         page = self.pages.get(page_id)

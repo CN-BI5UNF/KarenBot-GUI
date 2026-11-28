@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import gi
 
@@ -59,6 +59,72 @@ BACKUP_TERMINAL_STATES = frozenset(
         "interrupted",
     }
 )
+
+def _selected_backup_bytes(
+    components: list[dict[str, Any]],
+    selected: set[str],
+    *,
+    include_media: bool = True,
+) -> int:
+    """Estimate selected source bytes; unavailable categories are never counted."""
+    total = 0
+    seen: set[str] = set()
+    for item in components:
+        component_id = str(item.get("id") or "")
+        if component_id not in selected or component_id in seen:
+            continue
+        seen.add(component_id)
+        if item.get("available") is False:
+            continue
+        try:
+            raw_bytes = _component_bytes(item, include_media=include_media)
+            total += max(0, int(raw_bytes or 0))
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return total
+
+
+def _component_bytes(item: dict[str, Any], *, include_media: bool = True) -> int:
+    """Return the best size estimate for a component and media choice."""
+    if str(item.get("id") or "") == "workspace":
+        if include_media and item.get("bytes_with_media") is not None:
+            return int(item.get("bytes_with_media") or 0)
+        if not include_media and item.get("bytes_without_media") is not None:
+            return int(item.get("bytes_without_media") or 0)
+    return int(
+        item.get("bytes", item.get("archive_bytes", item.get("estimated_bytes", 0)))
+        or 0
+    )
+
+
+def _restore_payload(
+    filename: str,
+    selected: set[str],
+    preview: dict[str, Any] | None,
+    confirmation: str,
+) -> dict[str, Any]:
+    """Build a restore request only for the exact, still-previewed selection."""
+    safe_name = str(filename or "").strip()
+    chosen = sorted({str(item).strip() for item in selected if str(item).strip()})
+    if not safe_name:
+        raise ValueError("请选择一个备份文件。")
+    if not chosen:
+        raise ValueError("至少选择一类要恢复的内容。")
+    if not isinstance(preview, dict) or not preview.get("ok"):
+        raise ValueError("请先预览并检查恢复内容。")
+    if str(preview.get("filename") or "") != safe_name:
+        raise ValueError("备份文件已变化，请重新预览。")
+    allowed = {
+        str(item.get("id") or "")
+        for item in preview.get("components") or []
+        if item.get("available") is not False and item.get("restorable") is not False
+    }
+    if set(chosen) != allowed:
+        raise ValueError("所选内容与预览不一致，请重新预览。")
+    required = str(preview.get("confirmation_phrase") or "恢复备份")
+    if confirmation.strip() != required:
+        raise ValueError(f"请输入确认短语“{required}”。")
+    return {"filename": safe_name, "components": chosen, "confirmation": required}
 
 
 def _spec_map(group: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -1013,15 +1079,28 @@ class BackupSettingsPanel(Gtk.Box):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         self.page = page
         self._active_job = ""
+        self._backup_starting = False
+        self._restore_job = ""
         self._poll_source = 0
+        self._restore_poll_source = 0
         self._bump = 0
+        self.components: list[dict[str, Any]] = []
+        self._components_loaded = False
+        self.component_checks: dict[str, Gtk.CheckButton] = {}
+        self.component_size_labels: dict[str, Gtk.Label] = {}
+        self.selected_components: set[str] = set()
+        self._restore_selection: set[str] = set()
+        self._restore_filename = ""
+        self._restore_preview: dict[str, Any] | None = None
+        self._disposed = False
         self._build()
         self.connect("notify::mapped", self._on_mapped)
+        self.connect("unmap", self._on_unmapped)
 
     def _build(self) -> None:
         self.status_card = _card(
             "备份状态",
-            "备份包含配置、加密密钥库、聊天、RAG、工作区与人格；文件未加密。",
+            "选择要备份的内容。各类占用大小为源数据估算，实际压缩包大小会不同。",
         )
         self.summary_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self.status_card.append(self.summary_box)
@@ -1033,6 +1112,28 @@ class BackupSettingsPanel(Gtk.Box):
             wrap=True,
         )
         self.status_card.append(warning)
+        self.component_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.status_card.append(self.component_box)
+        component_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.select_all_button = widgets.button("全选")
+        self.select_all_button.connect("clicked", lambda _b: self._select_all_components(True))
+        self.select_none_button = widgets.button("全不选")
+        self.select_none_button.connect("clicked", lambda _b: self._select_all_components(False))
+        component_actions.append(self.select_all_button)
+        component_actions.append(self.select_none_button)
+        self.status_card.append(component_actions)
+        self.component_size_label = widgets.muted("正在读取备份内容大小…")
+        self.status_card.append(self.component_size_label)
+        media_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.media_switch = widgets.switch(True)
+        self.media_switch.connect(
+            "notify::active", lambda *_args: self._update_selected_size()
+        )
+        media_row.append(self.media_switch)
+        media_row.append(widgets.label("包含可选入站媒体"))
+        self.media_help = widgets.muted("媒体可能占用较多空间；取消后会跳过入站媒体附件。")
+        self.status_card.append(media_row)
+        self.status_card.append(self.media_help)
         actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.start_button = widgets.button("创建备份", css="suggested-action")
         self.start_button.set_sensitive(False)
@@ -1058,59 +1159,175 @@ class BackupSettingsPanel(Gtk.Box):
         self.jobs_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         self.append(self.jobs_box)
 
-        self.append(widgets.section_header("备份文件", "可离线校验或下载到本机"))
+        self.append(widgets.section_header("备份文件", "查看分类大小、离线校验、选择内容并一键恢复，或下载到本机"))
         self.files_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         self.append(self.files_box)
 
-        guide = widgets.card(spacing=6, padding=14)
-        guide.append(widgets.section_header(
-            "恢复备份（手动）",
-            "GUI 与 WebUI 都不提供在线一键恢复，避免运行中的服务写坏恢复结果。",
-        ))
-        for line in (
-            "1. 先停止 GUI 和 Runtime，并复制当前数据目录作为回滚点。",
-            "2. 解压备份 ZIP 到临时目录，按包内 README_RESTORE.txt 操作。",
-            "3. 恢复时整体替换数据目录，不要只替换单个 SQLite 文件；"
-            "各库分别快照，跨库引用与版本号必须保持一致。",
-            "4. 恢复后启动 Runtime；若提示维护库或数据库版本需要迁移，"
-            "先保留原库副本，再按提示迁移。",
-            "5. 校验结果显示“凭据不可恢复”时，模型 API Key 需要重新填写。",
-        ):
-            guide.append(widgets.muted(line))
-        self.append(guide)
+        self.restore_status = widgets.muted("")
+        self.append(self.restore_status)
 
     def _on_mapped(self, *_args: Any) -> None:
-        if self.get_mapped():
+        if self.get_mapped() and not self._disposed:
             self.refresh()
+            if self._restore_job:
+                self._schedule_restore_poll()
+
+    def _on_unmapped(self, *_args: Any) -> None:
+        self._stop_poll()
+        self._stop_restore_poll()
 
     def on_show(self) -> None:
-        if self.get_mapped():
+        if self.get_mapped() and not self._disposed:
             self.refresh()
+            if self._restore_job:
+                self._schedule_restore_poll()
+
+    def dispose(self) -> None:
+        self._disposed = True
+        self._bump += 1
+        self._stop_poll()
+        self._stop_restore_poll()
 
     def refresh(self) -> None:
-        if self.page.api is None:
+        if self.page.api is None or self._disposed:
             return
         self._bump += 1
         token = self._bump
         self.start_button.set_sensitive(False)
 
-        def _do() -> dict[str, Any]:
-            return self.page.api.get("/api/backup/status", timeout=60)
+        def _do() -> tuple[dict[str, Any], dict[str, Any]]:
+            status = self.page.api.get("/api/backup/status", timeout=60)
+            components = self.page.api.get("/api/backup/components", timeout=60)
+            return status, components
 
-        def _done(data: dict[str, Any]) -> None:
-            if token != self._bump:
+        def _done(result: tuple[dict[str, Any], dict[str, Any]]) -> None:
+            if token != self._bump or self._disposed:
                 return
+            data, component_data = result
             self._render(data)
+            self._render_components(component_data)
 
         def _failed(exc: BaseException) -> None:
-            if token != self._bump:
+            if token != self._bump or self._disposed:
                 return
             self.start_button.set_sensitive(False)
             self.status_label.set_text(
                 f"读取备份状态失败：{exc}。请点击刷新重试。"
             )
+            self.component_size_label.set_text(f"读取分类占用失败：{exc}")
 
         widgets.run_async(_do, on_success=_done, on_error=_failed)
+
+    def _render_components(self, data: dict[str, Any]) -> None:
+        previous = set(self.selected_components)
+        was_loaded = self._components_loaded
+        self.components = [
+            dict(item)
+            for item in data.get("components") or []
+            if isinstance(item, dict) and str(item.get("id") or "")
+        ]
+        self.selected_components = {
+            str(item.get("id") or "")
+            for item in self.components
+            if item.get("available") is not False
+            and (
+                not was_loaded
+                or str(item.get("id") or "") in previous
+            )
+        }
+        self._components_loaded = True
+        if not was_loaded:
+            self.media_switch.set_active(bool(data.get("include_media", True)))
+        self.component_checks = {}
+        self.component_size_labels = {}
+        widgets.clear(self.component_box)
+        for item in self.components:
+            component_id = str(item.get("id") or "")
+            available = item.get("available") is not False
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            check = Gtk.CheckButton.new_with_label(
+                str(item.get("label") or component_id)
+            )
+            check.set_active(component_id in self.selected_components)
+            check.set_sensitive(available)
+            check.connect(
+                "toggled",
+                lambda control, key=component_id: self._component_toggled(
+                    key, control.get_active()
+                ),
+            )
+            self.component_checks[component_id] = check
+            row.append(check)
+            size_label = widgets.label(
+                widgets.format_bytes(
+                    _component_bytes(
+                        item, include_media=self.media_switch.get_active()
+                    )
+                )
+            )
+            self.component_size_labels[component_id] = size_label
+            row.append(size_label)
+            row.set_hexpand(True)
+            self.component_box.append(row)
+            if not available and item.get("reason"):
+                self.component_box.append(
+                    widgets.muted(str(item["reason"]))
+                )
+        self.media_switch.set_sensitive(
+            any(item.get("id") == "workspace" and item.get("available") is not False
+                for item in self.components)
+        )
+        self._update_selected_size()
+
+    def _component_toggled(self, component_id: str, active: bool) -> None:
+        if active:
+            self.selected_components.add(component_id)
+        else:
+            self.selected_components.discard(component_id)
+        self._update_selected_size()
+
+    def _select_all_components(self, active: bool) -> None:
+        for item in self.components:
+            component_id = str(item.get("id") or "")
+            if item.get("available") is False:
+                continue
+            check = self.component_checks.get(component_id)
+            if check is not None:
+                check.set_active(active)
+        self._update_selected_size()
+
+    def _update_selected_size(self) -> None:
+        include_media = self.media_switch.get_active()
+        for item in self.components:
+            size_label = self.component_size_labels.get(str(item.get("id") or ""))
+            if size_label is not None:
+                size_label.set_text(
+                    widgets.format_bytes(
+                        _component_bytes(item, include_media=include_media)
+                    )
+                )
+        total = _selected_backup_bytes(
+            self.components,
+            self.selected_components,
+            include_media=include_media,
+        )
+        selected_count = sum(
+            1 for item in self.components
+            if str(item.get("id") or "") in self.selected_components
+            and item.get("available") is not False
+        )
+        self.component_size_label.set_text(
+            f"已选 {selected_count} 类 · 源数据约 {widgets.format_bytes(total)}；"
+            "压缩包大小会因内容和压缩率而变化。"
+        )
+        if self.start_button is not None:
+            self.start_button.set_sensitive(
+                selected_count > 0
+                and not bool(self._active_job)
+                and not bool(self._backup_starting)
+                and not bool(getattr(self, "_backup_running", False))
+                and not bool(self._restore_job)
+            )
 
     def _render(self, data: dict[str, Any]) -> None:
         widgets.clear(self.summary_box)
@@ -1142,6 +1359,7 @@ class BackupSettingsPanel(Gtk.Box):
         else:
             self.summary_box.append(widgets.property_row("最近备份", "还没有备份"))
         running = bool(data.get("running"))
+        self._backup_running = running
         self._active_job = str(data.get("active_job_id") or "")
         self.start_button.set_sensitive(not running)
         self.cancel_button.set_visible(running)
@@ -1220,6 +1438,27 @@ class BackupSettingsPanel(Gtk.Box):
                     + (f" · {job.get('current')}" if job.get("current") else "")
                 )
             )
+            breakdown = list(job.get("components") or [])
+            if breakdown:
+                card.append(
+                    widgets.table(
+                        ["内容", "估算大小", "已处理", "归档大小"],
+                        [
+                            [
+                                str(item.get("label") or item.get("id") or ""),
+                                widgets.format_bytes(
+                                    item.get("estimated_bytes", item.get("bytes"))
+                                ),
+                                widgets.format_bytes(item.get("processed_bytes")),
+                                widgets.format_bytes(
+                                    item.get("actual_bytes", item.get("archive_bytes"))
+                                ),
+                            ]
+                            for item in breakdown
+                        ],
+                        empty_text="暂无分类进度",
+                    )
+                )
             error = job.get("error")
             if isinstance(error, dict) and error.get("message"):
                 card.append(widgets.label(str(error["message"]), css="danger-text", wrap=True))
@@ -1272,27 +1511,332 @@ class BackupSettingsPanel(Gtk.Box):
             actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
             verify = widgets.button("离线校验")
             verify.connect("clicked", lambda _b, name=filename: self._verify(name))
+            restore = widgets.button("选择内容并恢复", css="destructive-action")
+            restore_area = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            restore.connect(
+                "clicked",
+                lambda button, name=filename, area=restore_area: self._load_restore_selection(
+                    name, area, button
+                ),
+            )
             download = widgets.button("下载")
             download.connect("clicked", lambda _b, name=filename: self._download(name))
             actions.append(verify)
+            actions.append(restore)
             actions.append(download)
             card.append(actions)
+            card.append(restore_area)
             self.files_box.append(card)
 
-    def _start(self) -> None:
-        if self.page.api is None:
+    def _load_restore_selection(
+        self, filename: str, host: Gtk.Box, button: Gtk.Button
+    ) -> None:
+        if self.page.api is None or self._disposed:
             return
-        self.start_button.set_sensitive(False)
-        self.status_label.set_text("正在启动备份…")
+        if self._backup_running or self._restore_job:
+            self.page.toast("当前有备份或恢复任务运行，请等待完成后再恢复。")
+            return
+        button.set_sensitive(False)
+        widgets.clear(host)
+        host.append(widgets.muted("正在校验备份并读取分类大小…"))
 
         def _do() -> dict[str, Any]:
-            return self.page.api.post("/api/backup", {}, timeout=60)
+            return self.page.api.post(
+                "/api/backup/verify",
+                {"filename": filename, "deep_sqlite": True},
+                timeout=600,
+            )
+
+        def _done(report: dict[str, Any]) -> None:
+            button.set_sensitive(True)
+            if self._disposed:
+                return
+            if not report.get("ok"):
+                errors = [
+                    str(item.get("message") or item.get("code") or "")
+                    for item in report.get("errors") or []
+                ]
+                widgets.clear(host)
+                host.append(
+                    widgets.label(
+                        "恢复前校验失败：" + ("；".join(errors) or "未知原因"),
+                        css="danger-text",
+                        wrap=True,
+                    )
+                )
+                return
+            self._render_restore_selection(filename, report, host)
+
+        def _failed(exc: BaseException) -> None:
+            button.set_sensitive(True)
+            widgets.clear(host)
+            host.append(widgets.label(f"读取备份分类失败：{exc}", css="danger-text", wrap=True))
+
+        widgets.run_async(_do, on_success=_done, on_error=_failed)
+
+    def _render_restore_selection(
+        self, filename: str, report: dict[str, Any], host: Gtk.Box
+    ) -> None:
+        widgets.clear(host)
+        card = widgets.card(spacing=7, padding=12)
+        card.append(
+            widgets.section_header(
+                f"恢复 {filename}",
+                "选择要恢复的类别。开始前会自动创建回滚备份；未选择的当前内容保持不变。",
+            )
+        )
+        warning = widgets.label(
+            "恢复会覆盖所选类别中同名内容并增加备份中的缺失文件；不会删除目标中备份没有的文件。"
+            "Runtime 将短暂停止并自动尝试恢复运行。",
+            css="danger-text",
+            wrap=True,
+        )
+        card.append(warning)
+        choices = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        checks: dict[str, Gtk.CheckButton] = {}
+        restore_components = [
+            item for item in report.get("components") or []
+            if isinstance(item, dict) and str(item.get("id") or "")
+        ]
+        selected = {
+            str(item.get("id") or "")
+            for item in restore_components
+            if item.get("available") is not False and item.get("restorable") is not False
+        }
+        for item in restore_components:
+            component_id = str(item.get("id") or "")
+            available = item.get("available") is not False and item.get("restorable") is not False
+            label = str(item.get("label") or component_id)
+            archive_size = item.get("archive_bytes", item.get("bytes"))
+            check = Gtk.CheckButton.new_with_label(
+                f"{label} · 备份中 {widgets.format_bytes(archive_size)}"
+            )
+            check.set_active(component_id in selected)
+            check.set_sensitive(available)
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            row.append(check)
+            if not available:
+                reason = str(item.get("reason") or "此类别不在备份中或不可恢复")
+                row.append(widgets.muted(reason))
+            choices.append(row)
+            checks[component_id] = check
+        card.append(choices)
+        size_label = widgets.muted("")
+        card.append(size_label)
+        preview_label = widgets.muted("")
+        card.append(preview_label)
+        preview_details = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        card.append(preview_details)
+        restore_progress = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        card.append(restore_progress)
+        preview_button = widgets.button("预览恢复范围")
+        confirmation = widgets.entry(placeholder="输入确认短语：恢复备份")
+        confirmation.set_sensitive(False)
+        restore_button = widgets.button("立即恢复所选内容", css="destructive-action")
+        restore_button.set_sensitive(False)
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        actions.append(preview_button)
+        actions.append(restore_button)
+        card.append(actions)
+        card.append(_field_block("确认短语", confirmation))
+        host.append(card)
+
+        state: dict[str, Any] = {"preview": None, "selected": set(selected), "busy": False}
+
+        def current_selection() -> set[str]:
+            return {key for key, control in checks.items() if control.get_active()}
+
+        def sync_selection(*_args: Any) -> None:
+            state["selected"] = current_selection()
+            # Any edit invalidates the last server-side preview.
+            state["preview"] = None
+            confirmation.set_text("")
+            confirmation.set_sensitive(False)
+            restore_button.set_sensitive(False)
+            preview_label.set_text("")
+            widgets.clear(preview_details)
+            size = _selected_backup_bytes(restore_components, state["selected"])
+            count = len(state["selected"])
+            size_label.set_text(
+                f"已选 {count} 类 · 备份中约 {widgets.format_bytes(size)}。"
+                "确认前需预览当前数据会被覆盖的范围。"
+            )
+
+        for check in checks.values():
+            check.connect("toggled", sync_selection)
+        sync_selection()
+
+        def sync_confirmation(*_args: Any) -> None:
+            preview = state.get("preview")
+            required = str((preview or {}).get("confirmation_phrase") or "")
+            restore_button.set_sensitive(
+                not state["busy"]
+                and not bool(self._restore_job)
+                and bool(preview and preview.get("ok"))
+                and bool(required)
+                and confirmation.get_text().strip() == required
+            )
+
+        confirmation.connect("changed", sync_confirmation)
+
+        def preview() -> None:
+            if self._restore_job:
+                preview_label.set_text("已有恢复任务运行中，请等待任务完成。")
+                return
+            chosen = current_selection()
+            if not chosen:
+                preview_label.set_text("至少选择一类要恢复的内容。")
+                return
+            preview_button.set_sensitive(False)
+            preview_label.set_text("正在核对备份并计算所选恢复范围…")
+            widgets.clear(preview_details)
+            state["busy"] = True
+            state["preview"] = None
+
+            def _do() -> dict[str, Any]:
+                return self.page.api.post(
+                    "/api/backup/restore/preview",
+                    {"filename": filename, "components": sorted(chosen)},
+                    timeout=300,
+                )
+
+            def _done(result: dict[str, Any]) -> None:
+                preview_button.set_sensitive(True)
+                state["busy"] = False
+                if self._disposed:
+                    return
+                state["preview"] = result
+                rows = [
+                    [
+                        str(item.get("label") or item.get("id") or ""),
+                        widgets.format_bytes(item.get("archive_bytes")),
+                        widgets.format_bytes(item.get("target_bytes")),
+                        (
+                            f"{int(item.get('overwrite_files') or 0)} 覆盖 · "
+                            f"{int(item.get('new_files') or 0)} 新增 · "
+                            f"{int(item.get('delete_files') or 0)} 删除"
+                        ),
+                    ]
+                    for item in result.get("components") or []
+                ]
+                if result.get("ok"):
+                    preview_label.set_text(
+                        f"预览通过：所选备份约 {widgets.format_bytes(result.get('total_archive_bytes'))}；"
+                        f"当前目标约 {widgets.format_bytes(result.get('total_target_bytes'))}。"
+                        "执行前会自动创建当前数据的回滚备份。"
+                    )
+                    detail = widgets.table(
+                        ["类别", "备份大小", "当前大小", "文件变化"],
+                        rows,
+                    )
+                    preview_details.append(detail)
+                    for text in result.get("warnings") or []:
+                        preview_details.append(
+                            widgets.label(str(text), css="danger-text", wrap=True)
+                        )
+                    phrase = str(result.get("confirmation_phrase") or "恢复备份")
+                    confirmation.set_placeholder_text(f"输入确认短语：{phrase}")
+                    confirmation.set_sensitive(True)
+                else:
+                    preview_label.set_text("恢复预览未通过，请检查警告后重新选择。")
+                    for text in result.get("warnings") or []:
+                        preview_label.set_text(preview_label.get_text() + "\n" + str(text))
+                sync_confirmation()
+
+            def _failed(exc: BaseException) -> None:
+                preview_button.set_sensitive(True)
+                state["busy"] = False
+                state["preview"] = None
+                preview_label.set_text(f"恢复预览失败：{exc}")
+                sync_confirmation()
+
+            widgets.run_async(_do, on_success=_done, on_error=_failed)
+
+        preview_button.connect("clicked", lambda _b: preview())
+
+        def start_restore() -> None:
+            try:
+                payload = _restore_payload(
+                    filename,
+                    current_selection(),
+                    state.get("preview"),
+                    confirmation.get_text(),
+                )
+            except ValueError as exc:
+                preview_label.set_text(str(exc))
+                return
+            state["busy"] = True
+            restore_button.set_sensitive(False)
+            preview_button.set_sensitive(False)
+            preview_label.set_text("正在提交恢复任务…")
+
+            def _do() -> dict[str, Any]:
+                return self.page.api.post("/api/backup/restore", payload, timeout=600)
+
+            def _done(job: dict[str, Any]) -> None:
+                state["busy"] = False
+                if self._disposed:
+                    return
+                job_id = str(job.get("id") or job.get("job_id") or "")
+                if not job_id:
+                    preview_label.set_text("恢复请求未返回任务编号，无法跟踪恢复状态。")
+                    return
+                self._restore_filename = filename
+                self._restore_job = job_id
+                self._restore_label = preview_label
+                self._restore_button = restore_button
+                self._restore_preview_button = preview_button
+                self._restore_progress_host = restore_progress
+                self._restore_preview = state.get("preview")
+                widgets.clear(restore_progress)
+                preview_label.set_text("恢复任务已启动，正在等待后端执行…")
+                self.status_label.set_text("正在恢复备份；Runtime 将暂时停止。")
+                self._schedule_restore_poll()
+
+            def _failed(exc: BaseException) -> None:
+                state["busy"] = False
+                preview_button.set_sensitive(True)
+                restore_button.set_sensitive(False)
+                preview_label.set_text(f"恢复启动失败：{exc}")
+                sync_confirmation()
+
+            widgets.run_async(_do, on_success=_done, on_error=_failed)
+
+        restore_button.connect("clicked", lambda _b: start_restore())
+
+    def _start(self) -> None:
+        if self.page.api is None or self._disposed:
+            return
+        if getattr(self, "_backup_starting", False):
+            return
+        if getattr(self, "_restore_job", ""):
+            self.status_label.set_text("恢复任务运行中，暂不能同时创建备份。")
+            return
+        if not self.selected_components:
+            self.status_label.set_text("至少选择一类要备份的内容。")
+            return
+        self.start_button.set_sensitive(False)
+        self._backup_starting = True
+        self.status_label.set_text("正在启动备份…")
+        payload = {
+            "components": sorted(self.selected_components),
+            "include_media": self.media_switch.get_active(),
+        }
+
+        def _do() -> dict[str, Any]:
+            return self.page.api.post("/api/backup", payload, timeout=60)
 
         def _done(result: dict[str, Any]) -> None:
+            self._backup_starting = False
+            if self._disposed:
+                return
             self.page.toast(str(result.get("message") or "备份已开始"))
             self.refresh()
 
         def _failed(exc: BaseException) -> None:
+            self._backup_starting = False
+            if self._disposed:
+                return
             self.start_button.set_sensitive(True)
             self.status_label.set_text(f"备份启动失败：{exc}")
             self.page.toast(f"备份启动失败：{exc}")
@@ -1330,6 +1874,8 @@ class BackupSettingsPanel(Gtk.Box):
             )
 
         def _done(report: dict[str, Any]) -> None:
+            if self._disposed:
+                return
             if report.get("ok"):
                 parts = [
                     f"校验通过：{filename}（{report.get('member_count', 0)} 个成员）",
@@ -1345,6 +1891,19 @@ class BackupSettingsPanel(Gtk.Box):
                     parts.append("警告：" + "；".join(warnings))
                 if not report.get("credential_restorable"):
                     parts.append("凭据不可恢复，请勿只依赖这个备份恢复 API Key")
+                component_rows = [
+                    [
+                        str(item.get("label") or item.get("id") or ""),
+                        widgets.format_bytes(item.get("archive_bytes")),
+                        "可恢复" if item.get("restorable") is not False else "不可恢复",
+                    ]
+                    for item in report.get("components") or []
+                ]
+                if component_rows:
+                    parts.append("分类大小：")
+                    parts.extend(
+                        " / ".join(row) for row in component_rows
+                    )
                 self.detail_label.set_text(" · ".join(parts))
             else:
                 errors = [
@@ -1363,6 +1922,8 @@ class BackupSettingsPanel(Gtk.Box):
             self.page.toast(self.detail_label.get_text())
 
         def _failed(exc: BaseException) -> None:
+            if self._disposed:
+                return
             self.detail_label.set_text(f"校验失败：{exc}")
 
         widgets.run_async(_do, on_success=_done, on_error=_failed)
@@ -1384,16 +1945,20 @@ class BackupSettingsPanel(Gtk.Box):
             return len(data)
 
         def _done(size: int) -> None:
+            if self._disposed:
+                return
             self.detail_label.set_text(f"已下载 {filename}（{widgets.format_bytes(size)}）")
             self.page.toast("备份已保存到本机")
 
         def _failed(exc: BaseException) -> None:
+            if self._disposed:
+                return
             self.detail_label.set_text(f"下载失败：{exc}")
 
         widgets.run_async(_do, on_success=_done, on_error=_failed)
 
     def _schedule_poll(self) -> None:
-        if self._poll_source:
+        if self._poll_source or self._disposed:
             return
         self._poll_source = GLib.timeout_add_seconds(1, self._poll)
 
@@ -1404,7 +1969,7 @@ class BackupSettingsPanel(Gtk.Box):
 
     def _poll(self) -> bool:
         self._poll_source = 0
-        if not self.get_mapped():
+        if not self.get_mapped() or self._disposed:
             return False
         if self.page.api is None or not self._active_job:
             return False
@@ -1414,6 +1979,8 @@ class BackupSettingsPanel(Gtk.Box):
             return self.page.api.get(f"/api/backup/jobs/{q(job_id)}", timeout=15)
 
         def _done(job: dict[str, Any]) -> None:
+            if self._disposed:
+                return
             state = str(job.get("state") or "")
             processed = widgets.format_bytes(job.get("processed_bytes"))
             total = widgets.format_bytes(job.get("total_bytes"))
@@ -1425,8 +1992,133 @@ class BackupSettingsPanel(Gtk.Box):
                 self._schedule_poll()
 
         def _failed(exc: BaseException) -> None:
+            if self._disposed:
+                return
             self.status_label.set_text(f"备份进度读取失败：{exc}")
             self._schedule_poll()
+
+        widgets.run_async(_do, on_success=_done, on_error=_failed)
+        return False
+
+    def _stop_restore_poll(self) -> None:
+        if self._restore_poll_source:
+            GLib.source_remove(self._restore_poll_source)
+            self._restore_poll_source = 0
+
+    def _schedule_restore_poll(self) -> None:
+        if self._restore_poll_source or self._disposed:
+            return
+        self._restore_poll_source = GLib.timeout_add_seconds(
+            1, self._poll_restore
+        )
+
+    def _poll_restore(self) -> bool:
+        self._restore_poll_source = 0
+        if not self.get_mapped() or self._disposed or not self._restore_job:
+            return False
+        job_id = self._restore_job
+
+        def _do() -> dict[str, Any]:
+            return self.page.api.get(
+                f"/api/backup/restore/jobs/{q(job_id)}", timeout=15
+            )
+
+        def _done(job: dict[str, Any]) -> None:
+            if self._disposed or job_id != self._restore_job:
+                return
+            state = str(job.get("state") or "")
+            processed = widgets.format_bytes(job.get("processed_bytes", job.get("progress")))
+            total = widgets.format_bytes(job.get("total_bytes"))
+            stage = str(job.get("stage") or "")
+            line = (
+                f"恢复进度：{processed} / {total}"
+                + (f" · {BACKUP_STAGE_TEXT.get(stage, stage)}" if stage else "")
+            )
+            self.status_label.set_text(line)
+            label = getattr(self, "_restore_label", None)
+            if label is not None:
+                label.set_text(line)
+            progress = job.get("component_progress") or {}
+            if isinstance(progress, dict) and progress:
+                # The restore form already contains the preview table; the
+                # task summary below it shows per-category processed bytes.
+                task_host = getattr(self, "_restore_progress_host", None)
+                if task_host is not None:
+                    preview_items = {
+                        item["id"]: item
+                        for item in (getattr(self, "_restore_preview", None) or {}).get("components", [])
+                        if isinstance(item, dict) and "id" in item
+                    }
+                    widgets.clear(task_host)
+                    task_host.append(
+                        widgets.table(
+                            ["类别", "已处理", "总量"],
+                            [
+                                [
+                                    str(preview_items.get(component_id, {}).get("label") or component_id),
+                                    widgets.format_bytes(
+                                        item.get("bytes") if isinstance(item, dict) else 0
+                                    ),
+                                    widgets.format_bytes(
+                                        preview_items.get(component_id, {}).get("archive_bytes")
+                                    ),
+                                ]
+                                for component_id, item in progress.items()
+                            ],
+                        )
+                    )
+            error = job.get("error") or {}
+            message = (
+                str(error.get("message") or "")
+                if isinstance(error, dict)
+                else ""
+            )
+            if state in BACKUP_TERMINAL_STATES:
+                self._restore_job = ""
+                self._stop_restore_poll()
+                rollback = str(job.get("rollback_filename") or "")
+                if state in {"done", "completed", "success"}:
+                    result = "恢复完成。"
+                elif state == "partial":
+                    result = "恢复部分完成，请检查警告。"
+                elif state == "cancelled":
+                    result = "恢复已取消。"
+                elif state == "interrupted":
+                    result = "恢复因服务重启中断，请检查数据及回滚备份。"
+                else:
+                    result = "恢复失败：" + (message or "未知错误")
+                if rollback:
+                    result += f" 自动回滚备份：{rollback}"
+                warnings = [str(item) for item in job.get("warnings") or []]
+                if warnings:
+                    result += " 警告：" + "；".join(warnings)
+                self.status_label.set_text(result)
+                if label is not None:
+                    label.set_text(result)
+                restore_button = getattr(self, "_restore_button", None)
+                if restore_button is not None:
+                    restore_button.set_sensitive(
+                        state in {"failed", "partial", "cancelled", "interrupted"}
+                    )
+                if state not in {"done", "completed", "success"}:
+                    preview_button = getattr(self, "_restore_preview_button", None)
+                    if preview_button is not None:
+                        preview_button.set_sensitive(True)
+                    self._restore_preview = None
+                self.page.toast(result)
+                self.refresh()
+            else:
+                self._schedule_restore_poll()
+
+        def _failed(exc: BaseException) -> None:
+            if self._disposed or job_id != self._restore_job:
+                return
+            message = f"恢复进度读取失败：{exc}；将继续重试。"
+            self.status_label.set_text(message)
+            label = getattr(self, "_restore_label", None)
+            if label is not None:
+                label.set_text(message)
+            self._schedule_restore_poll()
 
         widgets.run_async(_do, on_success=_done, on_error=_failed)
         return False
@@ -1767,8 +2459,10 @@ class TokenBudgetSettingsPanel(Gtk.Box):
                 ("Provider / 模型", f"{data.get('provider') or '?'} / {data.get('model') or '?'}"),
                 (
                     "工作窗口 / 模型限制",
-                    f"{_num(budget.get('window_requested'))} / "
-                    f"{_num(budget.get('window_model')) if budget.get('window_model') else '未核实'}",
+                    (
+                        f"{_num(budget.get('window_requested'))} / "
+                        f"{_num(budget.get('window_model')) if budget.get('window_model') else '未核实'}"
+                    ),
                 ),
                 (
                     "输出预留 / 安全余量",
@@ -1777,13 +2471,17 @@ class TokenBudgetSettingsPanel(Gtk.Box):
                 ("净输入预算", _num(budget.get("input_budget"))),
                 (
                     "soft / target / retry / urgent",
-                    f"{_num(budget.get('soft_trigger'))} / {_num(budget.get('target_after'))} / "
-                    f"{_num(budget.get('retry_target'))} / {_num(budget.get('urgent_trigger'))}",
+                    (
+                        f"{_num(budget.get('soft_trigger'))} / {_num(budget.get('target_after'))} / "
+                        f"{_num(budget.get('retry_target'))} / {_num(budget.get('urgent_trigger'))}"
+                    ),
                 ),
                 (
                     "固定开销 / 活跃历史预算",
-                    f"{_num(data.get('fixed_overhead_tokens'))} / "
-                    f"{_num(data.get('working_history_budget'))}",
+                    (
+                        f"{_num(data.get('fixed_overhead_tokens'))} / "
+                        f"{_num(data.get('working_history_budget'))}"
+                    ),
                 ),
                 (
                     "压缩状态",
@@ -1801,9 +2499,11 @@ class TokenBudgetSettingsPanel(Gtk.Box):
                 ),
                 (
                     "增长预测 / 冷却 / 最少新增",
-                    f"{compaction.get('growth_ewma', '—')} / "
-                    f"{_num(compaction.get('cooldown_seconds'))}s / "
-                    f"{_num(compaction.get('min_new_tokens'))}",
+                    (
+                        f"{compaction.get('growth_ewma', '—')} / "
+                        f"{_num(compaction.get('cooldown_seconds'))}s / "
+                        f"{_num(compaction.get('min_new_tokens'))}"
+                    ),
                 ),
             ]
             for name, value in rows:
@@ -1970,7 +2670,7 @@ class AdapterSettingsPanel(Gtk.Box):
     v0.1.3 和 v0.1.11 的控制面。
     """
 
-    _MODEL_NAMES = {
+    _MODEL_NAMES: ClassVar[dict[str, str]] = {
         "napcat": "NapCatAdapterConfig",
         "onebot11": "OneBot11AdapterConfig",
         "telegram": "TelegramAdapterConfig",
@@ -2321,13 +3021,19 @@ class AdapterSettingsPanel(Gtk.Box):
         card.append(flow)
         self.content.append(card)
 
-    def _protocol_button(self, protocol: dict[str, Any]) -> Gtk.Button:
+    def _protocol_button(self, protocol: dict[str, Any]) -> Gtk.Box:
+        """Render one protocol card, including its introduction action.
+
+        Protocol cards used to be a single button.  Keeping the documentation
+        action in a separate row means planned protocols can still open their
+        documentation while their configuration/select action remains disabled.
+        """
         protocol_id = str(protocol.get("id") or "")
         status = str(protocol.get("status") or "")
-        button = Gtk.Button()
-        button.add_css_class("protocol-card")
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        card.add_css_class("protocol-card")
         # 固定卡片宽度，避免长 summary 把 FlowBox 撑成一列全宽。
-        button.set_size_request(238, -1)
+        card.set_size_request(238, -1)
         body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
         head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         title = widgets.label(
@@ -2364,19 +3070,101 @@ class AdapterSettingsPanel(Gtk.Box):
             body.append(
                 widgets.label(f"接入方式：{transports}", css="field-help", wrap=True)
             )
+
+        select = Gtk.Button()
+        select.add_css_class("flat")
+        select.add_css_class("protocol-card-selector")
+        select.set_child(body)
+        select.set_hexpand(True)
+        select.set_halign(Gtk.Align.FILL)
         if status == "planned":
             body.append(widgets.label("该协议尚未实现，暂不可保存。", css="field-help"))
-            button.set_sensitive(False)
-        button.set_child(body)
-        button.set_tooltip_text(str(protocol.get("summary") or ""))
+            select.set_sensitive(False)
+        select.set_tooltip_text(str(protocol.get("summary") or ""))
         if protocol_id == self._selected_type:
-            button.add_css_class("selected")
+            card.add_css_class("selected")
         if status != "planned":
-            button.connect(
+            select.connect(
                 "clicked",
                 lambda _b, selected=protocol_id: self._select_protocol(selected),
             )
-        return button
+
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        actions.set_halign(Gtk.Align.END)
+        docs = widgets.button("查看介绍", icon="help-browser-symbolic", css="flat")
+        docs.set_tooltip_text("打开该协议的介绍文档")
+        docs.connect(
+            "clicked",
+            lambda _b, item=protocol, control=docs: self._show_protocol_docs(
+                item, control
+            ),
+        )
+        actions.append(docs)
+        card.append(select)
+        card.append(actions)
+        return card
+
+    def _show_protocol_docs(
+        self,
+        protocol: dict[str, Any],
+        button: Gtk.Button | None = None,
+    ) -> None:
+        """Fetch and display a protocol introduction in a readable window."""
+        if self.api is None:
+            return
+        protocol_id = str(protocol.get("id") or "").strip()
+        if not protocol_id:
+            self.page.toast("该协议没有可用的文档。")
+            return
+        if button is not None:
+            button.set_sensitive(False)
+
+        def _fetch() -> Any:
+            return self.api.get(
+                f"/api/adapters/docs/{q(protocol_id)}", timeout=30
+            )
+
+        def _show(payload: Any) -> None:
+            if button is not None:
+                button.set_sensitive(True)
+            if isinstance(payload, dict):
+                markdown = str(payload.get("markdown") or "")
+                path = str(payload.get("path") or protocol.get("docs") or "")
+            else:
+                markdown = str(payload or "")
+                path = str(protocol.get("docs") or "")
+            if not markdown.strip():
+                self.page.toast("该协议暂时没有介绍文档。")
+                return
+
+            name = adapter_spec.protocol_label(protocol)
+            window = Gtk.Window()
+            window.set_title(f"{name} · 介绍文档")
+            window.set_default_size(820, 680)
+            window.set_transient_for(self.page.app.window)
+            window.set_modal(True)
+            window.set_titlebar(Gtk.HeaderBar())
+            body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            body.set_margin_top(14)
+            body.set_margin_bottom(14)
+            body.set_margin_start(18)
+            body.set_margin_end(18)
+            if path:
+                body.append(widgets.muted(path, wrap=False))
+            document = widgets.text_view(markdown, height=600, monospace=False)
+            document.text_view.set_editable(False)  # type: ignore[attr-defined]
+            document.text_view.set_cursor_visible(False)  # type: ignore[attr-defined]
+            document.set_vexpand(True)
+            body.append(document)
+            window.set_child(body)
+            window.present()
+
+        def _failed(exc: BaseException) -> None:
+            if button is not None:
+                button.set_sensitive(True)
+            self.page.toast(f"读取协议介绍失败：{exc}")
+
+        widgets.run_async(_fetch, on_success=_show, on_error=_failed)
 
     def _select_protocol(self, protocol_id: str) -> None:
         if not protocol_id or protocol_id == self._selected_type:

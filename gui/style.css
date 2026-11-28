@@ -632,7 +632,7 @@ button.choice-card:checked {
 }
 
 /* 渠道协议卡片：选中态用青瓷色描边，planned 保持低饱和。 */
-button.protocol-card {
+.protocol-card {
   min-height: 108px;
   padding: 12px;
   border: 1px solid @karen_border;
@@ -641,16 +641,16 @@ button.protocol-card {
   color: @karen_fg;
 }
 
-button.protocol-card:hover {
+.protocol-card:hover {
   background-color: @karen_hover;
 }
 
-button.protocol-card.selected {
+.protocol-card.selected {
   border-color: @karen_accent_bg;
   background-color: @karen_accent_soft;
 }
 
-button.protocol-card:disabled {
+button.protocol-card-selector:disabled {
   color: @karen_text_disabled;
   background-color: @karen_bg;
 }

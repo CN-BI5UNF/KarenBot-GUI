@@ -138,6 +138,10 @@ class SetupPage(Page):
         self._progress_ok = False
         self._progress_retry_source = 0
         self._busy = False
+        self._disposed = False
+        self._return_to_summary = False
+        self._summary_error_step = ""
+        self._retry_action: Callable[[], None] | None = None
         self._building_step = False
         self._error = ""
         self._validate_step: Callable[[], str | None] = lambda: None
@@ -221,6 +225,16 @@ class SetupPage(Page):
         self.status_label = widgets.muted("")
         self.body.append(self.status_label)
         self.body.append(self.error_label)
+        self.retry_button = widgets.button("重试")
+        self.retry_button.set_visible(False)
+        self.retry_button.connect("clicked", lambda _b: self._retry_failed())
+        self.correction_button = widgets.button("前往修改")
+        self.correction_button.set_visible(False)
+        self.correction_button.connect(
+            "clicked", lambda _b: self._edit_summary(self._summary_error_step)
+        )
+        self.body.append(self.retry_button)
+        self.body.append(self.correction_button)
         self._set_ready(False)
         self.refresh()
 
@@ -228,7 +242,7 @@ class SetupPage(Page):
     # Boot / navigation
     # ------------------------------------------------------------------
     def refresh(self) -> None:
-        if self.api is None:
+        if self.api is None or self._disposed:
             return
         self._set_busy(True, "正在读取向导选项…")
 
@@ -241,18 +255,45 @@ class SetupPage(Page):
             return {"options": options, "copy": copy_data}
 
         def _done(data: dict[str, Any]) -> None:
+            if self._disposed:
+                return
             self._render_options(data.get("options") or {})
 
         def _failed(exc: BaseException) -> None:
+            if self._disposed:
+                return
             self._set_busy(False)
             self._set_ready(False)
             self.status_label.set_text(f"读取向导选项失败：{exc}")
             self.status_label.add_css_class("danger-text")
+            self._set_error("请检查本地服务状态，然后重试读取向导选项。", self.refresh)
 
         widgets.run_async(_fetch, on_success=_done, on_error=_failed)
 
+    def refresh_requested(self) -> None:
+        if self._busy:
+            return
+        if not self._options:
+            self.refresh()
+            return
+        widgets.ConfirmDialog(
+            self.app.window,
+            heading="重新读取向导并清空草稿？",
+            body="已填写但尚未完成的模型、密钥和渠道设置会被清空。",
+            confirm_label="重新读取",
+            destructive=True,
+            on_confirm=self.refresh,
+        )
+
+    def dispose(self) -> None:
+        self._disposed = True
+        if self._progress_retry_source:
+            GLib.source_remove(self._progress_retry_source)
+            self._progress_retry_source = 0
+
     def _render_options(self, data: dict[str, Any]) -> None:
         self._options = data
+        self._return_to_summary = False
         self._presets = list(data.get("presets") or [])
         self._personas = list(data.get("personas") or [])
         self._steps_meta = {
@@ -293,7 +334,7 @@ class SetupPage(Page):
         self._features = {}
         adapter = defaults.get("adapter") or {}
         self._adapter = {
-            "enabled": True,
+            "enabled": False,
             "mode": str(adapter.get("mode") or "client"),
             "host": str(adapter.get("host") or "127.0.0.1"),
             "port": int(adapter.get("port") or 3000),
@@ -330,6 +371,9 @@ class SetupPage(Page):
         self._current = step_id
         self._error = ""
         self.error_label.set_visible(False)
+        self.retry_button.set_visible(False)
+        self.correction_button.set_visible(False)
+        self._retry_action = None
         meta = self._steps_meta.get(step_id) or {}
         self.step_title.set_text(str(meta.get("title") or step_id))
         self.step_subtitle.set_text(str(meta.get("subtitle") or ""))
@@ -385,9 +429,11 @@ class SetupPage(Page):
             )
 
         def _done(result: dict[str, Any]) -> None:
-            if token != (self._current, self._path, self._persona_source):
+            if self._disposed or token != (self._current, self._path, self._persona_source):
                 return
             self._progress_ok = True
+            if self._retry_action == self._refresh_progress:
+                self._set_error("")
             if self._progress_retry_source:
                 GLib.source_remove(self._progress_retry_source)
                 self._progress_retry_source = 0
@@ -402,7 +448,10 @@ class SetupPage(Page):
             self.progress_bar.set_fraction(
                 max(0.0, min(1.0, index / total if total else 0.0))
             )
-            self.next_button.set_label("完成配置" if self._is_last else "下一步")
+            self.next_button.set_label(
+                "返回确认" if self._return_to_summary else
+                "完成配置" if self._is_last else "下一步"
+            )
             self.skip_button.set_visible(
                 not self._is_last
                 and bool((self._steps_meta.get(self._current) or {}).get("can_skip"))
@@ -412,12 +461,14 @@ class SetupPage(Page):
                 self.skip_button.set_sensitive(True)
 
         def _failed(exc: BaseException) -> None:
-            if token != (self._current, self._path, self._persona_source):
+            if self._disposed or token != (self._current, self._path, self._persona_source):
                 return
             self._progress_ok = False
             self.next_button.set_sensitive(False)
             self.skip_button.set_sensitive(False)
-            self._set_error(f"读取向导进度失败：{exc}，请稍后重试")
+            self._set_error(
+                f"读取向导进度失败：{exc}，请稍后重试", self._refresh_progress
+            )
             if not self._progress_retry_source:
                 self._progress_retry_source = GLib.timeout_add_seconds(
                     3, self._retry_progress
@@ -427,7 +478,7 @@ class SetupPage(Page):
 
     def _retry_progress(self) -> bool:
         self._progress_retry_source = 0
-        if self._busy or self._progress_ok or self.api is None:
+        if self._disposed or self._busy or self._progress_ok or self.api is None:
             return False
         self._refresh_progress()
         return False
@@ -445,6 +496,13 @@ class SetupPage(Page):
             self._set_error("向导进度尚未确认，请稍后重试。")
             self._refresh_progress()
             return
+        if self._return_to_summary:
+            if self._current == "persona" and self._persona_source == "create":
+                self._show_step("persona_create")
+            else:
+                self._return_to_summary = False
+                self._show_step("summary")
+            return
         if self._is_last:
             self._submit()
             return
@@ -452,10 +510,18 @@ class SetupPage(Page):
 
     def _skip(self) -> None:
         if not self._busy:
+            if self._return_to_summary:
+                self._return_to_summary = False
+                self._show_step("summary")
+                return
             self._ask_flow("next", validate_first=False)
 
     def _go_back(self) -> None:
         if not self._busy:
+            if self._return_to_summary:
+                self._return_to_summary = False
+                self._show_step("summary")
+                return
             self._ask_flow("prev", validate_first=False)
 
     def _ask_flow(self, direction: str, *, validate_first: bool) -> None:
@@ -481,6 +547,8 @@ class SetupPage(Page):
             )
 
         def _done(result: dict[str, Any]) -> None:
+            if self._disposed:
+                return
             self._set_busy(False)
             self.status_label.set_text("")
             target = result.get("next") if direction == "next" else result.get("prev")
@@ -498,6 +566,8 @@ class SetupPage(Page):
                 )
 
         def _failed(exc: BaseException) -> None:
+            if self._disposed:
+                return
             self._set_busy(False)
             self.status_label.set_text("")
             self._set_error(f"步骤切换失败：{exc}")
@@ -513,12 +583,16 @@ class SetupPage(Page):
             self.skip_button.set_sensitive(False)
             self.reset_button.set_sensitive(False)
             self.defer_button.set_sensitive(False)
+            self.retry_button.set_sensitive(False)
+            self.correction_button.set_sensitive(False)
         else:
             self.next_button.set_sensitive(self._progress_ok)
             self.back_button.set_sensitive(self._current != "welcome")
             self.skip_button.set_sensitive(self._progress_ok)
             self.reset_button.set_sensitive(True)
             self.defer_button.set_sensitive(True)
+            self.retry_button.set_sensitive(True)
+            self.correction_button.set_sensitive(True)
 
     def _set_ready(self, ready: bool) -> None:
         self.next_button.set_sensitive(ready and self._progress_ok)
@@ -527,10 +601,28 @@ class SetupPage(Page):
         self.reset_button.set_sensitive(ready)
         self.defer_button.set_sensitive(ready)
 
-    def _set_error(self, message: str) -> None:
+    def _set_error(
+        self, message: str, retry: Callable[[], None] | None = None
+    ) -> None:
         self._error = message
+        self._retry_action = retry
         self.error_label.set_text(message)
         self.error_label.set_visible(bool(message))
+        self.retry_button.set_visible(bool(message) and retry is not None)
+        self.correction_button.set_visible(
+            bool(message) and self._current == "summary"
+            and bool(self._summary_error_step)
+        )
+
+    def _retry_failed(self) -> None:
+        if not self._busy and not self._disposed and self._retry_action is not None:
+            self._retry_action()
+
+    def _edit_summary(self, step_id: str) -> None:
+        if self._busy or not step_id:
+            return
+        self._return_to_summary = True
+        self._show_step(step_id)
 
     def _confirm_reset(self) -> None:
         if self._busy:
@@ -1678,14 +1770,14 @@ class SetupPage(Page):
     # ------------------------------------------------------------------
     def _step_adapter(self) -> None:
         adapter = self._adapter
-        enabled = widgets.switch(bool(adapter.get("enabled", True)))
+        enabled = widgets.switch(bool(adapter.get("enabled", False)))
         enabled.connect(
             "notify::active",
             lambda widget, *_args: adapter.__setitem__("enabled", bool(widget.get_active())),
         )
         enabled_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         enabled_row.append(enabled)
-        enabled_row.append(widgets.label("启用 NapCat 渠道"))
+        enabled_row.append(widgets.label("连接 QQ（NapCat）"))
         mode = widgets.dropdown(
             [
                 ("client", "client（连接 NapCat 正向 WS）"),
@@ -1787,40 +1879,41 @@ class SetupPage(Page):
 
         wl_mode.connect("notify::selected", _sync_adapter_visibility)
         _sync_adapter_visibility()
-        self._add(
-            widgets.muted(
-                "连接 NapCat 后才会收发 QQ 消息；先跳过也不影响人格试跑。"
-            ),
-            enabled_row,
+        connection_fields = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        for field in (
             self._field("NapCat 连接模式", mode),
             self._field(
-                "主机",
-                host,
+                "主机", host,
                 "只填 IP 或域名，例如 127.0.0.1；不要带 ws:// 或中文。",
             ),
             self._field("端口", port),
+            self._field("WebSocket 路径", path, "以 / 开头。"),
             self._field(
-                "WebSocket 路径",
-                path,
-                "以 / 开头，只使用英文/数字/URL 符号。",
+                "Access Token（鉴权令牌）", token,
+                "填写与 NapCat 相同的 Token；只保存到加密密钥库。"
+                "双方均未启用鉴权时可留空，Token 不一致会导致 401/403。",
             ),
-            self._field(
-                "Access Token（鉴权令牌）",
-                token,
-                "可选。填写 NapCat 网络配置里设置的鉴权 Token；NapCat 没有设置时留空。\n"
-                "填写后会保存到加密密钥库并自动绑定到渠道，配置完成即可使用，"
-                "无需再到设置页填写。两边都设置但 Token 不一致时，连接会失败"
-                "（通常表现为 401/403）。",
+            wl_mode_field, wl_qq_field, wl_group_field,
+        ):
+            connection_fields.append(field)
+        enabled.connect(
+            "notify::active",
+            lambda w, *_args: connection_fields.set_visible(w.get_active()),
+        )
+        connection_fields.set_visible(enabled.get_active())
+        self._add(
+            widgets.muted(
+                "暂不连接也能在控制台试跑人格；以后可到「设置 → 渠道」连接 QQ。"
+                "只有打开下方开关后才会连接 NapCat。"
             ),
-            wl_mode_field,
-            wl_qq_field,
-            wl_group_field,
+            enabled_row,
+            connection_fields,
         )
         self._validate_step = self._validate_adapter
 
     def _validate_adapter(self) -> str | None:
         adapter = self._adapter
-        if not adapter.get("enabled", True):
+        if not adapter.get("enabled", False):
             return None
         host = str(adapter.get("host") or "").strip()
         if not host:
@@ -1981,39 +2074,55 @@ class SetupPage(Page):
             ]
         )
         adapter = self._adapter
-        rows.append(
-            ["渠道", f"{adapter.get('mode')}://{adapter.get('host')}:{adapter.get('port')}"]
-        )
-        rows.append(
-            ["入站策略", str((adapter.get("whitelist") or {}).get("mode") or "verify")]
-        )
+        if adapter.get("enabled", False):
+            rows.append([
+                "渠道", f"{adapter.get('mode')}://{adapter.get('host')}:{adapter.get('port')}"
+            ])
+            rows.append([
+                "入站策略", str((adapter.get("whitelist") or {}).get("mode") or "verify")
+            ])
+        else:
+            rows.append(["渠道", "暂不连接；以后可在「设置 → 渠道」启用"])
         rows.append(["人格", self._persona])
         self._add(
             widgets.muted("确认一下。点「完成配置」就会写盘并启动 Runtime。"),
             widgets.table(["项目", "值"], rows, weights=[0.7, 2.3]),
         )
+        edits = Gtk.FlowBox()
+        edits.set_selection_mode(Gtk.SelectionMode.NONE)
+        edits.set_column_spacing(8)
+        edits.set_row_spacing(6)
+        for label, step in (
+            ("修改主模型", "main_model_custom" if self._path == "custom" else "main_model_quick"),
+            ("修改功能", "features"),
+            ("修改记忆", "embedding"),
+            ("修改渠道", "adapter"),
+            ("修改人格", "persona"),
+        ):
+            edit = widgets.button(label)
+            edit.connect("clicked", lambda _b, target=step: self._edit_summary(target))
+            edits.append(edit)
+        self._add(edits, widgets.muted("修改完成后点「返回确认」，无需重新走完整个向导。"))
         self._validate_step = self._validate_summary
 
     def _validate_summary(self) -> str | None:
-        if not self._provider.get("api_key"):
-            return "还没有填 API Key —— 没有密钥人格无法说话。"
-        if not self._provider.get("model"):
-            return "还没有选择模型。"
+        self._summary_error_step = ""
         # ``跳过`` 有意不逐步校验；汇总页再兜一次底，避免最后才由后端报错。
         provider_validator = (
             self._validate_provider_custom
             if self._path == "custom"
             else self._validate_provider_quick
         )
-        for validator in (
-            provider_validator,
-            self._validate_agents,
-            self._validate_features,
-            self._validate_embedding,
-            self._validate_adapter,
+        for step, validator in (
+            ("main_model_custom" if self._path == "custom" else "main_model_quick", provider_validator),
+            ("other_agents", self._validate_agents),
+            ("features", self._validate_features),
+            ("embedding", self._validate_embedding),
+            ("adapter", self._validate_adapter),
         ):
             problem = validator()
             if problem:
+                self._summary_error_step = step
                 return problem
         return None
 
@@ -2035,6 +2144,8 @@ class SetupPage(Page):
             return self.api.post("/api/setup/apply", payload, timeout=180)
 
         def _done(result: dict[str, Any]) -> None:
+            if self._disposed:
+                return
             self._set_busy(False)
             message = str(result.get("message") or "配置已写入")
             self.status_label.set_text(message)
@@ -2045,9 +2156,12 @@ class SetupPage(Page):
                 self.app.on_setup_finished()
 
         def _failed(exc: BaseException) -> None:
+            if self._disposed:
+                return
             self._set_busy(False)
             self.status_label.set_text(f"首次配置失败：{exc}")
             self.status_label.add_css_class("danger-text")
+            self._set_error(f"配置未完成：{exc}。已保留填写内容。", self._submit)
 
         widgets.run_async(_do, on_success=_done, on_error=_failed)
 
@@ -2069,7 +2183,7 @@ class SetupPage(Page):
             "timeout_seconds": float(provider.get("timeout_seconds") or 120.0),
         }
         agents: dict[str, Any] = {}
-        for key, _label, _desc, _temp, _tokens in SUB_AGENTS:
+        for key, _label, _desc, default_temp, default_tokens in SUB_AGENTS:
             cfg = self._agents.get(key) or {}
             if not cfg.get("enabled", True):
                 agents[key] = {"enabled": False}
@@ -2086,8 +2200,8 @@ class SetupPage(Page):
                 "enabled": True,
                 "provider": agent_provider,
                 "model": agent_model or provider.get("model") or "",
-                "temperature": float(cfg.get("temperature") or 0.3),
-                "max_tokens": int(cfg.get("max_tokens") or 4096),
+                "temperature": float(cfg.get("temperature", default_temp)),
+                "max_tokens": int(cfg.get("max_tokens", default_tokens)),
             }
         features: dict[str, Any] = {}
         secrets: dict[str, str] = {}
@@ -2196,8 +2310,8 @@ class SetupPage(Page):
             "chat": {
                 "provider": provider_id,
                 "model": provider.get("model") or "",
-                "temperature": float(self._chat.get("temperature") or 0.6),
-                "top_p": float(self._chat.get("top_p") or 1.0),
+                "temperature": float(self._chat.get("temperature", 0.6)),
+                "top_p": float(self._chat.get("top_p", 1.0)),
                 "max_tokens": int(self._chat.get("max_tokens") or 16384),
                 "reasoning": bool(self._chat.get("reasoning")),
                 "reasoning_budget": self._chat.get("reasoning_budget") or None,
@@ -2205,7 +2319,7 @@ class SetupPage(Page):
             "agents": agents,
             "features": features,
             "adapter": {
-                "enabled": bool(adapter.get("enabled", True)),
+                "enabled": bool(adapter.get("enabled", False)),
                 "mode": str(adapter.get("mode") or "client"),
                 "host": str(adapter.get("host") or "127.0.0.1"),
                 "port": int(adapter.get("port") or 3000),

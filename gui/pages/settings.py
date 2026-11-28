@@ -58,7 +58,7 @@ class SettingsPage(Page):
     refresh_on_activate = True
     page_id = "settings"
     page_title = "设置"
-    page_subtitle = "运行参数、模型与路径诊断。改动即时写入 config.yaml；需要重启的会给出提示。"
+    page_subtitle = "运行参数、模型与路径诊断。保存状态和需要重启的改动会给出提示。"
     page_icon = "emblem-system-symbolic"
 
     def build(self) -> None:
@@ -83,8 +83,16 @@ class SettingsPage(Page):
         self._provider_error = ""
         self._selected_group = ""
         self._pending_section = ""
+        self._generic_drafts: dict[str, tuple[Any, Any]] = {}
+        self._pending_checks: dict[str, Any] = {}
+        self._saving_requests = 0
 
         self.body.append(self.header())
+        self.draft_hint = widgets.muted(
+            "开关和下拉选项立即保存；文本在回车或离开输入框时保存。"
+            "多行文本和 JSON 也可点击保存；需要重启的设置会单独提示。"
+        )
+        self.body.append(self.draft_hint)
         self.restart_hint = widgets.card()
         self.restart_hint.set_visible(False)
         self.body.append(self.restart_hint)
@@ -134,7 +142,9 @@ class SettingsPage(Page):
     # Loading
     # ------------------------------------------------------------------
     def refresh(self) -> None:
-        if self.api is None or self._refresh_busy:
+        if self.api is None or self._refresh_busy or self._disposed:
+            return
+        if not self.can_discard_unsaved_changes():
             return
         self._refresh_busy = True
         if not self._groups and not self._data:
@@ -187,6 +197,8 @@ class SettingsPage(Page):
         self.group_list.append(row)
 
     def _error(self, exc: BaseException) -> None:
+        if self._disposed:
+            return
         self._refresh_busy = False
         widgets.clear(self.group_list)
         widgets.clear(self.group_stack)
@@ -202,7 +214,12 @@ class SettingsPage(Page):
         self.group_stack.set_visible_child_name("error")
 
     def _render(self, data: dict[str, Any]) -> None:
+        if self._disposed:
+            return
         self._refresh_busy = False
+        if self.has_unsaved_changes():
+            self.toast("读取设置期间检测到新的修改，已保留当前输入。完成保存后可再次刷新。")
+            return
         payload = data.get("settings") or {}
         self._data = payload
         settings_error = str(payload.get("error") or "")
@@ -223,6 +240,9 @@ class SettingsPage(Page):
         self._presets = list(preset_payload.get("presets") or [])
         self._group_pages = {}
         self._group_panels = {}
+        self._generic_drafts = {}
+        self._pending_checks = {}
+        self._sync_draft_hint()
         widgets.clear(self.group_list)
         while self.group_stack.get_first_child() is not None:
             self.group_stack.remove(self.group_stack.get_first_child())
@@ -533,6 +553,7 @@ class SettingsPage(Page):
                 def _saved(_result: Any, current=selected) -> None:
                     st["value"] = bool(current)
                     f["value"] = bool(current)
+                    w.set_sensitive(True)
 
                 def _failed(_exc: BaseException, current=st["value"]) -> None:
                     st["suppress"] = True
@@ -540,7 +561,9 @@ class SettingsPage(Page):
                         w.set_active(bool(current))
                     finally:
                         st["suppress"] = False
+                        w.set_sensitive(True)
 
+                w.set_sensitive(False)
                 self._save(f, selected, on_success=_saved, on_error=_failed)
 
             control.connect("notify::active", _toggle)
@@ -573,6 +596,7 @@ class SettingsPage(Page):
                 def _saved(_result: Any, current=selected) -> None:
                     st["value"] = str(current)
                     f["value"] = str(current)
+                    w.set_sensitive(True)
 
                 def _failed(_exc: BaseException, current=st["value"]) -> None:
                     st["suppress"] = True
@@ -580,7 +604,9 @@ class SettingsPage(Page):
                         _select_dropdown(w, str(current))
                     finally:
                         st["suppress"] = False
+                        w.set_sensitive(True)
 
+                w.set_sensitive(False)
                 self._save(f, selected, on_success=_saved, on_error=_failed)
 
             control.connect("notify::selected", _changed)
@@ -600,6 +626,12 @@ class SettingsPage(Page):
                 "clicked",
                 lambda _b, f=field, e=entry: self._save_secret(f, e),
             )
+            self._track_draft(
+                field,
+                lambda e=entry: bool(e.get_text()),
+                lambda e=entry: e.set_text(""),
+            )
+            entry.connect("changed", lambda _e: self._sync_draft_hint())
             row.append(entry)
             row.append(save)
             box.append(row)
@@ -654,7 +686,14 @@ class SettingsPage(Page):
                 ),
             )
             control.set_halign(Gtk.Align.START)
-            last = [control.get_value()]
+            last = {"value": control.get_value(), "inflight": False, "pending": False}
+            self._track_draft(
+                field,
+                lambda w=control, st=last: st["inflight"] or w.get_value() != st["value"],
+                lambda w=control, st=last: w.set_value(st["value"]),
+                pending=lambda st=last: st["inflight"],
+            )
+            control.connect("value-changed", lambda _w: self._sync_draft_hint())
 
             def _spin_commit(
                 w: Gtk.SpinButton, f=field, state=last, floating=is_float
@@ -662,13 +701,33 @@ class SettingsPage(Page):
                 current: Any = (
                     float(w.get_value()) if floating else int(w.get_value())
                 )
-                if current == state[0]:
+                if state["inflight"]:
+                    state["pending"] = True
                     return
+                if current == state["value"]:
+                    return
+                state["inflight"] = True
+                self._sync_draft_hint()
+
+                def _saved(_result: Any) -> None:
+                    state["inflight"] = False
+                    state["value"] = current
+                    self._sync_draft_hint()
+                    pending = state["pending"]
+                    state["pending"] = False
+                    if pending:
+                        _spin_commit(w)
+
+                def _failed(_exc: BaseException) -> None:
+                    state["inflight"] = False
+                    state["pending"] = False
+                    self._sync_draft_hint()
+
                 self._save(
                     f,
                     current,
-                    on_success=lambda _r, val=current, old_state=state: old_state.__setitem__(0, val),
-                    on_error=lambda _exc, spin=w, prev=state[0]: spin.set_value(prev),
+                    on_success=_saved,
+                    on_error=_failed,
                 )
 
             focus = Gtk.EventControllerFocus()
@@ -705,8 +764,15 @@ class SettingsPage(Page):
         kind: str,
         help_label: Gtk.Label,
     ) -> None:
-        last = {"raw": entry.get_text()}
+        last = {"raw": entry.get_text(), "inflight": False, "pending": False}
         base_help = help_label.get_text()
+        self._track_draft(
+            field,
+            lambda: last["inflight"] or entry.get_text().strip() != last["raw"],
+            lambda: entry.set_text(last["raw"]),
+            pending=lambda: last["inflight"],
+        )
+        entry.connect("changed", lambda _e: self._sync_draft_hint())
 
         def _restore_help() -> None:
             help_label.set_text(base_help)
@@ -714,6 +780,9 @@ class SettingsPage(Page):
 
         def _commit() -> None:
             raw = entry.get_text().strip()
+            if last["inflight"]:
+                last["pending"] = True
+                return
             if raw == last["raw"]:
                 return
             try:
@@ -722,22 +791,33 @@ class SettingsPage(Page):
                 help_label.set_text(str(exc))
                 help_label.set_visible(True)
                 self.toast(str(exc))
-                entry.set_text(last["raw"])
                 return
             _restore_help()
+            last["inflight"] = True
+            self._sync_draft_hint()
 
             def _done(_result: Any) -> None:
+                last["inflight"] = False
                 last["raw"] = display
-                entry.set_text(display)
+                if entry.get_text().strip() == raw:
+                    entry.set_text(display)
                 _restore_help()
+                self._sync_draft_hint()
+                pending = last["pending"]
+                last["pending"] = False
+                if pending:
+                    _commit()
 
             def _failed(_exc: BaseException) -> None:
-                entry.set_text(last["raw"])
+                last["inflight"] = False
+                last["pending"] = False
                 _restore_help()
+                self._sync_draft_hint()
 
             self._save(field, value, on_success=_done, on_error=_failed)
 
         entry.connect("activate", lambda _e: _commit())
+        entry.commit_value = _commit  # type: ignore[attr-defined]
         focus = Gtk.EventControllerFocus()
         focus.connect("leave", lambda _c: _commit())
         entry.add_controller(focus)
@@ -755,7 +835,15 @@ class SettingsPage(Page):
         state: dict[str, Any] = {
             "saved_text": widgets.text_value(area),
             "inflight": False,
+            "pending": False,
         }
+        self._track_draft(
+            field,
+            lambda: state["inflight"]
+            or widgets.text_value(area) != state["saved_text"],
+            lambda: view.get_buffer().set_text(state["saved_text"]),
+            pending=lambda: state["inflight"],
+        )
 
         def _restore_help() -> None:
             help_label.set_text(base_help)
@@ -763,8 +851,10 @@ class SettingsPage(Page):
 
         def _sync_button() -> None:
             save_button.set_sensitive(
-                widgets.text_value(area) != state["saved_text"]
+                not state["inflight"]
+                and widgets.text_value(area) != state["saved_text"]
             )
+            self._sync_draft_hint()
 
         def _parse() -> tuple[bool, Any, str]:
             text = widgets.text_value(area)
@@ -780,23 +870,34 @@ class SettingsPage(Page):
                 )
 
         def _send(value: Any) -> None:
+            submitted_text = widgets.text_value(area)
             state["inflight"] = True
-            save_button.set_sensitive(False)
+            _sync_button()
 
             def _done(_result: Any) -> None:
                 state["inflight"] = False
-                state["saved_text"] = widgets.text_value(area)
+                state["saved_text"] = submitted_text
                 _restore_help()
                 _sync_button()
+                pending = state["pending"]
+                state["pending"] = False
+                if pending:
+                    _commit()
 
             def _failed(_exc: BaseException) -> None:
                 state["inflight"] = False
+                state["pending"] = False
                 _restore_help()
                 _sync_button()
 
             self._save(field, value, on_success=_done, on_error=_failed)
 
         def _commit() -> None:
+            if state["inflight"]:
+                # Remember an explicit save/focus change while a request is
+                # pending, and send the latest draft after that request ends.
+                state["pending"] = True
+                return
             ok, value, message = _parse()
             if not ok:
                 help_label.set_text(message)
@@ -807,10 +908,6 @@ class SettingsPage(Page):
                 state["saved_text"] = widgets.text_value(area)
                 _restore_help()
                 _sync_button()
-                return
-            if state["inflight"]:
-                # Focus leaving the editor and the save button's click can both
-                # fire before the first PATCH returns. Keep only one request.
                 return
             _restore_help()
             _send(value)
@@ -840,7 +937,7 @@ class SettingsPage(Page):
         if not path:
             return
         entry.set_text(path)
-        self._save(field, path)
+        entry.commit_value()  # type: ignore[attr-defined]
 
     # ------------------------------------------------------------------
     # Saving
@@ -853,7 +950,7 @@ class SettingsPage(Page):
         on_success: Any = None,
         on_error: Any = None,
     ) -> None:
-        if self.api is None:
+        if self.api is None or self._disposed:
             return
         path = str(field.get("path") or "")
         if not path:
@@ -868,6 +965,9 @@ class SettingsPage(Page):
             return self.api.patch("/api/settings", {"path": path, "value": value}, timeout=60)
 
         def _done(result: dict[str, Any]) -> None:
+            self._saving_requests = max(0, self._saving_requests - 1)
+            if self._disposed:
+                return
             stored = result.get("value", value)
             field["value"] = stored
             self.update_spec_value(path, stored)
@@ -902,10 +1002,14 @@ class SettingsPage(Page):
                     prompt()
 
         def _failed(exc: BaseException) -> None:
+            self._saving_requests = max(0, self._saving_requests - 1)
+            if self._disposed:
+                return
             self.toast(f"保存失败：{exc}")
             if callable(on_error):
                 on_error(exc)
 
+        self._saving_requests += 1
         widgets.run_async(_do, on_success=_done, on_error=_failed)
 
     def _save_secret(self, field: dict[str, Any], entry: Gtk.Entry) -> None:
@@ -934,7 +1038,7 @@ class SettingsPage(Page):
         value: str,
         entry: Gtk.Entry,
     ) -> None:
-        if self.api is None:
+        if self.api is None or self._disposed:
             return
         ref_path = str(field.get("path") or "")
 
@@ -969,33 +1073,46 @@ class SettingsPage(Page):
             }
 
         def _done(result: dict[str, Any]) -> None:
-            entry.set_text("")
+            self._saving_requests = max(0, self._saving_requests - 1)
+            if self._disposed:
+                return
             secret = result.get("secret") or {}
-            if value:
-                entry.set_placeholder_text(
-                    f"已保存（ID: {key_id}，留空不修改）"
-                )
-                field["value"] = key_id
-                self.update_spec_value(ref_path, key_id)
-            else:
-                entry.set_placeholder_text("未设置")
-                field["value"] = ""
             if result.get("ref_error"):
                 action = "保存" if value else "清空"
+                current_ref = str(field.get("value") or "未设置")
+                entry.set_placeholder_text(f"绑定失败；当前配置引用：{current_ref}")
                 self.toast(
-                    f"密钥已{action}，但更新配置引用失败：{result['ref_error']}"
+                    f"密钥已{action}，但更新配置引用失败：{result['ref_error']}。"
+                    "配置引用未变，请点击「保存密钥」重试。"
                 )
             else:
+                # A failed reference PATCH must retain the actual config and
+                # the entered value, so retrying still attempts the binding.
+                ref_target = key_id if value else ""
+                field["value"] = ref_target
+                self.update_spec_value(ref_path, ref_target)
+                if entry.get_text().strip() == value:
+                    entry.set_text("")
+                entry.set_placeholder_text(
+                    f"已保存（ID: {key_id}，留空不修改）" if value else "未设置"
+                )
                 self.toast(
                     str(secret.get("message") or ("密钥已保存" if value else "密钥已清空"))
                 )
+            self._sync_draft_hint()
             if (
                 secret.get("needs_restart")
                 or (result.get("ref") or {}).get("needs_restart")
             ):
                 self.mark_restart()
 
-        widgets.run_async(_do, on_success=_done, on_error=lambda exc: self.toast(str(exc)))
+        def _failed(exc: BaseException) -> None:
+            self._saving_requests = max(0, self._saving_requests - 1)
+            if not self._disposed:
+                self.toast(str(exc))
+
+        self._saving_requests += 1
+        widgets.run_async(_do, on_success=_done, on_error=_failed)
 
     def mark_restart(self) -> None:
         if self.restart_hint.get_visible():
@@ -1175,18 +1292,58 @@ class SettingsPage(Page):
         return scroller
 
     def has_unsaved_changes(self) -> bool:
-        return any(
+        return self._has_pending_saves() or any(
+            check() for check, _discard in self._generic_drafts.values()
+        ) or any(
             getattr(panel, "dirty", False)
             for panels in self._group_panels.values()
             for panel in panels
         )
 
-    def discard_unsaved_changes(self) -> None:
+    def discard_unsaved_changes(self) -> bool:
+        if not self.can_discard_unsaved_changes():
+            return False
+        for _check, discard in self._generic_drafts.values():
+            discard()
         for panels in self._group_panels.values():
             for panel in panels:
                 if hasattr(panel, "dirty"):
                     panel.dirty = False
         self.refresh()
+        return True
+
+    def _has_pending_saves(self) -> bool:
+        return self._saving_requests > 0 or any(
+            check() for check in self._pending_checks.values()
+        ) or any(
+            getattr(panel, "_saving", False)
+            for panels in self._group_panels.values()
+            for panel in panels
+        )
+
+    def can_discard_unsaved_changes(self) -> bool:
+        if self._has_pending_saves():
+            self.toast("正在保存设置，请等待保存完成后再离开、刷新或放弃草稿。已发送的保存请求无法撤销。")
+            return False
+        return True
+
+    def _track_draft(
+        self, field: dict[str, Any], check: Any, discard: Any, *, pending: Any = None
+    ) -> None:
+        key = str(field.get("path") or id(field))
+        self._generic_drafts[key] = (check, discard)
+        if pending is not None:
+            self._pending_checks[key] = pending
+
+    def _sync_draft_hint(self) -> None:
+        dirty = any(check() for check, _discard in self._generic_drafts.values())
+        self.draft_hint.set_text(
+            "有尚未保存或正在保存的内容。离开页面前请确认保存结果；"
+            "多行文本和 JSON 可点击保存或按 Ctrl+Enter。"
+            if dirty
+            else "开关和下拉选项立即保存；文本在回车或离开输入框时保存。"
+            "多行文本和 JSON 也可点击保存；需要重启的设置会单独提示。"
+        )
 
     def _request_runtime_action(self, path: str, label: str) -> None:
         if path == "/api/system/start":

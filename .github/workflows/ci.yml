@@ -17,7 +17,7 @@ jobs:
       - name: Install GTK4 / libadwaita / PyGObject
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-gi gir1.2-gtk-4.0 gir1.2-adw-1
+          sudo apt-get install -y python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 python3-platformdirs
 
       - name: Compile GUI
         run: python3 -m compileall -q gui
@@ -36,6 +36,9 @@ jobs:
 
       - name: Verify non-GTK helpers
         run: python3 -c "import gui.paths, gui.identity; print('helpers ok')"
+
+      - name: Verify settings and setup behavior without a display
+        run: python3 -m unittest discover -s tests -v
 
       - name: Verify module layout
         run: |
